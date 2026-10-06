@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="utf-8"?>
+<policyDefinitionResources xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" revision="1.0" schemaVersion="1.0" xmlns="http://schemas.microsoft.com/GroupPolicy/2006/07/PolicyDefinitions">
+  <displayName>VFS365</displayName>
+  <description>Settings for VFS365, which shows Microsoft 365 files as a drive and in Explorer's navigation pane.</description>
+  <resources>
+    <stringTable>
+      <string id="SUPPORTED_Windows11">Windows 11 with WinFsp and VFS365 installed</string>
+      <string id="JSolve">JSolve</string>
+      <string id="VFS365">VFS365</string>
+
+      <string id="ClientId">App registration</string>
+      <string id="ClientId_Help">Application (client) ID of your own Entra app registration for VFS365 to sign in with. Not configured: JSolve's multi-tenant app, which an admin consents to once per tenant. Delegated permissions only; see the app registration guide.</string>
+
+      <string id="TenantId">Force tenant</string>
+      <string id="TenantId_Help">Tenant (directory) ID to sign in to. Normally not needed: VFS365 uses the tenant the device is joined or registered to, else the tenant of the account that signs in.</string>
+
+      <string id="DriveLetter">Drive letter</string>
+      <string id="DriveLetter_Help">Drive letter for the drive, for example M. Use * for the first free letter counting down from Z, or None for no drive letter (the default when not configured): the files are then reachable through the navigation pane and the UNC path \\VFS365\&lt;tenant&gt; only.</string>
+
+      <string id="Label">Name</string>
+      <string id="Label_Help">Name of the drive and of the navigation pane entry in Explorer. Default: VFS365.</string>
+
+      <string id="Scope">Content</string>
+      <string id="Scope_Help">What the drive shows. Only SharePoint sites (the default when not configured) or only OneDrive: that content is the root of the drive, without the extra folder level. Everything: OneDrive and Sites folders.</string>
+      <string id="Scope_All">Everything</string>
+      <string id="Scope_OneDrive">Only OneDrive</string>
+      <string id="Scope_SharePoint">Only SharePoint sites</string>
+
+      <string id="IncludedSites">Included sites</string>
+      <string id="IncludedSites_Help">Site URL patterns to show, one per line. * matches any characters; patterns match the whole URL. Default: */sites/* and */teams/*. Exclusions win.</string>
+
+      <string id="ExcludedSites">Excluded sites</string>
+      <string id="ExcludedSites_Help">Site URL patterns to hide, one per line, for example */sites/HR*. Replaces the built-in list (app catalog, content type hub, Viva Engage and similar system sites).</string>
+
+      <string id="NavigationPane">Show in the navigation pane</string>
+      <string id="NavigationPane_Help">Shows the drive as its own entry in Explorer's navigation pane and in Open and Save dialogs. Enabled by default; disable to show it under This PC only.</string>
+    </stringTable>
+    <presentationTable>
+      <presentation id="ClientId"><textBox refId="ClientId"><label>Client ID</label></textBox></presentation>
+      <presentation id="TenantId"><textBox refId="TenantId"><label>Tenant ID</label></textBox></presentation>
+      <presentation id="DriveLetter"><textBox refId="DriveLetter"><label>Drive letter, * or None</label><defaultValue>M</defaultValue></textBox></presentation>
+      <presentation id="Label"><textBox refId="Label"><label>Name</label><defaultValue>VFS365</defaultValue></textBox></presentation>
+      <presentation id="Scope"><dropdownList refId="Scope" defaultItem="0">Show</dropdownList></presentation>
+      <presentation id="IncludedSites"><multiTextBox refId="IncludedSites">Site URL patterns, one per line</multiTextBox></presentation>
+      <presentation id="ExcludedSites"><multiTextBox refId="ExcludedSites">Site URL patterns, one per line</multiTextBox></presentation>
+    </presentationTable>
+  </resources>
+</policyDefinitionResources>
