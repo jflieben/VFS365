@@ -1,0 +1,27 @@
+# Build output
+bin/
+obj/
+artifacts/
+TestResults/
+*.log
+
+# Local settings and secrets that must never be committed
+*.local.json
+.env
+*.pfx
+*.snk
+
+# Maintainer notes, research, status and test scripts with tenant details: kept locally, never published
+private/
+
+# Editor / OS
+.vs/
+.vscode/
+.idea/
+*.user
+Thumbs.db
+.DS_Store
+
+# Release builds (rebuild with ./build.ps1 release)
+release/*
+!release/README.md

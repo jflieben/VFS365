@@ -1,0 +1,5 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Engine: namespace, metadata and content caches, upload queue, change feed. No WinFsp or cfapi types here. -->
+
+</Project>

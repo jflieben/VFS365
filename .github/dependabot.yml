@@ -1,0 +1,19 @@
+version: 2
+updates:
+  - package-ecosystem: nuget
+    directory: /
+    schedule:
+      interval: weekly
+    ignore:
+      # Must match the bundled WinFsp driver; moved by hand together with the pin in build.ps1
+      - dependency-name: winfsp.net
+      # WiX 6 and later carry the Open Source Maintenance Fee; VFS365 stays on WiX 5
+      - dependency-name: WixToolset.*
+        update-types: [version-update:semver-major]
+    groups:
+      nuget:
+        patterns: ["*"]
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly

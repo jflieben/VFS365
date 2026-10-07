@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- vfs365.exe: console tool for admins and diagnostics. -->
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <AssemblyName>vfs365</AssemblyName>
+    <AssemblyTitle>VFS365 console</AssemblyTitle>
+    <ApplicationIcon>..\..\assets\vfs365.ico</ApplicationIcon>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Vfs365.Agent\Vfs365.Agent.csproj" />
+  </ItemGroup>
+
+</Project>

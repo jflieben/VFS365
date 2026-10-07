@@ -1,0 +1,20 @@
+<Project Sdk="WixToolset.Sdk/5.0.2">
+
+  <!-- Per-machine MSI. Build through ./build.ps1 release, which passes Platform (x64 or arm64), Version, PublishDir and the network
+       provider DLLs (NpDll for the platform, NpDllX86). -->
+
+  <PropertyGroup>
+    <OutputName>VFS365</OutputName>
+    <Version Condition="'$(Version)' == ''">0.0.0</Version>
+    <InstallerPlatform>$(Platform)</InstallerPlatform>
+    <DefineConstants>Version=$(Version);PublishDir=$(PublishDir);AssetsDir=$(MSBuildThisFileDirectory)..\assets;NpDll=$(NpDll);NpDllX86=$(NpDllX86)</DefineConstants>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <!-- The setup project in bundle\ leaves .wxl files in its obj folder; they must not be globbed into the MSI -->
+    <DefaultItemExcludes>$(DefaultItemExcludes);bundle\**</DefaultItemExcludes>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="Package.wxs" />
+  </ItemGroup>
+
+</Project>

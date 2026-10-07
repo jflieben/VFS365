@@ -1,0 +1,50 @@
+name: Bug report
+description: Something in VFS365 doesn't work as documented.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. Issues are handled best effort, without a response time; for help with your own deployment see [SUPPORT.md](../blob/main/SUPPORT.md). Security problems go through [SECURITY.md](../blob/main/SECURITY.md), not here.
+  - type: input
+    id: version
+    attributes:
+      label: VFS365 version
+      description: "`vfs365.exe about`"
+      placeholder: 0.1.9
+    validations:
+      required: true
+  - type: input
+    id: windows
+    attributes:
+      label: Windows version and architecture
+      placeholder: Windows 11 24H2, x64 (or ARM64, AVD multi-session)
+    validations:
+      required: true
+  - type: input
+    id: winfsp
+    attributes:
+      label: WinFsp version
+      placeholder: 2.1.25156 (installed by the VFS365 setup)
+  - type: dropdown
+    id: deployment
+    attributes:
+      label: Deployed with
+      options:
+        - Setup program
+        - MSI
+        - Intune or other device management
+        - Other
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what did you expect?
+      description: Steps to reproduce, the app involved, and how often it happens.
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: Log lines
+      description: The relevant lines from `%LOCALAPPDATA%\VFS365\agent.log`. Remove user, tenant and file names you don't want to publish.
+      render: text

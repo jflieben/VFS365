@@ -1,0 +1,13 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Vfs365.Agent/Vfs365.Agent.csproj" />
+    <Project Path="src/Vfs365.Background/Vfs365.Background.csproj" />
+    <Project Path="src/Vfs365.Cli/Vfs365.Cli.csproj" />
+    <Project Path="src/Vfs365.Core/Vfs365.Core.csproj" />
+    <Project Path="src/Vfs365.Drive.WinFsp/Vfs365.Drive.WinFsp.csproj" />
+    <Project Path="src/Vfs365.Graph/Vfs365.Graph.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Vfs365.Tests/Vfs365.Tests.csproj" />
+  </Folder>
+</Solution>

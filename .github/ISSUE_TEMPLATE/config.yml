@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Paid support (JSolve B.V.)
+    url: https://jsolve.nl/hire
+    about: Help with deploying and running VFS365, troubleshooting in your tenant, priority fixes and custom changes.
+  - name: Report a security vulnerability
+    url: https://github.com/jflieben/VFS365/security/advisories/new
+    about: Privately, never as a public issue.

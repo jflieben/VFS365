@@ -1,0 +1,3 @@
+<Project>
+  <!-- Stops the repo's .NET settings (target framework, central package versions) from applying to the WiX project -->
+</Project>

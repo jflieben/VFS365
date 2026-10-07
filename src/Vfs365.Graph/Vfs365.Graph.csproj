@@ -1,0 +1,9 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Thin Graph and SharePoint REST client: requests, retries, RU accounting. Implements Core's API ports. Takes tokens from the host, no MSAL. -->
+
+  <ItemGroup>
+    <ProjectReference Include="..\Vfs365.Core\Vfs365.Core.csproj" />
+  </ItemGroup>
+
+</Project>

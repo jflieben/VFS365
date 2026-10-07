@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- vfs365-agent.exe: started at logon by the installer's Run key, mounts with the policy settings, no window. -->
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <AssemblyName>vfs365-agent</AssemblyName>
+    <AssemblyTitle>VFS365</AssemblyTitle>
+    <ApplicationIcon>..\..\assets\vfs365.ico</ApplicationIcon>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Win32.SystemEvents" />
+    <ProjectReference Include="..\Vfs365.Agent\Vfs365.Agent.csproj" />
+  </ItemGroup>
+
+</Project>

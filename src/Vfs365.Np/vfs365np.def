@@ -1,0 +1,5 @@
+LIBRARY vfs365np
+EXPORTS
+    NPGetCaps
+    NPGetResourceInformation
+    NPGetResourceParent

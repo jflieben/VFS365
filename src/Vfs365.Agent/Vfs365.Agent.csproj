@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Agent logic shared by vfs365.exe (console) and vfs365-agent.exe (background): settings, sign-in, commands, Explorer integration. -->
+
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows</TargetFramework>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Identity.Client" />
+    <PackageReference Include="Microsoft.Identity.Client.Broker" />
+    <PackageReference Include="System.Security.Cryptography.ProtectedData" />
+    <ProjectReference Include="..\Vfs365.Core\Vfs365.Core.csproj" />
+    <ProjectReference Include="..\Vfs365.Graph\Vfs365.Graph.csproj" />
+    <ProjectReference Include="..\Vfs365.Drive.WinFsp\Vfs365.Drive.WinFsp.csproj" />
+  </ItemGroup>
+
+  <!-- Tray icons (tools/New-TrayIcons.ps1) next to the exe, in tray\ -->
+  <ItemGroup>
+    <Content Include="..\..\assets\tray\*.ico" Link="tray\%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+  </ItemGroup>
+
+</Project>

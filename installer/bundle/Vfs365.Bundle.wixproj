@@ -1,0 +1,17 @@
+<Project Sdk="WixToolset.Sdk/5.0.2">
+
+  <!-- Setup program: WinFsp (unmodified, when missing or older) and then the VFS365 MSI. Built by ./build.ps1 release. -->
+
+  <PropertyGroup>
+    <OutputType>Bundle</OutputType>
+    <OutputName>VFS365-setup</OutputName>
+    <Version Condition="'$(Version)' == ''">0.0.0</Version>
+    <InstallerPlatform>$(Platform)</InstallerPlatform>
+    <DefineConstants>Version=$(Version);VfsMsi=$(VfsMsi);WinFspMsi=$(WinFspMsi);AssetsDir=$(MSBuildThisFileDirectory)..\..\assets</DefineConstants>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="WixToolset.Bal.wixext" Version="5.0.2" />
+  </ItemGroup>
+
+</Project>

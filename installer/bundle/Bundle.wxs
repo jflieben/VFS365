@@ -1,0 +1,17 @@
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs" xmlns:bal="http://wixtoolset.org/schemas/v4/wxs/bal">
+  <!--
+    One setup per architecture. WinFsp is installed unmodified (permitted by its FLOSS exception, VFS365 being GPLv3) and is permanent:
+    uninstalling VFS365 leaves it, as other software may use it. Burn skips WinFsp when the same or a newer version is installed.
+    Silent: VFS365-<version>-<arch>-setup.exe /quiet, removal with /uninstall /quiet.
+  -->
+  <Bundle Name="VFS365" Manufacturer="JSolve B.V." Version="$(Version)" UpgradeCode="{1CE1F16D-DE38-4295-AE8A-7C3C52171A4F}"
+          IconSourceFile="$(AssetsDir)\vfs365.ico" AboutUrl="https://www.jsolve.nl">
+    <BootstrapperApplication>
+      <bal:WixStandardBootstrapperApplication Theme="rtfLicense" LicenseFile="license.rtf" ShowVersion="yes" SuppressOptionsUI="yes" />
+    </BootstrapperApplication>
+    <Chain>
+      <MsiPackage SourceFile="$(WinFspMsi)" Permanent="yes" Visible="yes" />
+      <MsiPackage SourceFile="$(VfsMsi)" />
+    </Chain>
+  </Bundle>
+</Wix>

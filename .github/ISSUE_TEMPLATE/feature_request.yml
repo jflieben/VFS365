@@ -1,0 +1,23 @@
+name: Feature idea
+description: Something VFS365 should do.
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Ideas are welcome; we decide what gets built and when. For a feature your organisation needs on a timeline, see [SUPPORT.md](../blob/main/SUPPORT.md).
+  - type: textarea
+    id: problem
+    attributes:
+      label: What do you want to do, and what stops you now?
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: How could VFS365 help?
+  - type: textarea
+    id: context
+    attributes:
+      label: Anything else
+      description: The apps involved, the number of users or files, links.
