@@ -26,6 +26,11 @@ public sealed partial class DriveEngine
         public bool Pushed { get; set; }
         public Task? Polling { get; set; }
 
+        /// <summary>Reads that failed in a row; no read before RetryAt. Problem is what the log last said about it.</summary>
+        public int Failures { get; set; }
+        public DateTimeOffset RetryAt { get; set; }
+        public string? Problem { get; set; }
+
         /// <summary>Folders of this drive that started loading lately, to notice a tree walk and find where it is.</summary>
         public Queue<(DateTimeOffset At, string Path)> Loads { get; } = new();
 
@@ -94,7 +99,7 @@ public sealed partial class DriveEngine
         }
     }
 
-    /// <summary>Reads a drive's changes now, or joins the read already running.</summary>
+    /// <summary>Reads a drive's changes now, or joins the read already running. After failures, not before the back-off ends.</summary>
     public Task PollAsync(string driveId)
     {
         var feed = feeds.GetOrAdd(driveId, _ => NewFeed());
@@ -103,6 +108,10 @@ public sealed partial class DriveEngine
             if (feed.Polling is { IsCompleted: false } running)
             {
                 return running;
+            }
+            if (Now < feed.RetryAt)
+            {
+                return Task.CompletedTask;
             }
             feed.LastPoll = Now;
             var requestedAt = Now;
@@ -162,12 +171,12 @@ public sealed partial class DriveEngine
             }
             Apply(driveId, changes);
             feed.DeltaLink = link;
-            feed.Broken = false;
+            Recovered(driveId, feed);
         }
         catch (RemoteException e) when (e.Error == RemoteError.Gone)
         {
             // Expired: what is cached may have missed changes. Start over from now; folders are read again when used.
-            Log($"change feed of drive {driveId} expired; folders are read again");
+            Log($"change feed of {FeedName(driveId)} expired; folders are read again");
             DropDrive(driveId);
             try
             {
@@ -176,14 +185,12 @@ public sealed partial class DriveEngine
             catch (Exception again) when (again is not OperationCanceledException)
             {
                 feed.DeltaLink = null;
-                Log($"change feed of drive {driveId}: {again.Message}");
+                Failed(driveId, feed, again);
             }
         }
         catch (Exception e) when (e is not OperationCanceledException)
         {
-            // Listings fall back to ListingTtl until a read succeeds
-            feed.Broken = true;
-            Log($"change feed of drive {driveId}: {e.Message}");
+            Failed(driveId, feed, e);
         }
     }
 
@@ -191,8 +198,45 @@ public sealed partial class DriveEngine
     {
         feed.DeltaLink = await api.GetLatestDeltaLinkAsync(driveId, CancellationToken.None);
         feed.BaselineAt = started;
-        feed.Broken = false;
+        Recovered(driveId, feed);
     }
+
+    static readonly TimeSpan FirstFeedRetry = TimeSpan.FromMinutes(1), LastFeedRetry = TimeSpan.FromMinutes(30);
+
+    /// <summary>
+    /// A read failed. Listings fall back to ListingTtl (read again when opened) until one succeeds. Reads back off from 1 to 30
+    /// minutes, and the log tells once per problem instead of on every attempt.
+    /// </summary>
+    void Failed(string driveId, Feed feed, Exception e)
+    {
+        feed.Broken = true;
+        feed.Failures++;
+        var wait = TimeSpan.FromTicks(Math.Min(LastFeedRetry.Ticks, FirstFeedRetry.Ticks << Math.Min(feed.Failures - 1, 10)));
+        feed.RetryAt = Now + wait;
+        var problem = e is RemoteException { Error: RemoteError.ReadOnly }
+            ? "SharePoint has the library read-only for now (maintenance or a site move)"
+            : e.Message;
+        if (problem != feed.Problem)
+        {
+            Log($"change feed of {FeedName(driveId)}: {problem}. Folders are read again when opened; trying again in {wait.TotalMinutes:0} min, then less often");
+            feed.Problem = problem;
+        }
+    }
+
+    void Recovered(string driveId, Feed feed)
+    {
+        if (feed.Failures > 0)
+        {
+            Log($"change feed of {FeedName(driveId)} works again after {feed.Failures} failed read(s)");
+        }
+        feed.Broken = false;
+        feed.Failures = 0;
+        feed.RetryAt = default;
+        feed.Problem = null;
+    }
+
+    /// <summary>The library's path on the volume, and its drive ID for support.</summary>
+    string FeedName(string driveId) => ns.VolumePathOf(driveId) is { } path ? $"{path} (drive {driveId})" : $"drive {driveId}";
 
     /// <summary>
     /// The front end opened a folder of the drive. Many folder loads in a short time that also go down the tree mean a walk (copy,

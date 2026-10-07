@@ -7,12 +7,13 @@ using Vfs365.Core;
 namespace Vfs365.Graph;
 
 public sealed class M365RequestException(HttpStatusCode status, Uri uri, string detail)
-    : RemoteException(ToError(status), $"{(int)status} {status} from {uri.GetLeftPart(UriPartial.Path)}: {detail}")
+    : RemoteException(ToError(status, detail), $"{(int)status} {status} from {uri.GetLeftPart(UriPartial.Path)}: {detail}")
 {
     public HttpStatusCode Status { get; } = status;
 
-    static RemoteError ToError(HttpStatusCode status) => (int)status switch
+    static RemoteError ToError(HttpStatusCode status, string detail) => (int)status switch
     {
+        _ when detail.Contains("\"serviceReadOnly\"", StringComparison.OrdinalIgnoreCase) => RemoteError.ReadOnly,
         404 => RemoteError.NotFound,
         410 => RemoteError.Gone,
         401 or 403 => RemoteError.AccessDenied,

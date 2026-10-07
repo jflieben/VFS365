@@ -81,7 +81,7 @@ The agent mounts with what the last run knew: libraries, their drive IDs and the
 - Icons come from `tray\tray-{light,dark}-{normal,waiting,error}.ico` (made by `tools/New-TrayIcons.ps1`). The set follows the taskbar theme and changes with it; the size matches the system DPI.
 - Show files opens the navigation pane entry (`shell:::{CLSID}`), else the drive letter or UNC path. Explorer can't parse `\\VFS365` until it has loaded the network provider.
 - Restart starts the same exe with the same arguments plus `--after <pid>`. The new agent waits for the old one to exit, then mounts.
-- Other items: status, Show log, Help (`HelpUrl`), JSolve website, version.
+- Other items: status, Show log, Help (`HelpUrl`), and the version line, which opens the JSolve website.
 
 ## Caches and transfers
 
@@ -101,6 +101,7 @@ The agent mounts with what the last run knew: libraries, their drive IDs and the
 - Reading it returns changed items with their parent's ID; they are applied to cached listings by item ID (adds, edits, deletes, moves; a renamed folder drops its cached subtree). Echoes of the engine's own uploads change nothing. An expired link (410) drops the drive's cache and starts over.
 - Wake-ups: a socket.io push channel per drive used in the last 10 minutes (`GET .../root/subscriptions/socketIo`, Engine.IO 3 over a WebSocket; a notification carries no details, so it triggers a delta read). Without push: on use every 15 s and in the background every 60 s while active. With push: a safety read every 15 minutes.
 - Hot libraries: a drive used in the last 2 minutes is also read every `ChangeCheckSeconds` (default 20 s), so a change shows within about 20 s even when SharePoint's push is slow. Paused for 15 minutes after any 429 or 503.
+- Failed reads back off per drive from 1 to 30 minutes (pushes and hot checks wait too); the log says what went wrong once per problem and again when reads work. Meanwhile listings are read again when opened (`ListingTtl`). A `403` with `serviceReadOnly` ("Database Is Read Only": SharePoint maintenance or a site move) is `RemoteError.ReadOnly`: writes into such a library wait and retry, and failed uploads and deletes back off from 30 s to 15 minutes.
 - Changes reach Windows through WinFsp's `Notify` (Explorer refreshes, `ReadDirectoryChangesW` watchers see them). Paths are sent upper-cased, matching the names WinFsp keeps when no normalized name is returned.
 - Push latency is SharePoint's: 7 to 31 s measured from a change elsewhere to the notification, usually about 25 s, often two notifications per change.
 

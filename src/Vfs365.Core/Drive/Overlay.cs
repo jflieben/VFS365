@@ -7,6 +7,9 @@ internal abstract class LocalState(string driveId, string drivePath)
     public string DrivePath { get; set; } = drivePath;
     public string Key => DriveEngine.Key(DriveId, DrivePath);
     public string Name => DrivePath[(DrivePath.LastIndexOf('/') + 1)..];
+
+    /// <summary>Uploads or deletes that failed in a row, for the retry back-off.</summary>
+    public int Failures { get; set; }
 }
 
 /// <summary>Content staged locally. Base is the remote item it will be uploaded into; null for a new file.</summary>

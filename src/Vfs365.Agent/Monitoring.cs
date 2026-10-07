@@ -72,7 +72,7 @@ public sealed class Monitoring(MonitoringTarget target, DeviceInfo device, Actio
     public const string ErrorsTable = "errors";
     public const string StatisticsTable = "statistics";
     public const string DevicesTable = "devices";
-    public const string Instructions = "https://jsolve.nl";
+    public const string Instructions = "https://github.com/jflieben/VFS365/blob/main/docs/DEPLOYMENT.md#monitoring";
     const int MaxErrorsPerHour = 20;
 
     static readonly HttpClient http = new() { Timeout = TimeSpan.FromSeconds(15) };

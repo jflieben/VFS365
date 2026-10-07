@@ -454,8 +454,8 @@ public sealed partial class DriveEngine
                         }
                         catch (Exception e) when (IsTransient(e))
                         {
-                            gone.Deadline = Now + options.RetryInterval;
-                            Log($"delete of {gone.DrivePath} failed, retrying: {e.Message}");
+                            gone.Deadline = Now + RetryDelay(++gone.Failures);
+                            Log($"delete of {gone.DrivePath} failed, retrying in {RetryDelay(gone.Failures).TotalMinutes:0.#} min: {Short(e)}");
                             break;
                         }
                         DropLocal(gone);
@@ -600,12 +600,12 @@ public sealed partial class DriveEngine
 
         if (failure is not null)
         {
-            pending.RetryAt = Now + options.RetryInterval;
-            Log($"upload of {pending.DrivePath} failed, retrying: {failure.Message}");
+            pending.RetryAt = Now + RetryDelay(++pending.Failures);
+            Log($"upload of {pending.DrivePath} failed, retrying in {RetryDelay(pending.Failures).TotalMinutes:0.#} min: {Short(failure)}");
             if (!pending.Waiting)
             {
                 pending.Waiting = true;
-                Notify(NoticeKind.UploadWaiting, pending.DriveId, pending.DrivePath, failure.Message);
+                Notify(NoticeKind.UploadWaiting, pending.DriveId, pending.DrivePath, Short(failure));
             }
         }
         else if (copy is not null)
@@ -738,8 +738,17 @@ public sealed partial class DriveEngine
     string ConflictName(string name) =>
         $"{Path.GetFileNameWithoutExtension(name)} (conflict {Now.ToLocalTime():yyyy-MM-dd HHmm}){Path.GetExtension(name)}";
 
+    /// <summary>Retries back off: RetryInterval, then twice as long each time, up to 15 minutes.</summary>
+    TimeSpan RetryDelay(int failures) =>
+        TimeSpan.FromTicks(Math.Min(TimeSpan.FromMinutes(15).Ticks, options.RetryInterval.Ticks << Math.Clamp(failures - 1, 0, 10)));
+
+    /// <summary>What went wrong, in words a user or admin can act on.</summary>
+    static string Short(Exception e) => e is RemoteException { Error: RemoteError.ReadOnly }
+        ? "SharePoint has the library read-only for now (maintenance or a site move)"
+        : e.Message;
+
     static bool IsTransient(Exception e) =>
-        e is HttpRequestException or TaskCanceledException or TimeoutException || e is RemoteException { Error: RemoteError.Throttled or RemoteError.Unavailable };
+        e is HttpRequestException or TaskCanceledException or TimeoutException || e is RemoteException { Error: RemoteError.Throttled or RemoteError.Unavailable or RemoteError.ReadOnly };
 
     static void TryDelete(string path)
     {

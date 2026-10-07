@@ -116,7 +116,7 @@ Read the tables with Azure Storage Explorer, Excel or Power BI (Azure Table Stor
 - Tree walks (copying a folder tree, searching, backups) get up to `WalkPrefetchFolders` folders listed ahead of them, in their own order; the log reports per walk how many were used.
 - Copies of many small files run at about disk speed: to the drive, new files upload right after they are closed (`BackgroundUploads`); out of the drive, the next small files are downloaded ahead (`ReadAheadFiles`). Measured with 300 small files and Microsoft Defender on: to the drive 3 s (all uploaded after 29 s), out of the drive 21 s with nothing cached.
 - Apps that write a file in many small pieces, or append and close it again and again, upload it once when done or once per `RepeatSaveSeconds`, not on every close.
-- A tray icon shows the status and notifies about conflict copies, uploads that wait (offline, throttled) and sign-in problems. Its menu: Show files, Show log, Restart, Help (`HelpUrl`), JSolve website.
+- A tray icon shows the status and notifies about conflict copies, uploads that wait (offline, throttled) and sign-in problems. Its menu: Show files, Show log, Restart, Help (`HelpUrl`), and the version, which opens the JSolve website.
 - `vfs365.exe pin <url>` adds a site, library or folder link for the user (`unpin`, `pins` to list); it shows after Restart.
 - `vfs365.exe signout` stops the drive in the session, forgets the sign-in and removes the cached data (unsaved changes stay).
 
@@ -173,4 +173,5 @@ Other antivirus products: the same idea applies. Leave the drive scanned, and ex
 - `vfs365.exe inspect <path>` shows what Graph has at a path on the volume (`--versions` counts versions); `vfs365.exe watch <folder>` shows push notifications for its library.
 - `vfs365.exe machine-report install` sends an install row to the `devices` table, or says why it can't; `vfs365.exe settings` shows the monitoring account (never the SAS) and the API use settings.
 - Unsaved changes wait in `%LOCALAPPDATA%\VFS365\staging` and upload at the next start.
+- "SharePoint has the library read-only for now" in the log: SharePoint answered `403 serviceReadOnly` ("Database Is Read Only"), usually during maintenance or while a site is moved, and it passes. The change check backs off (up to 30 minutes), saves into that library wait and retry, and the log says when it works again. If it lasts for days, check the site in the SharePoint admin center (a read-only lock or an archived site).
 - Known WinFsp 2.1 issue: scripts that enumerate deep trees recursively (`Get-ChildItem -Recurse`, .NET `AllDirectories`) can fail with "The network path was not found". Explorer is not affected. Fixed in WinFsp 2026 (2.2), which a later release will bundle.

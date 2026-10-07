@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.0 (2026-10-07)
+
+- Libraries that SharePoint keeps read-only for a while (maintenance, a site or geo move: `403 serviceReadOnly`, "Database Is Read Only"): the change check no longer retries every 20 s and logs every attempt. It backs off from 1 to 30 minutes, logs the problem once in plain words and logs again when it works; folders are read again when opened meanwhile. Saves into such a library wait and retry (shown as waiting in the tray) instead of failing.
+- Uploads and deletes that fail for a passing reason retry less often over time: 30 s, then twice as long each time, up to 15 minutes.
+- Change feed log lines name the library's path, not just its drive ID.
+
 ## 0.1.9 (2026-10-07)
 
 - Copying many small files to the drive is much faster: new files upload right after their close, four at a time, instead of the close waiting for each upload (new `BackgroundUploads` policy, on by default). 300 small files: the copy takes 3 s instead of 171 s, and all are uploaded after 29 s, with half the requests. Saves into existing files still upload before the close returns.

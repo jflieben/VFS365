@@ -79,9 +79,16 @@ sealed class FakeDriveApi : IDriveApi
     /// <summary>Every delta call fails (503), so listings rely on their TTL.</summary>
     public bool DeltaUnavailable { get; set; }
 
+    /// <summary>Every delta call fails as SharePoint does while a site is read-only (403 serviceReadOnly).</summary>
+    public bool DeltaReadOnly { get; set; }
+
     public Task<string> GetLatestDeltaLinkAsync(string driveId, CancellationToken ct)
     {
         Interlocked.Increment(ref DeltaCalls);
+        if (DeltaReadOnly)
+        {
+            throw new RemoteException(RemoteError.ReadOnly, "403 serviceReadOnly: Database Is Read Only");
+        }
         if (DeltaUnavailable)
         {
             throw new RemoteException(RemoteError.Unavailable, "503");
@@ -95,6 +102,10 @@ sealed class FakeDriveApi : IDriveApi
     public Task<DeltaPage> GetDeltaAsync(string link, CancellationToken ct)
     {
         Interlocked.Increment(ref DeltaCalls);
+        if (DeltaReadOnly)
+        {
+            throw new RemoteException(RemoteError.ReadOnly, "403 serviceReadOnly: Database Is Read Only");
+        }
         if (DeltaUnavailable)
         {
             throw new RemoteException(RemoteError.Unavailable, "503");

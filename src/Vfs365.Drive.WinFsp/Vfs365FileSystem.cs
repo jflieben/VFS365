@@ -439,6 +439,7 @@ sealed class Vfs365FileSystem(DriveEngine engine, string label, Action<string>? 
             RemoteException { Error: RemoteError.NotFound } => STATUS_OBJECT_NAME_NOT_FOUND,
             RemoteException { Error: RemoteError.AccessDenied } => STATUS_ACCESS_DENIED,
             RemoteException { Error: RemoteError.Locked or RemoteError.Conflict } => STATUS_SHARING_VIOLATION,
+            RemoteException { Error: RemoteError.ReadOnly } => STATUS_MEDIA_WRITE_PROTECTED,
             RemoteException { Error: RemoteError.Throttled or RemoteError.Unavailable } => STATUS_UNEXPECTED_NETWORK_ERROR,
             HttpRequestException => STATUS_NETWORK_UNREACHABLE,
             TaskCanceledException or TimeoutException => STATUS_IO_TIMEOUT,

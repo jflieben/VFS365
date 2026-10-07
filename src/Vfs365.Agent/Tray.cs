@@ -204,9 +204,8 @@ sealed class Tray : IDisposable
         AppendMenu(menu, MfString, Restart, $"Restart {label}");
         AppendMenu(menu, MfSeparator, 0, null);
         AppendMenu(menu, MfString, Help, "Help");
-        AppendMenu(menu, MfString, Website, "JSolve website");
         AppendMenu(menu, MfSeparator, 0, null);
-        AppendMenu(menu, MfString | MfGrayed, 0, $"VFS365 {typeof(Tray).Assembly.GetName().Version!.ToString(3)} by JSolve B.V.");
+        AppendMenu(menu, MfString, Website, $"VFS365 {typeof(Tray).Assembly.GetName().Version!.ToString(3)} by JSolve B.V.");
         SetMenuDefaultItem(menu, ShowFiles, 0);
         GetCursorPos(out var point);
         SetForegroundWindow(window);
