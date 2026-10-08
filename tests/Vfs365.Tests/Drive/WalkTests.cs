@@ -39,8 +39,13 @@ public sealed class WalkTests : IDisposable
     static async Task<string[]> Names(DriveEngine engine, string path) =>
         (await engine.ListAsync((await engine.GetEntryAsync(path, default))!, default)).Select(e => e.Name).Order(StringComparer.OrdinalIgnoreCase).ToArray();
 
-    static async Task Settle(FakeDriveApi api)
+    /// <summary>Waits until at least <paramref name="expected"/> listings were asked for (busy build machines), then until no more come for 20 ms.</summary>
+    static async Task Settle(FakeDriveApi api, int expected = 0)
     {
+        for (var waited = 0; api.ListCalls < expected && waited < 10_000; waited += 20)
+        {
+            await Task.Delay(20);
+        }
         for (int last = -1, i = 0; i < 100 && last != api.ListCalls; i++)
         {
             last = api.ListCalls;
@@ -71,7 +76,7 @@ public sealed class WalkTests : IDisposable
             Assert.Equal(["a.txt", "sub"], await Names(engine, $"\\f{f:D2}"));
             Assert.Equal(["b.txt"], await Names(engine, $"\\f{f:D2}\\sub"));
         }
-        await Settle(api);
+        await Settle(api, 21);
 
         Assert.Equal(21, api.ListCalls);
         Assert.Contains(log, line => line.Contains("tree walk on drive b!me"));
@@ -91,7 +96,7 @@ public sealed class WalkTests : IDisposable
             await Names(engine, $"\\f{f:D2}");
         }
         await Names(engine, "\\f00\\sub");
-        await Settle(api);
+        await Settle(api, 21);
         Assert.Equal(21, api.ListCalls);
 
         for (var f = 1; f < 10; f++)
@@ -126,7 +131,7 @@ public sealed class WalkTests : IDisposable
         var api = Tree(50);
         var engine = Create(api, prefetchAhead: 5);
         await StartWalk(engine);
-        await Settle(api);
+        await Settle(api, 3 + 5);
         Assert.Equal(3 + 5, api.ListCalls);
 
         now += TimeSpan.FromSeconds(60);
@@ -134,7 +139,7 @@ public sealed class WalkTests : IDisposable
         Assert.Contains(log, line => line.Contains("ended: 5 folder(s) loaded ahead, 0 of them opened"));
 
         await Names(engine, "\\f40");
-        await Settle(api);
+        await Settle(api, 3 + 5 + 1);
         Assert.Equal(3 + 5 + 1, api.ListCalls);
     }
 
@@ -150,7 +155,7 @@ public sealed class WalkTests : IDisposable
         {
             await Names(engine, $"\\f{f:D2}");
         }
-        await Settle(api);
+        await Settle(api, 7);
 
         Assert.Equal(7, api.ListCalls);
     }

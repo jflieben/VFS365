@@ -220,14 +220,14 @@ public sealed class UploadTests : IDisposable
         {
             Assert.Equal($"photo {i}", await ReadAllAsync(engine, files[i]));
         }
-        await Settle();
+        await Settle(3 + 5);
         Assert.Equal(3 + 5, api.Downloads);
 
         for (var i = 3; i < 8; i++)
         {
             Assert.Equal($"photo {i}", await ReadAllAsync(engine, files[i]));
         }
-        await Settle();
+        await Settle(8 + 5);
         Assert.Equal(8 + 5, api.Downloads);
 
         now += TimeSpan.FromSeconds(30);
@@ -253,8 +253,16 @@ public sealed class UploadTests : IDisposable
         Assert.Equal(2, api.Downloads);
     }
 
-    async Task Settle()
+    /// <summary>
+    /// Waits until at least <paramref name="expected"/> downloads started (background work starts late on a busy build machine), then until
+    /// no more start for 50 ms, so one too many still shows.
+    /// </summary>
+    async Task Settle(int expected = 0)
     {
+        for (var waited = 0; api.Downloads < expected && waited < 10_000; waited += 20)
+        {
+            await Task.Delay(20);
+        }
         for (int last = -1, i = 0; i < 100 && last != api.Downloads; i++)
         {
             last = api.Downloads;
