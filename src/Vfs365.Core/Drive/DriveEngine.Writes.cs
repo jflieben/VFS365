@@ -100,7 +100,7 @@ public sealed partial class DriveEngine
             var staging = NewStagingFile();
             if (!truncate)
             {
-                await content.CopyToAsync(target.DriveId, item.Id, item.CTag ?? item.ETag, item.Size, staging, ct);
+                await content.CopyToAsync(target.DriveId, item.Id, item.CTag ?? item.ETag, ServedSize(target.DriveId, item), staging, ct, current => ContentChanged(target.DriveId, current));
             }
             var staged = new PendingFile(target.DriveId, target.DrivePath, staging, item, Now) { Dirty = truncate };
             overlay[key] = staged;
@@ -377,7 +377,7 @@ public sealed partial class DriveEngine
                 DriveItemInfo updated;
                 try
                 {
-                    await content.CopyToAsync(driveId, item.Id, item.CTag ?? item.ETag, item.Size, file, ct);
+                    await content.CopyToAsync(driveId, item.Id, item.CTag ?? item.ETag, ServedSize(driveId, item), file, ct, current => ContentChanged(driveId, current));
                     updated = await api.UploadAsync(driveId, UploadTarget.Existing(toItem), file, ct);
                 }
                 catch

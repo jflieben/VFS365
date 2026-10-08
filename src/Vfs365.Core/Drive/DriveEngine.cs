@@ -353,7 +353,7 @@ public sealed partial class DriveEngine(DriveNamespace ns, IDriveApi api, Conten
         }
         var driveId = await file.Drive!.GetDriveIdAsync(ct);
         NoteRead(driveId, file);
-        return content.Open(driveId, file.ItemId!, file.ContentTag, file.Size);
+        return content.Open(driveId, file.ItemId!, file.ContentTag, file.Size, current => ContentChanged(driveId, current));
     }
 
     public string? StagingPathOf(FsEntry file) =>
@@ -543,7 +543,7 @@ public sealed partial class DriveEngine(DriveNamespace ns, IDriveApi api, Conten
         Path = path,
         Name = item.Name,
         IsDirectory = item.IsFolder,
-        Size = item.IsFolder ? 0 : item.Size,
+        Size = item.IsFolder ? 0 : ServedSize(driveId, item),
         Created = item.Created,
         Modified = item.Modified,
         ReadOnly = IsReadOnly(drive, item.Name, item.IsFolder),

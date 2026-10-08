@@ -190,6 +190,14 @@ sealed class Vfs365FileSystem(DriveEngine engine, string label, Action<string>? 
             bytes.AsSpan(0, read).CopyTo(new Span<byte>((void*)buffer, read));
             bytesTransferred = (uint)read;
         }
+        catch (Exception e) when (e is not FsException)
+        {
+            if (e is not ContentChangedException) // the engine logged it, with the sizes
+            {
+                log?.Invoke($"error: reading {handle.Entry.Path}: {e.GetType().Name}: {e.Message}");
+            }
+            return Status(e);
+        }
         finally
         {
             ArrayPool<byte>.Shared.Return(bytes);
@@ -424,11 +432,15 @@ sealed class Vfs365FileSystem(DriveEngine engine, string label, Action<string>? 
 
     public override int ExceptionHandler(Exception ex)
     {
-        if (ex is not FsException)
+        if (ex is not (FsException or ContentChangedException))
         {
             log?.Invoke($"error: {ex.GetType().Name}: {ex.Message}");
         }
-        return ex switch
+        return Status(ex);
+    }
+
+    static int Status(Exception ex) =>
+        ex switch
         {
             FsException { Error: FsError.NotFound } => STATUS_OBJECT_NAME_NOT_FOUND,
             FsException { Error: FsError.NameCollision } => STATUS_OBJECT_NAME_COLLISION,
@@ -441,11 +453,11 @@ sealed class Vfs365FileSystem(DriveEngine engine, string label, Action<string>? 
             RemoteException { Error: RemoteError.Locked or RemoteError.Conflict } => STATUS_SHARING_VIOLATION,
             RemoteException { Error: RemoteError.ReadOnly } => STATUS_MEDIA_WRITE_PROTECTED,
             RemoteException { Error: RemoteError.Throttled or RemoteError.Unavailable } => STATUS_UNEXPECTED_NETWORK_ERROR,
+            ContentChangedException => STATUS_FILE_INVALID, // "externally altered so that the opened file is no longer valid"
             HttpRequestException => STATUS_NETWORK_UNREACHABLE,
             TaskCanceledException or TimeoutException => STATUS_IO_TIMEOUT,
             _ => STATUS_UNEXPECTED_IO_ERROR,
         };
-    }
 
     /// <summary>The handle's current content: the staging file while the file is being changed, else the cached or streaming download.</summary>
     IContentSource Readable(Handle handle)

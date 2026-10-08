@@ -201,11 +201,32 @@ sealed class FakeDriveApi : IDriveApi
     public int Sessions, Fragments, CancelledSessions;
     readonly Dictionary<Uri, (UploadTarget Target, byte[] Buffer)> sessions = [];
 
-    public async Task<Stream> OpenReadAsync(string driveId, string itemId, long offset, CancellationToken ct)
+    /// <summary>Downloads that fail after starting, like a dropped connection.</summary>
+    public int FailDownloads;
+
+    public async Task<Stream> OpenReadAsync(string driveId, string itemId, long offset, long length, CancellationToken ct)
     {
         Interlocked.Increment(ref Downloads);
         await Task.Delay(20, ct);
-        return new CountingStream(new MemoryStream(nodes[itemId].Content, (int)offset, nodes[itemId].Content.Length - (int)offset), this);
+        var node = nodes[itemId];
+        if (Interlocked.Decrement(ref FailDownloads) >= 0)
+        {
+            throw new IOException("The response ended prematurely.");
+        }
+        if (node.Content.Length != length)
+        {
+            throw new ContentChangedException(node.Item with { Size = node.Content.Length }, length);
+        }
+        return new CountingStream(new MemoryStream(node.Content, (int)offset, node.Content.Length - (int)offset), this);
+    }
+
+    /// <summary>New content that the item's size and the change feed don't show (a change not seen yet, or SharePoint rewriting it).</summary>
+    public void ServeOtherContent(string path, byte[] content)
+    {
+        lock (nodes)
+        {
+            Find(path)!.Content = content;
+        }
     }
 
     /// <summary>How long each whole-file upload takes, like a network would.</summary>

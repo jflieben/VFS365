@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.1 (unreleased)
+
+- Downloads: a file that Microsoft 365 serves with another length than it lists (changed since the folder was listed, or an Office file SharePoint writes library properties into) no longer fails three times with "Unable to read beyond the end of the stream", and a longer one is no longer cut off without notice. The read fails once, the drive takes the length served, and opening the file again works; the log names the file.
+- Downloads that break off are tried again after 1 and 2 s. Only when all three attempts fail is the error logged, now with the file's path, and reported to monitoring.
+
 ## 0.3.0 (2026-10-08)
 
 - Fewer calls at sign-in, spread over time: when the libraries of the last session are less than a week old, the drive shows them at once and discovery waits a random 5 to 90 minutes, so a tenant's morning sign-ins don't all discover at the same moment. Library details are then read again only for libraries checked more than 48 hours ago (each library by its own age; before, all of them every 24 hours). A first start, or a state older than a week, discovers right away.

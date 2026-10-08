@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Net;
 using System.Net.Http.Headers;
 using System.Runtime.CompilerServices;
 using System.Text;
@@ -73,14 +74,30 @@ public sealed partial class DriveApi(M365Client client) : IDriveApi
     }
 
     /// <summary>Asks for a fresh pre-authenticated download URL per stream; it is never kept.</summary>
-    public async Task<Stream> OpenReadAsync(string driveId, string itemId, long offset, CancellationToken ct)
+    public async Task<Stream> OpenReadAsync(string driveId, string itemId, long offset, long length, CancellationToken ct)
     {
         string url;
+        DriveItemInfo current;
         using (var doc = await client.GetJsonAsync(new Uri($"{DriveUrl(driveId)}/items/{itemId}"), ct))
         {
             url = doc!.RootElement.GetProperty("@microsoft.graph.downloadUrl").GetString()!;
+            current = Parse(doc.RootElement)!;
         }
-        return await client.OpenStreamAsync(new Uri(url), offset, ct);
+        (Stream Content, long? Total) download;
+        try
+        {
+            download = await client.OpenStreamAsync(new Uri(url), offset, ct);
+        }
+        catch (M365RequestException e) when (e.Status == HttpStatusCode.RequestedRangeNotSatisfiable)
+        {
+            throw new ContentChangedException(current, length); // the offset is past the end of what is there now
+        }
+        if (download.Total is { } served && served != length)
+        {
+            await download.Content.DisposeAsync();
+            throw new ContentChangedException(current with { Size = served }, length);
+        }
+        return download.Content;
     }
 
     public async Task<DriveItemInfo> UploadAsync(string driveId, UploadTarget target, string sourceFile, CancellationToken ct)

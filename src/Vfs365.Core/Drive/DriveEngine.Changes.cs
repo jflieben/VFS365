@@ -544,6 +544,49 @@ public sealed partial class DriveEngine
         }
     }
 
+    /// <summary>
+    /// A download served another length than the listing says: the file changed since it was listed, or SharePoint serves an Office file
+    /// with properties written into it. The listing takes the item as served, so opening it again reads it whole.
+    /// </summary>
+    void ContentChanged(string driveId, DriveItemInfo current)
+    {
+        servedLengths[Key(driveId, current.Id)] = (current.CTag ?? current.ETag, current.Size);
+        var prefix = Key(driveId, "");
+        string? path = null;
+        var listed = 0L;
+        foreach (var (key, listing) in listings)
+        {
+            if (key.StartsWith(prefix, StringComparison.Ordinal) && listing.IsLoaded && listing.Items.Values.FirstOrDefault(i => i.Id == current.Id) is { } known)
+            {
+                (path, listed) = (JoinDrivePath(key[prefix.Length..], known.Name), known.Size);
+                listing.Items[known.Name] = current with { Name = known.Name };
+            }
+        }
+        foreach (var (key, lookup) in lookups)
+        {
+            if (key.StartsWith(prefix, StringComparison.Ordinal) && lookup.Item is { } known && known.Id == current.Id)
+            {
+                (path, listed) = (key[prefix.Length..], known.Size);
+                lookups[key] = (current with { Name = known.Name }, lookup.At);
+            }
+        }
+        if (path is null)
+        {
+            return;
+        }
+        var shown = ns.VolumePathOf(driveId) is { } top ? Join(top, path.Replace('/', '\\')) : path;
+        Log($"{shown}: {listed} bytes listed, {current.Size} served (changed in Microsoft 365, or SharePoint wrote properties into it); " +
+            "a read failed, opening it again works");
+        Report(driveId, path, ChangeKind.Modified, false);
+    }
+
+    /// <summary>Lengths downloads served that differ from the listed size, per item, for the content version they were served for.</summary>
+    readonly ConcurrentDictionary<string, (string? Tag, long Length)> servedLengths = new(StringComparer.Ordinal);
+
+    /// <summary>A file's size as its downloads serve it: listings and lookups bring SharePoint's own figure back.</summary>
+    long ServedSize(string driveId, DriveItemInfo item) =>
+        servedLengths.TryGetValue(Key(driveId, item.Id), out var served) && served.Tag == (item.CTag ?? item.ETag) ? served.Length : item.Size;
+
     /// <summary>Reports the difference between a listing and its refreshed version.</summary>
     void ReportDifferences(string driveId, string folderPath, Listing before, Listing after)
     {

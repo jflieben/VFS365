@@ -2,6 +2,17 @@ namespace Vfs365.Core.Drive;
 
 public sealed record DriveItemInfo(string Id, string Name, bool IsFolder, long Size, DateTimeOffset Created, DateTimeOffset Modified, string? ETag, string? CTag);
 
+/// <summary>
+/// A download serves another length than the listing said: the file changed in Microsoft 365 since it was listed, or SharePoint serves
+/// an Office file with properties written into it. <see cref="Current"/> is the item with the length served.
+/// </summary>
+public sealed class ContentChangedException(DriveItemInfo current, long listed)
+    : IOException($"changed in Microsoft 365 since it was listed ({listed} bytes listed, {current.Size} served)")
+{
+    public DriveItemInfo Current { get; } = current;
+    public long Listed { get; } = listed;
+}
+
 /// <summary>One change from a drive's delta feed. Item is null for deletions (and for items that are neither file nor folder).</summary>
 public sealed record DriveChange(string Id, string? ParentId, DriveItemInfo? Item, bool Deleted);
 
@@ -40,8 +51,11 @@ public interface IDriveApi
     /// <summary>Null when nothing exists at the path. "" returns the root folder.</summary>
     Task<DriveItemInfo?> GetItemAsync(string driveId, string path, CancellationToken ct);
 
-    /// <summary>Content from <paramref name="offset"/> to the end, as it arrives.</summary>
-    Task<Stream> OpenReadAsync(string driveId, string itemId, long offset, CancellationToken ct);
+    /// <summary>
+    /// Content from <paramref name="offset"/> to the end, as it arrives. Throws <see cref="ContentChangedException"/> when the content
+    /// served isn't <paramref name="length"/> bytes long.
+    /// </summary>
+    Task<Stream> OpenReadAsync(string driveId, string itemId, long offset, long length, CancellationToken ct);
 
     /// <summary>Whole-file upload: one request up to <see cref="UploadSession.SimpleUploadLimit"/>, else a session.</summary>
     Task<DriveItemInfo> UploadAsync(string driveId, UploadTarget target, string sourceFile, CancellationToken ct);

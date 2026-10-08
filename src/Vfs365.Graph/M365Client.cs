@@ -90,15 +90,22 @@ public sealed class M365Client(HttpClient http, ITokenSource tokens, RequestBudg
 
     /// <summary>
     /// Content from <paramref name="offset"/> to the end as a stream; dispose it to end the request. For pre-authenticated download URLs.
-    /// A server that ignores the range sends everything; the bytes before the offset are skipped.
+    /// A server that ignores the range sends everything; the bytes before the offset are skipped. Total is the whole content's length
+    /// the server states (Content-Range, else Content-Length), when it states one.
     /// </summary>
-    public async Task<Stream> OpenStreamAsync(Uri uri, long offset, CancellationToken ct)
+    public async Task<(Stream Content, long? Total)> OpenStreamAsync(Uri uri, long offset, CancellationToken ct)
     {
         var response = (await SendAsync(HttpMethod.Get, uri, null, null, false, false, ct, offset > 0 ? offset : null))!;
         try
         {
+            var partial = response.StatusCode == HttpStatusCode.PartialContent;
+            var total = partial ? response.Content.Headers.ContentRange?.Length : response.Content.Headers.ContentLength;
             var stream = new CountingStream(await response.Content.ReadAsStreamAsync(ct), Received);
-            if (offset > 0 && response.StatusCode != HttpStatusCode.PartialContent)
+            if (offset > 0 && !partial && total <= offset)
+            {
+                return (new ResponseStream(response, stream), total); // shorter than the offset: the caller sees Total
+            }
+            if (offset > 0 && !partial)
             {
                 var skip = new byte[81920];
                 for (var left = offset; left > 0;)
@@ -111,7 +118,7 @@ public sealed class M365Client(HttpClient http, ITokenSource tokens, RequestBudg
                     left -= read;
                 }
             }
-            return new ResponseStream(response, stream);
+            return (new ResponseStream(response, stream), total);
         }
         catch
         {

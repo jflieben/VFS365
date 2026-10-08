@@ -6,6 +6,8 @@ namespace Vfs365.Core.Drive;
 /// One item version downloaded on demand into a sparse local file in 1 MiB blocks. A read waits only for its own blocks.
 /// A sequential reader is fed by one streaming request that stays a few blocks ahead; a read elsewhere opens its own ranged request.
 /// Streams pause when nobody reads near them and stop after a while, so peeking at a big file doesn't download all of it.
+/// A failed stream is tried again after 1 and 2 s; reads fail only when all attempts did, or at once when the content served isn't
+/// Length bytes (then <c>contentChanged</c> gets the item as served).
 /// </summary>
 internal sealed class StreamingContent : IContentSource
 {
@@ -13,6 +15,7 @@ internal sealed class StreamingContent : IContentSource
     const int ReadAhead = 8;
     const int MaxStreams = 3;
     const int MaxFailures = 3;
+    static readonly TimeSpan RetryDelay = TimeSpan.FromSeconds(1);
     static readonly TimeSpan IdleStop = TimeSpan.FromSeconds(30);
     static readonly TimeSpan NoProgressTimeout = TimeSpan.FromSeconds(90);
 
@@ -26,6 +29,7 @@ internal sealed class StreamingContent : IContentSource
     readonly IDriveApi api;
     readonly string driveId, itemId, partialPath, finalPath;
     readonly Action<StreamingContent> completed;
+    readonly Action<DriveItemInfo>? contentChanged;
     readonly CacheCipher? cipher;
     readonly byte[] nonce;
     readonly SafeFileHandle file;
@@ -40,9 +44,10 @@ internal sealed class StreamingContent : IContentSource
     bool finished;
 
     /// <param name="cipher">Encrypts blocks as they are written and decrypts reads, with the keystream of <paramref name="finalPath"/>'s name.</param>
-    public StreamingContent(IDriveApi api, string driveId, string itemId, long length, string finalPath, CacheCipher? cipher, Action<StreamingContent> completed)
+    public StreamingContent(IDriveApi api, string driveId, string itemId, long length, string finalPath, CacheCipher? cipher, Action<StreamingContent> completed,
+        Action<DriveItemInfo>? contentChanged = null)
     {
-        (this.api, this.driveId, this.itemId, this.finalPath, this.cipher, this.completed) = (api, driveId, itemId, finalPath, cipher, completed);
+        (this.api, this.driveId, this.itemId, this.finalPath, this.cipher, this.completed, this.contentChanged) = (api, driveId, itemId, finalPath, cipher, completed, contentChanged);
         nonce = CacheCipher.NonceFor(Path.GetFileName(finalPath));
         Length = length;
         partialPath = $"{finalPath}.{Guid.NewGuid():N}.part";
@@ -113,7 +118,9 @@ internal sealed class StreamingContent : IContentSource
                 {
                     if (failures >= MaxFailures)
                     {
-                        throw new IOException($"Download failed: {failure?.Message}", failure);
+                        throw failure is ContentChangedException mismatch
+                            ? new ContentChangedException(mismatch.Current, mismatch.Listed)
+                            : new IOException($"Download failed after {MaxFailures} attempts: {failure?.Message}", failure);
                     }
                     if (runners.Count < MaxStreams)
                     {
@@ -149,7 +156,16 @@ internal sealed class StreamingContent : IContentSource
     {
         try
         {
-            await using var stream = await api.OpenReadAsync(driveId, itemId, (long)runner.Next * BlockSize, disposed.Token);
+            int retry;
+            lock (gate)
+            {
+                retry = failures;
+            }
+            if (retry > 0)
+            {
+                await Task.Delay(RetryDelay * retry, disposed.Token);
+            }
+            await using var stream = await api.OpenReadAsync(driveId, itemId, (long)runner.Next * BlockSize, Length, disposed.Token);
             var buffer = new byte[BlockSize];
             while (true)
             {
@@ -198,6 +214,15 @@ internal sealed class StreamingContent : IContentSource
                     return;
                 }
             }
+        }
+        catch (ContentChangedException e) when (!disposed.IsCancellationRequested)
+        {
+            lock (gate)
+            {
+                failure = e;
+                failures = MaxFailures; // trying again serves the same
+            }
+            contentChanged?.Invoke(e.Current);
         }
         catch (Exception e) when (!disposed.IsCancellationRequested)
         {

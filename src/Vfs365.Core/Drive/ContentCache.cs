@@ -51,6 +51,7 @@ public sealed class ContentCache
         Evict(null);
     }
 
+
     /// <summary>Bytes and files of complete content on disk.</summary>
     public (long Bytes, int Files) Usage
     {
@@ -63,8 +64,11 @@ public sealed class ContentCache
         }
     }
 
-    /// <summary>Content for reading: the cached file, else a download that serves each read as soon as its blocks arrive. Dispose when done.</summary>
-    public IContentSource Open(string driveId, string itemId, string? contentTag, long length)
+    /// <summary>
+    /// Content for reading: the cached file, else a download that serves each read as soon as its blocks arrive. Dispose when done.
+    /// <paramref name="changed"/> gets the item as served when the download isn't <paramref name="length"/> bytes.
+    /// </summary>
+    public IContentSource Open(string driveId, string itemId, string? contentTag, long length, Action<DriveItemInfo>? changed = null)
     {
         var path = PathFor(driveId, itemId, contentTag);
         lock (streaming)
@@ -76,7 +80,7 @@ public sealed class ContentCache
                     Touch(path);
                     return new CachedFile(path, options.Cipher);
                 }
-                download = new StreamingContent(api, driveId, itemId, length, path, options.Cipher, finished => Completed(path, finished));
+                download = new StreamingContent(api, driveId, itemId, length, path, options.Cipher, finished => Completed(path, finished), changed);
                 streaming[path] = download;
             }
             download.References++;
@@ -95,9 +99,9 @@ public sealed class ContentCache
     }
 
     /// <summary>Downloads the complete content into the cache, unless it is there.</summary>
-    public async Task FetchAsync(string driveId, string itemId, string? contentTag, long length, CancellationToken ct)
+    public async Task FetchAsync(string driveId, string itemId, string? contentTag, long length, CancellationToken ct, Action<DriveItemInfo>? changed = null)
     {
-        using var source = Open(driveId, itemId, contentTag, length);
+        using var source = Open(driveId, itemId, contentTag, length, changed);
         if (source is Reference reference)
         {
             await reference.Download.CompleteAsync(ct);
@@ -105,10 +109,11 @@ public sealed class ContentCache
     }
 
     /// <summary>Writes the complete content, decrypted, to <paramref name="destination"/>, downloading what is missing.</summary>
-    public async Task CopyToAsync(string driveId, string itemId, string? contentTag, long length, string destination, CancellationToken ct)
+    public async Task CopyToAsync(string driveId, string itemId, string? contentTag, long length, string destination, CancellationToken ct,
+        Action<DriveItemInfo>? changed = null)
     {
         var path = PathFor(driveId, itemId, contentTag);
-        using var source = Open(driveId, itemId, contentTag, length);
+        using var source = Open(driveId, itemId, contentTag, length, changed);
         if (source is Reference reference)
         {
             await reference.Download.CompleteAsync(ct);

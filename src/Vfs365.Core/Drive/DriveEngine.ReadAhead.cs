@@ -94,7 +94,7 @@ public sealed partial class DriveEngine
         {
             if (Now < walk.ActiveUntil && !PrefetchPaused)
             {
-                await content.FetchAsync(driveId, item.Id, item.CTag ?? item.ETag, item.Size, CancellationToken.None);
+                await content.FetchAsync(driveId, item.Id, item.CTag ?? item.ETag, ServedSize(driveId, item), CancellationToken.None, current => ContentChanged(driveId, current));
                 return;
             }
         }
