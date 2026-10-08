@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.3.0 (2026-10-08)
+
+- Fewer calls at sign-in, spread over time: when the libraries of the last session are less than a week old, the drive shows them at once and discovery waits a random 5 to 90 minutes, so a tenant's morning sign-ins don't all discover at the same moment. Library details are then read again only for libraries checked more than 48 hours ago (each library by its own age; before, all of them every 24 hours). A first start, or a state older than a week, discovers right away.
+- Tray: Refresh reads all libraries and folders again (folders as they are opened). It works once a day, and only when the libraries were read more than an hour ago; when it is greyed out, pointing at it says why and when it works again.
+- Log: every sign-in starts a new `agent.log`, which begins with the settings that differ from the defaults and where each comes from (computer or user policy, marked Intune when Intune set it, or the config file). Earlier sign-ins move to `logs\`, kept for 7 days (at most 50 files); a log that reaches 10 MB continues in a new file. A restart from the tray keeps writing to the same log.
+- `vfs365 settings` shows every setting with its source.
+- Stability: `vfs365-agent.exe` now watches the agent and starts it again within seconds when it crashes (at most 3 times in 15 minutes), so the drive comes back without a new sign-in. The log says what Windows recorded about the crash (faulting module, exception, stack), and monitoring reports it.
+- Drive letter checks: at the start and every 5 minutes the agent checks what Windows tells Explorer about its drive letter, and logs when something is off, with the cause and the fix: a remembered mapping to another share on the same letter, no network provider reporting the letter (WinFsp.Np missing from the provider order), the letter removed by another tool, or VFS365.Np missing (typed `\\VFS365` paths).
+- Refresh in the tray shows one notification when it is done (the status reads "refreshing" meanwhile).
+- Monitoring: daily statistics split the time waited for the API budget into user actions (`BudgetWaitForegroundSeconds`) and background work (`BudgetWaitBackgroundSeconds`); `BudgetWaitSeconds` stays the total. The log line at unmount shows both.
+- Monitoring dashboard: `vfs365-monitoring.html`, one file that shows the monitoring tables in a browser: what needs attention, trends per day (including what users and background work waited for, with an explanation), devices, users, errors grouped by cause and installs, with details per row. It reads with a Read and List SAS, refreshes on a schedule and explains SAS and CORS problems. See DEPLOYMENT.md.
+
 ## 0.2.0 (2026-10-07)
 
 - Libraries that SharePoint keeps read-only for a while (maintenance, a site or geo move: `403 serviceReadOnly`, "Database Is Read Only"): the change check no longer retries every 20 s and logs every attempt. It backs off from 1 to 30 minutes, logs the problem once in plain words and logs again when it works; folders are read again when opened meanwhile. Saves into such a library wait and retry (shown as waiting in the tray) instead of failing.

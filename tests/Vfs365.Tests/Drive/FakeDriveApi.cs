@@ -34,6 +34,18 @@ sealed class FakeDriveApi : IDriveApi
         }
     }
 
+    /// <summary>A file the change feed never reports (a change the feed missed).</summary>
+    public DriveItemInfo AddUnnoticed(string path, string content = "abc")
+    {
+        lock (nodes)
+        {
+            var bytes = Encoding.UTF8.GetBytes(content);
+            var node = new Node(Item($"id-{path}", Name(path), false, bytes.Length, $"e{++version}"), path, bytes);
+            nodes[node.Item.Id] = node;
+            return node.Item;
+        }
+    }
+
     public string? ContentOf(string path) => Find(path) is { } node ? Encoding.UTF8.GetString(node.Content) : null;
 
     public byte[]? BytesOf(string path) => Find(path)?.Content;

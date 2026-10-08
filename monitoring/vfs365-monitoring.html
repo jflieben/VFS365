@@ -1,0 +1,1110 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VFS365 monitoring</title>
+<meta name="description" content="Dashboard for VFS365's monitoring tables: usage statistics, errors and installs, read straight from your Azure table storage.">
+<style>
+:root {
+  color-scheme: light;
+  --page: #f9f9f7; --surface: #fcfcfb; --surface-2: #f3f2ee;
+  --ink: #0b0b0b; --ink-2: #52514e; --muted: #898781;
+  --grid: #e1e0d9; --axis: #c3c2b7; --ring: rgba(11,11,11,0.10);
+  --accent: #2a78d6; --accent-ink: #ffffff; --link: #1c5cab;
+  --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a; --s4: #eda100; --s5: #e87ba4; --s6: #008300; --s7: #4a3aa7; --s8: #e34948; --other: #b4b2a9;
+  --good: #0ca30c; --warning: #fab219; --serious: #ec835a; --critical: #d03b3b; --good-ink: #006300;
+  --shadow: 0 8px 30px rgba(0,0,0,0.12);
+}
+@media (prefers-color-scheme: dark) {
+  :root:where(:not([data-theme="light"])) {
+    color-scheme: dark;
+    --page: #0d0d0d; --surface: #1a1a19; --surface-2: #232321;
+    --ink: #ffffff; --ink-2: #c3c2b7; --muted: #898781;
+    --grid: #2c2c2a; --axis: #383835; --ring: rgba(255,255,255,0.10);
+    --accent: #3987e5; --accent-ink: #ffffff; --link: #86b6ef;
+    --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500; --s5: #d55181; --s6: #008300; --s7: #9085e9; --s8: #e66767; --other: #5f5e59;
+    --good-ink: #0ca30c; --shadow: 0 8px 30px rgba(0,0,0,0.5);
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --page: #0d0d0d; --surface: #1a1a19; --surface-2: #232321;
+  --ink: #ffffff; --ink-2: #c3c2b7; --muted: #898781;
+  --grid: #2c2c2a; --axis: #383835; --ring: rgba(255,255,255,0.10);
+  --accent: #3987e5; --accent-ink: #ffffff; --link: #86b6ef;
+  --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500; --s5: #d55181; --s6: #008300; --s7: #9085e9; --s8: #e66767; --other: #5f5e59;
+  --good-ink: #0ca30c; --shadow: 0 8px 30px rgba(0,0,0,0.5);
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; }
+body { background: var(--page); color: var(--ink); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+a { color: var(--link); }
+button, select, input, textarea { font: inherit; color: inherit; }
+button { cursor: pointer; }
+.wrap { max-width: 1440px; margin: 0 auto; padding: 0 16px 48px; }
+header.top { position: sticky; top: 0; z-index: 20; background: var(--page); border-bottom: 1px solid var(--grid); }
+header.top .wrap { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; padding-top: 10px; padding-bottom: 10px; }
+.brand { font-weight: 650; font-size: 16px; display: flex; align-items: center; gap: 8px; }
+.brand svg { width: 22px; height: 22px; }
+.status-line { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; color: var(--ink-2); font-size: 13px; }
+.spacer { flex: 1; }
+.chip { display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px; border-radius: 999px; background: var(--surface-2); color: var(--ink-2); font-size: 12.5px; white-space: nowrap; }
+.btn { border: 1px solid var(--ring); background: var(--surface); padding: 6px 12px; border-radius: 8px; }
+.btn:hover { background: var(--surface-2); }
+.btn.primary { background: var(--accent); color: var(--accent-ink); border-color: transparent; }
+.btn.small { padding: 3px 9px; font-size: 12.5px; }
+.btn.link { border: 0; background: none; padding: 0; color: var(--link); text-decoration: underline; }
+select, input[type=search] { border: 1px solid var(--ring); background: var(--surface); border-radius: 8px; padding: 6px 10px; }
+.filters { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 16px 0 12px; }
+.seg { display: inline-flex; border: 1px solid var(--ring); border-radius: 8px; overflow: hidden; background: var(--surface); }
+.seg button { border: 0; background: none; padding: 6px 12px; }
+.seg button[aria-pressed=true] { background: var(--surface-2); font-weight: 650; }
+.seg button[aria-pressed=true]::before { content: "✓ "; font-weight: 700; }
+.card { background: var(--surface); border: 1px solid var(--ring); border-radius: 12px; padding: 16px; min-width: 0; }
+.card h2 { font-size: 15px; margin: 0; font-weight: 650; }
+.card .sub { color: var(--ink-2); font-size: 12.5px; margin-top: 2px; }
+.card-head { display: flex; align-items: flex-start; gap: 8px; margin-bottom: 10px; }
+.card-head > div:first-child { flex: 1; min-width: 0; }
+.grid { display: grid; gap: 12px; }
+.kpis { grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }
+.charts { grid-template-columns: repeat(auto-fit, minmax(min(100%, 520px), 1fr)); margin-top: 12px; }
+.tables { grid-template-columns: 1fr; margin-top: 12px; }
+.kpi { padding: 14px 16px; }
+.kpi .label { color: var(--ink-2); font-size: 12.5px; }
+.kpi .value { font-size: 26px; font-weight: 650; margin-top: 2px; }
+.kpi .note { color: var(--ink-2); font-size: 12.5px; min-height: 18px; }
+.kpi svg { display: block; margin-top: 6px; width: 100%; height: 28px; }
+.delta-good { color: var(--good-ink); } .delta-bad { color: var(--critical); }
+.insights { margin-top: 12px; }
+.insight { display: flex; gap: 10px; align-items: flex-start; padding: 8px 0; border-top: 1px solid var(--grid); }
+.insight:first-of-type { border-top: 0; }
+.insight .icon { flex: none; width: 18px; height: 18px; margin-top: 1px; }
+.insight .text { flex: 1; }
+.insight .label { font-weight: 650; margin-right: 6px; }
+.legend { display: flex; flex-wrap: wrap; gap: 4px 14px; color: var(--ink-2); font-size: 12.5px; margin-bottom: 6px; }
+.legend span { display: inline-flex; align-items: center; gap: 6px; }
+.key-rect { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+.key-line { width: 14px; height: 2px; border-radius: 1px; display: inline-block; }
+.chart { position: relative; }
+.chart svg { display: block; width: 100%; overflow: visible; }
+.chart text { fill: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+.empty { color: var(--muted); padding: 24px 0; text-align: center; }
+.tooltip { position: fixed; z-index: 50; pointer-events: none; background: var(--surface); border: 1px solid var(--ring); box-shadow: var(--shadow); border-radius: 8px; padding: 8px 10px; font-size: 12.5px; min-width: 140px; display: none; }
+.tooltip .t-title { color: var(--ink-2); margin-bottom: 4px; }
+.tooltip .t-row { display: flex; align-items: center; gap: 8px; }
+.tooltip .t-row b { font-variant-numeric: tabular-nums; margin-left: auto; padding-left: 12px; }
+table.data { width: 100%; border-collapse: collapse; font-size: 13px; }
+table.data th, table.data td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--grid); vertical-align: top; }
+table.data th { color: var(--ink-2); font-weight: 600; font-size: 12.5px; white-space: nowrap; user-select: none; }
+table.data th.sortable { cursor: pointer; }
+table.data th.sortable:hover { color: var(--ink); }
+table.data td.num, table.data th.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+table.data tr.click { cursor: pointer; }
+table.data tr.click:hover td { background: var(--surface-2); }
+.table-scroll { overflow-x: auto; }
+.msg { max-width: 640px; overflow-wrap: anywhere; }
+.badge { display: inline-block; padding: 1px 7px; border-radius: 999px; font-size: 11.5px; background: var(--surface-2); color: var(--ink-2); white-space: nowrap; }
+.dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; vertical-align: middle; }
+.tabs { display: flex; gap: 4px; flex-wrap: wrap; }
+.tabs button { border: 0; background: none; padding: 6px 10px; border-radius: 8px; color: var(--ink-2); }
+.tabs button[aria-selected=true] { background: var(--surface-2); color: var(--ink); font-weight: 650; }
+.more { margin-top: 8px; }
+.panel { max-width: 860px; margin: 32px auto; }
+.panel h1 { font-size: 22px; margin: 0 0 4px; }
+.panel textarea { width: 100%; min-height: 96px; border: 1px solid var(--ring); border-radius: 8px; background: var(--surface); padding: 10px; font-family: ui-monospace, Consolas, monospace; font-size: 12.5px; }
+.panel .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 10px; }
+.panel ul { margin: 6px 0; padding-left: 20px; }
+.problem { border-left: 4px solid var(--critical); }
+.problem.warning { border-left-color: var(--warning); }
+pre.cmd { background: var(--surface-2); border-radius: 8px; padding: 10px; overflow-x: auto; font-size: 12.5px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.drawer-back { position: fixed; inset: 0; background: rgba(0,0,0,0.35); z-index: 30; display: none; }
+.drawer { position: fixed; top: 0; right: 0; bottom: 0; width: min(760px, 100%); background: var(--page); z-index: 31; overflow-y: auto; box-shadow: var(--shadow); display: none; }
+.drawer .wrap { padding-top: 16px; }
+.drawer h2 { margin: 0; font-size: 18px; }
+.loading { opacity: 0.55; transition: opacity 0.2s; }
+.progress { font-size: 12.5px; color: var(--ink-2); }
+.footer { color: var(--muted); font-size: 12px; margin-top: 24px; }
+details.note { margin-top: 8px; color: var(--ink-2); font-size: 12.5px; }
+details.note summary { cursor: pointer; color: var(--link); }
+details.note dl { margin: 6px 0 0; }
+details.note dt { font-weight: 650; color: var(--ink); margin-top: 6px; }
+details.note dd { margin: 0; }
+@media (max-width: 640px) { .kpi .value { font-size: 22px; } .hide-narrow { display: none; } }
+</style>
+</head>
+<body>
+<header class="top"><div class="wrap">
+  <div class="brand"><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="var(--accent)" d="M7 18a5 5 0 0 1-.6-9.96A6 6 0 0 1 18 9a4.5 4.5 0 0 1-.5 9z"/><rect x="7" y="13.5" width="10" height="1.6" rx=".8" fill="var(--surface)"/></svg>VFS365 monitoring</div>
+  <div class="status-line" id="statusLine"></div>
+  <div class="spacer"></div>
+  <label class="status-line" title="How often the data is read again">Refresh
+    <select id="refreshEvery" aria-label="Refresh every">
+      <option value="0">off</option><option value="1">every minute</option><option value="5" selected>every 5 minutes</option>
+      <option value="15">every 15 minutes</option><option value="30">every 30 minutes</option><option value="60">every hour</option>
+    </select></label>
+  <button class="btn small" id="refreshNow">Refresh now</button>
+  <button class="btn small" id="themeToggle" title="Light or dark">Theme</button>
+  <button class="btn small" id="changeConnection">Connection</button>
+</div></header>
+
+<main class="wrap" id="main"></main>
+<div class="tooltip" id="tooltip" role="status"></div>
+<div class="drawer-back" id="drawerBack"></div>
+<aside class="drawer" id="drawer" aria-modal="true" role="dialog"><div class="wrap" id="drawerBody"></div></aside>
+
+<script>
+"use strict";
+/* ---------- Utilities ---------- */
+const $ = id => document.getElementById(id);
+function h(tag, attrs, ...children) {
+  const node = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (v == null || v === false) continue;
+    if (k === "class") node.className = v;
+    else if (k.startsWith("on")) node.addEventListener(k.slice(2), v);
+    else if (k === "style") node.style.cssText = v;
+    else node.setAttribute(k, v === true ? "" : v);
+  }
+  for (const child of children.flat()) {
+    if (child == null || child === false) continue;
+    node.append(child instanceof Node ? child : document.createTextNode(String(child)));
+  }
+  return node;
+}
+const SVG = "http://www.w3.org/2000/svg";
+function s(tag, attrs) { const n = document.createElementNS(SVG, tag); for (const [k, v] of Object.entries(attrs || {})) n.setAttribute(k, v); return n; }
+const num = v => (v == null || v === "" ? 0 : Number(v)) || 0;
+const fmtInt = n => Math.round(n).toLocaleString();
+function compact(n) {
+  const a = Math.abs(n);
+  if (a >= 1e9) return (n / 1e9).toFixed(a >= 1e10 ? 0 : 1) + "B";
+  if (a >= 1e6) return (n / 1e6).toFixed(a >= 1e7 ? 0 : 1) + "M";
+  if (a >= 1e4) return (n / 1e3).toFixed(0) + "K";
+  if (a >= 1e3) return (n / 1e3).toFixed(1) + "K";
+  return fmtInt(n);
+}
+function bytes(n) {
+  const units = ["B", "KB", "MB", "GB", "TB"]; let i = 0;
+  while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
+  return (i === 0 ? fmtInt(n) : n.toFixed(n >= 100 ? 0 : 1).replace(/\.0$/, "")) + " " + units[i];
+}
+function duration(seconds) {
+  if (seconds < 90) return fmtInt(seconds) + " s";
+  if (seconds < 3600) return fmtInt(seconds / 60) + " min";
+  if (seconds < 172800) return (seconds / 3600).toFixed(1).replace(/\.0$/, "") + " h";
+  return fmtInt(seconds / 86400) + " days";
+}
+const pad = n => String(n).padStart(2, "0");
+const localDay = d => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+const utcDay = d => d.toISOString().slice(0, 10);
+const dayToDate = day => new Date(day + "T12:00:00");
+const addDays = (d, n) => { const r = new Date(d); r.setDate(r.getDate() + n); return r; };
+const shortDay = day => dayToDate(day).toLocaleDateString(undefined, { month: "short", day: "numeric" });
+const longDay = day => dayToDate(day).toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric", year: "numeric" });
+const dateTime = d => d ? d.toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "";
+function ago(d) {
+  if (!d) return "never";
+  const min = (Date.now() - d.getTime()) / 60000;
+  if (min < 2) return "just now";
+  if (min < 90) return `${Math.round(min)} min ago`;
+  if (min < 2160) return `${Math.round(min / 60)} h ago`;
+  return `${Math.round(min / 1440)} days ago`;
+}
+function semverCompare(a, b) {
+  const pa = String(a || "").split(".").map(Number), pb = String(b || "").split(".").map(Number);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) { const d = (pa[i] || 0) - (pb[i] || 0); if (d) return d; }
+  return 0;
+}
+const store = {
+  get(k) { try { return localStorage.getItem("vfs365mon." + k); } catch { return null; } },
+  set(k, v) { try { v == null ? localStorage.removeItem("vfs365mon." + k) : localStorage.setItem("vfs365mon." + k, v); } catch { } },
+};
+
+/* ---------- Connection and SAS ---------- */
+const TABLES = ["statistics", "errors", "devices"];
+class Problem extends Error {
+  constructor(title, details, level = "critical", fix = null) { super(title); this.title = title; this.details = details; this.level = level; this.fix = fix; }
+}
+function parseConnection(input) {
+  const text = (input || "").trim();
+  if (!text) throw new Problem("Enter a table service SAS URL or a connection string", []);
+  let base, sas;
+  if (/^https?:\/\//i.test(text)) {
+    const url = new URL(text);
+    base = url.origin + url.pathname.replace(/\/+$/, "");
+    sas = url.search.replace(/^\?/, "");
+    const table = TABLES.find(t => base.toLowerCase().endsWith("/" + t));
+    if (table) base = base.slice(0, -table.length - 1);
+  } else if (/^\??sv=/.test(text)) {
+    throw new Problem("This is only the SAS token", ["Paste the whole Table service SAS URL (https://<account>.table.core.windows.net/?sv=...) or the SAS connection string, so the dashboard knows the storage account."]);
+  } else {
+    const parts = {};
+    for (const segment of text.split(";")) {
+      const at = segment.indexOf("=");
+      if (at > 0) parts[segment.slice(0, at).trim().toLowerCase()] = segment.slice(at + 1).trim();
+    }
+    if (parts.accountkey && !parts.sharedaccesssignature) {
+      throw new Problem("Account keys are not used here", ["This connection string holds the storage account key, which gives full control. Create a SAS with only Read and List instead (see below) and paste its connection string or URL."]);
+    }
+    if (!parts.sharedaccesssignature) throw new Problem("No SharedAccessSignature in this connection string", ["Paste the connection string of a SAS (it contains SharedAccessSignature=sv=...), or the Table service SAS URL."]);
+    sas = parts.sharedaccesssignature.replace(/^\?/, "");
+    if (parts.tableendpoint) base = parts.tableendpoint.replace(/\/+$/, "");
+    else if (parts.accountname) base = `${parts.defaultendpointsprotocol || "https"}://${parts.accountname}.table.${parts.endpointsuffix || "core.windows.net"}`;
+    else throw new Problem("No TableEndpoint in this connection string", ["The SAS connection string needs TableEndpoint=https://<account>.table.core.windows.net/ (it is there when Table is one of the allowed services)."]);
+  }
+  const params = Object.fromEntries(new URLSearchParams(sas));
+  const host = new URL(base).hostname;
+  return { base, sas, params, account: host.split(".")[0], host };
+}
+const Fix = {
+  sas: "Create a SAS in the Azure portal: Storage account > Security + networking > Shared access signature. Allowed services: Table. Allowed resource types: Container and Object. Allowed permissions: Read and List. Allowed protocols: HTTPS only. Set an expiry date, then Generate and copy the Table service SAS URL.",
+};
+function sasFindings(c, now = new Date()) {
+  const p = c.params, out = [];
+  if (!p.sig) out.push({ level: "critical", text: "The SAS has no signature (sig=). Copy the whole SAS URL." });
+  if (p.sr) out.push({ level: "critical", text: `This is a SAS for blob storage (sr=${p.sr}), not for the Table service.` });
+  if (p.tn) out.push({ level: "warning", text: `This SAS is for the table "${p.tn}" only; the dashboard reads statistics, errors and devices. Use an account SAS for the Table service.` });
+  if (p.ss && !p.ss.includes("t")) out.push({ level: "critical", text: `The SAS is not for the Table service (allowed services: ${p.ss}).` });
+  if (p.srt && !p.srt.includes("o")) out.push({ level: "critical", text: "The SAS lacks resource type Object (srt has no o), which reading rows needs." });
+  if (p.sp && !p.sp.includes("r")) out.push({ level: "critical", text: "The SAS lacks the Read permission (sp has no r)." });
+  if (p.sp && /[wdaucp]/.test(p.sp)) out.push({ level: "warning", text: `This SAS can also change data (sp=${p.sp}). A dashboard needs only Read and List: create one with just those.` });
+  if (p.sip) out.push({ level: "info", text: `The SAS only works from IP addresses ${p.sip}.` });
+  if (p.spr === "http") out.push({ level: "warning", text: "The SAS allows HTTP only; use HTTPS." });
+  if (p.st) {
+    const start = new Date(p.st);
+    if (!isNaN(start) && start > now) out.push({ level: "critical", text: `The SAS is not valid yet: it starts ${dateTime(start)}.` });
+  }
+  if (p.se) {
+    const end = new Date(p.se);
+    if (!isNaN(end)) {
+      if (end <= now) out.push({ level: "critical", text: `The SAS expired ${dateTime(end)}.` });
+      else if (end - now < 3 * 86400000) out.push({ level: "warning", text: `The SAS expires ${dateTime(end)} (${ago(new Date(now - (end - now))).replace(" ago", "")} from now). Create a new one before then.` });
+    }
+  }
+  return out;
+}
+function corsFix(c) {
+  return [
+    "Browsers only let a page read storage that allows it (CORS), and this storage account does not allow it for the Table service yet.",
+    "In the Azure portal: Storage account > Settings > Resource sharing (CORS) > Table service. Add a rule: Allowed origins * (or the address this page is opened from), Allowed methods GET and OPTIONS, Allowed headers *, Exposed headers *, Max age 3600. Save, wait a minute, then Refresh.",
+    { cmd: `az storage cors add --account-name ${c.account} --services t --methods GET OPTIONS --origins "*" --allowed-headers "*" --exposed-headers "*" --max-age 3600` },
+    "A rule only allows reading in a browser; the SAS still decides what can be read. Exposed headers * lets the dashboard read days with more than 1000 rows.",
+  ];
+}
+
+/* ---------- Table client ---------- */
+let pagingHidden = false;
+async function query(c, table, filter, onPage) {
+  const rows = [];
+  let next = null;
+  do {
+    let url = `${c.base}/${table}()?${c.sas}`;
+    if (filter) url += "&$filter=" + encodeURIComponent(filter);
+    if (next) url += `&NextPartitionKey=${encodeURIComponent(next.pk)}${next.rk ? "&NextRowKey=" + encodeURIComponent(next.rk) : ""}`;
+    let response;
+    try {
+      response = await fetch(url, { headers: { Accept: "application/json;odata=nometadata" }, cache: "no-store" });
+    } catch {
+      throw await networkProblem(c);
+    }
+    if (!response.ok) throw await serviceProblem(c, table, response);
+    const body = await response.json();
+    rows.push(...body.value);
+    onPage?.(rows.length);
+    const pk = response.headers.get("x-ms-continuation-NextPartitionKey");
+    next = pk ? { pk, rk: response.headers.get("x-ms-continuation-NextRowKey") } : null;
+    if (!next && body.value.length === 1000) pagingHidden = true;
+  } while (next);
+  return rows;
+}
+async function networkProblem(c) {
+  let reachable = false;
+  try { await fetch(c.base + "/?restype=service&comp=properties", { mode: "no-cors", cache: "no-store" }); reachable = true; } catch { }
+  if (reachable) return new Problem("The browser may not read this storage account (CORS)", corsFix(c), "critical");
+  return new Problem(`${c.host} can't be reached`, [
+    "Check the account name in the URL, the network connection, and whether a firewall or the storage account's network rules (Networking > Public network access) block this computer.",
+  ]);
+}
+async function serviceProblem(c, table, response) {
+  let code = "", message = "";
+  // JSON normally; authentication errors come as XML whatever the Accept header says
+  try {
+    const text = await response.text();
+    try { const body = JSON.parse(text); code = body["odata.error"]?.code || ""; message = body["odata.error"]?.message?.value || ""; }
+    catch { code = /<code>([^<]*)<\/code>/i.exec(text)?.[1] || ""; message = /<message[^>]*>([^<]*)<\/message>/i.exec(text)?.[1] || ""; }
+  } catch { }
+  code ||= response.headers.get("x-ms-error-code") || "";
+  const first = message.split("\n")[0];
+  const map = {
+    AuthenticationFailed: /time frame/i.test(message)
+      ? ["The SAS is expired or not valid yet", ["Azure says the signature is not valid at this time.", Fix.sas]]
+      : ["The SAS signature is not valid", ["Copy the whole SAS again (including sig=...). If the account's keys were rotated, SAS made with the old key stopped working.", Fix.sas]],
+    AuthorizationPermissionMismatch: ["The SAS lacks the Read permission", [first, Fix.sas]],
+    AuthorizationResourceTypeMismatch: ["The SAS lacks resource type Object", [first, Fix.sas]],
+    AuthorizationServiceMismatch: ["The SAS is not for the Table service", [first, Fix.sas]],
+    AuthorizationSourceIPMismatch: ["The SAS doesn't allow this computer's IP address", [first, "Create a SAS without an IP range, or include this address."]],
+    AuthorizationProtocolMismatch: ["The SAS doesn't allow HTTPS", [first, Fix.sas]],
+    AuthorizationFailure: ["Azure refused the request", [first, "The storage account's network rules may block this computer (Networking > Public network access), or the SAS is wrong.", Fix.sas]],
+    AccountIsDisabled: ["The storage account is disabled", [first]],
+  };
+  if (map[code]) return new Problem(map[code][0], map[code][1]);
+  if (code === "TableNotFound" || response.status === 404) return Object.assign(new Problem(`Table ${table} not found`, []), { missingTable: table });
+  return new Problem(`Azure answered ${response.status} ${code || response.statusText}`, [first || "No details."]);
+}
+
+/* ---------- Data loading ----------
+   One query per day partition, 8 at a time: only a day with more than 1000 rows needs paging, so data is complete even
+   when the browser can't see continuation headers. Days already read are kept between refreshes, except recent ones. */
+const data = { statistics: new Map(), errors: new Map(), devices: [], from: {}, missing: new Set(), loadedAt: null, sample: false };
+function dayRange(first, last) {
+  const out = [];
+  for (let t = Date.parse(first + "T00:00:00Z"), d; (d = new Date(t).toISOString().slice(0, 10)) <= last; t += 86400000) out.push(d);
+  return out;
+}
+async function pool(items, limit, work) {
+  let next = 0;
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, async () => { while (next < items.length) await work(items[next++]); }));
+}
+async function loadAll(c, days, refresh, progress) {
+  pagingHidden = false;
+  const today = new Date();
+  // Statistics: local days, sent the day after and up to a week late. Errors: UTC days, sent at once; twice the range for the comparison.
+  const span = {
+    statistics: { from: localDay(addDays(today, -days)), to: localDay(addDays(today, -1)), recent: localDay(addDays(today, -8)) },
+    errors: { from: utcDay(addDays(today, -2 * days - 1)), to: utcDay(today), recent: utcDay(addDays(today, -1)) },
+  };
+  const counts = { statistics: 0, errors: 0, devices: 0 };
+  const tick = () => progress(Object.entries(counts).filter(([, n]) => n).map(([t, n]) => `${t} ${fmtInt(n)}`).join(", "));
+  const load = async table => {
+    const r = span[table], read = new Map();
+    if (refresh && data.from[table] && data.from[table] <= r.from)
+      for (const [day, rows] of data[table]) if (day >= r.from && day < r.recent) read.set(day, rows);
+    try {
+      await pool(dayRange(r.from, r.to).filter(day => !read.has(day)), 8, async day => {
+        const rows = await query(c, table, `PartitionKey eq '${day}'`);
+        read.set(day, rows);
+        counts[table] += rows.length; tick();
+      });
+      data[table] = read;
+      data.from[table] = r.from;
+      data.missing.delete(table);
+    } catch (e) {
+      if (e.missingTable) { data[table] = new Map(); data.missing.add(table); return; }
+      throw e;
+    }
+  };
+  const loadDevices = async () => {
+    try { data.devices = await query(c, "devices", null, n => { counts.devices = n; tick(); }); data.missing.delete("devices"); }
+    catch (e) { if (e.missingTable) { data.devices = []; data.missing.add("devices"); return; } throw e; }
+  };
+  await Promise.all([load("statistics"), load("errors"), loadDevices()]);
+  data.loadedAt = new Date();
+}
+
+/* ---------- Model: everything the page shows, for the current range and filters ---------- */
+/* Crash and start errors may come before sign-in, with only the Windows user; statistics rows link it to the UPN */
+const upnOf = new Map();
+const userOf = r => r.User || upnOf.get(r.WindowsUser) || r.WindowsUser || "(unknown)";
+/* Sources the agent reports, each with a fixed color; anything else is "other" */
+const SOURCE_COLOR = { upload: "--s1", "conflict copy": "--s2", "sign-in": "--s3", "file system": "--s4", discovery: "--s5", start: "--s6", "drive letter": "--s7", crash: "--s8" };
+const KNOWN_SOURCES = Object.keys(SOURCE_COLOR);
+const clip = (text, n) => { const t = String(text || ""); return t.length > n ? t.slice(0, n - 1) + "…" : t; };
+function errorPattern(message) {
+  return String(message || "")
+    .replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi, "{id}")
+    .replace(/b![A-Za-z0-9_-]{16,}/g, "{drive}")
+    .replace(/https?:\/\/\S+/g, "{url}")
+    .replace(/(?:[A-Za-z]:)?\\[^:;,()"]*/g, "{path}")
+    .replace(/\b0x[0-9a-f]+\b/gi, "{code}")
+    .replace(/\d+/g, "#")
+    .slice(0, 240);
+}
+function buildModel(range, filters) {
+  // Errors: the last `range` days through today. Statistics: the last `range` complete days (a day is sent the day after).
+  const today = new Date();
+  const allDays = [];
+  for (let back = range; back >= 0; back--) allDays.push(localDay(addDays(today, -back)));
+  const days = allDays.slice(1), statDays = allDays.slice(0, -1);
+  const start = dayToDate(days[0]); start.setHours(0, 0, 0, 0);
+  const prevStart = addDays(start, -range);
+  const text = filters.text.trim().toLowerCase();
+  const pass = r => (!filters.tenant || r.TenantId === filters.tenant) && (!filters.version || r.Version === filters.version)
+    && (!text || [r.DeviceName, r.User, r.WindowsUser, r.Users, r.Version, r.Message, r.Source].some(v => v && String(v).toLowerCase().includes(text)));
+
+  upnOf.clear();
+  for (const r of [...data.statistics.values()].flat().concat(...data.errors.values())) if (r.User && r.WindowsUser) upnOf.set(r.WindowsUser, r.User);
+  const stats = [...data.statistics.values()].flat().filter(r => r.PartitionKey >= statDays[0] && r.PartitionKey <= statDays[statDays.length - 1] && pass(r));
+  const allErrors = [...data.errors.values()].flat().map(r => ({ ...r, at: new Date(r.OccurredAt || r.Timestamp) })).filter(pass);
+  const errors = allErrors.filter(r => r.at >= start).sort((a, b) => b.at - a.at);
+  const previousErrors = allErrors.filter(r => r.at >= prevStart && r.at < start);
+  const installs = data.devices.map(r => ({ ...r, at: new Date(r.OccurredAt || r.Timestamp) })).filter(pass).sort((a, b) => b.at - a.at);
+
+  const perDay = Object.fromEntries(allDays.map(d => [d, { graph: 0, sp: 0, ru: 0, rx: 0, tx: 0, throttled: 0, throttledSec: 0, budgetUser: 0, budgetBackground: 0, budgetUnsplit: 0, minutes: 0, users: new Set(), devices: new Set(), errors: {} }]));
+  const devices = new Map(), users = new Map();
+  const device = r => {
+    if (!devices.has(r.DeviceId)) devices.set(r.DeviceId, { id: r.DeviceId, name: r.DeviceName || r.DeviceId, entra: r.EntraDeviceId || "", users: new Set(), version: "", versionDay: "", lastSeen: null, errors: 0, crashes: 0, ru: 0, requests: 0, rx: 0, tx: 0, throttled: 0, budgetUser: 0, budgetBackground: 0, budgetUnsplit: 0, minutes: 0, days: new Set(), install: null });
+    const d = devices.get(r.DeviceId); if (r.DeviceName) d.name = r.DeviceName; if (r.EntraDeviceId) d.entra = r.EntraDeviceId; return d;
+  };
+  const user = r => {
+    const key = userOf(r);
+    if (!users.has(key)) users.set(key, { key, upn: r.User || "", windows: r.WindowsUser || "", devices: new Set(), days: new Set(), lastSeen: null, errors: 0, ru: 0, requests: 0, rx: 0, tx: 0, throttled: 0, budgetUser: 0, budgetBackground: 0, budgetUnsplit: 0, minutes: 0 });
+    const u = users.get(key); if (r.User) u.upn = r.User; if (r.WindowsUser) u.windows = r.WindowsUser; return u;
+  };
+  const seen = (x, at) => { if (!x.lastSeen || at > x.lastSeen) x.lastSeen = at; };
+  for (const r of stats) {
+    const p = perDay[r.PartitionKey]; if (!p) continue;
+    const graph = num(r.GraphRequests), sp = num(r.SharePointRequests), ru = num(r.ResourceUnits), rx = num(r.BytesReceived), tx = num(r.BytesSent);
+    p.graph += graph; p.sp += sp; p.ru += ru; p.rx += rx; p.tx += tx; p.throttled += num(r.Throttled); p.throttledSec += num(r.ThrottledSeconds);
+    // Budget waits by cause; rows from before 0.3.0 only have the total, which then counts as not split
+    const wait = { budgetUser: num(r.BudgetWaitForegroundSeconds), budgetBackground: num(r.BudgetWaitBackgroundSeconds) };
+    wait.budgetUnsplit = Math.max(0, num(r.BudgetWaitSeconds) - wait.budgetUser - wait.budgetBackground);
+    for (const [key, value] of Object.entries(wait)) p[key] += value;
+    p.minutes += num(r.MinutesRunning); p.users.add(userOf(r)); p.devices.add(r.DeviceId);
+    const reported = r.Timestamp ? new Date(r.Timestamp) : new Date(r.PartitionKey + "T23:59:59");
+    const d = device(r), u = user(r);
+    for (const x of [d, u]) { x.ru += ru; x.requests += graph + sp; x.rx += rx; x.tx += tx; x.throttled += num(r.Throttled); x.minutes += num(r.MinutesRunning); x.days.add(r.PartitionKey); seen(x, reported); for (const [key, value] of Object.entries(wait)) x[key] += value; }
+    d.users.add(userOf(r)); u.devices.add(r.DeviceId);
+    if (r.PartitionKey >= d.versionDay) { d.version = r.Version; d.versionDay = r.PartitionKey; }
+  }
+  for (const r of errors) {
+    const day = localDay(r.at), p = perDay[day], source = r.Source || "other";
+    if (p) p.errors[source] = (p.errors[source] || 0) + 1;
+    const d = device(r), u = user(r);
+    d.errors++; u.errors++; if (source === "crash") d.crashes++;
+    d.users.add(userOf(r)); u.devices.add(r.DeviceId); seen(d, r.at); seen(u, r.at);
+    if (!d.version || localDay(r.at) >= d.versionDay) { d.version = r.Version; d.versionDay = localDay(r.at); }
+  }
+  for (const r of installs) {
+    const d = device(r);
+    if (!d.install || r.at > d.install.at) d.install = r;
+    if (r.Action !== "uninstall" && (!d.version || localDay(r.at) > d.versionDay)) { d.version = r.Version; d.versionDay = localDay(r.at); }
+  }
+
+  const versions = [...new Set([...devices.values()].map(d => d.version).filter(Boolean))].sort(semverCompare).reverse();
+  const latest = versions[0] || "";
+  const versionCounts = versions.map(v => ({ version: v, devices: [...devices.values()].filter(d => d.version === v && d.install?.Action !== "uninstall").length }));
+
+  const groups = new Map();
+  for (const r of errors) {
+    const key = (r.Source || "other") + "|" + errorPattern(r.Message);
+    if (!groups.has(key)) groups.set(key, { key, source: r.Source || "other", pattern: errorPattern(r.Message), sample: r.Message, rows: [], devices: new Set(), users: new Set(), first: r.at, last: r.at });
+    const g = groups.get(key); g.rows.push(r); g.devices.add(r.DeviceId); g.users.add(userOf(r));
+    if (r.at < g.first) g.first = r.at; if (r.at > g.last) { g.last = r.at; g.sample = r.Message; }
+  }
+  const sum = f => allDays.reduce((t, d) => t + f(perDay[d]), 0);
+  const activeDevices = new Set([...stats.map(r => r.DeviceId), ...errors.map(r => r.DeviceId)]);
+  const activeUsers = new Set([...stats.map(userOf), ...errors.map(userOf)]);
+  const userDays = stats.length;
+  const sourceTotals = {};
+  for (const r of errors) sourceTotals[r.Source || "other"] = (sourceTotals[r.Source || "other"] || 0) + 1;
+  const tenants = [...new Set([...data.statistics.values()].flat().concat(...data.errors.values(), data.devices).map(r => r.TenantId).filter(Boolean))];
+  const allVersions = [...new Set([...data.statistics.values()].flat().concat(...data.errors.values(), data.devices).map(r => r.Version).filter(Boolean))].sort(semverCompare).reverse();
+
+  return {
+    range, days, statDays, perDay, start, devices: [...devices.values()], users: [...users.values()], errors, previousErrors, installs, groups: [...groups.values()].sort((a, b) => b.rows.length - a.rows.length),
+    versions: versionCounts, latest, tenants, allVersions, sourceTotals,
+    totals: {
+      devices: activeDevices.size, users: activeUsers.size, userDays, errors: errors.length, previousErrors: previousErrors.length,
+      crashes: errors.filter(r => r.Source === "crash").length,
+      graph: sum(p => p.graph), sp: sum(p => p.sp), ru: sum(p => p.ru), rx: sum(p => p.rx), tx: sum(p => p.tx),
+      throttled: sum(p => p.throttled), throttledSec: sum(p => p.throttledSec), budgetUser: sum(p => p.budgetUser), budgetBackground: sum(p => p.budgetBackground), budgetUnsplit: sum(p => p.budgetUnsplit), minutes: sum(p => p.minutes),
+      installed: [...devices.values()].filter(d => d.install && d.install.Action !== "uninstall").length,
+    },
+  };
+}
+
+/* ---------- Insights: what needs attention ---------- */
+function insights(m, c) {
+  const out = [];
+  const crashDevices = new Set(m.errors.filter(r => r.Source === "crash").map(r => r.DeviceId));
+  if (m.totals.crashes) {
+    const latest = m.errors.find(r => r.Source === "crash");
+    out.push({ level: "critical", label: "Crashes", text: `The agent stopped unexpectedly ${m.totals.crashes} time(s) on ${crashDevices.size} device(s); it restarts by itself. Latest: ${latest.DeviceName}, ${dateTime(latest.at)}.`, action: () => openGroupBySource("crash") });
+  }
+  const dayAgo = Date.now() - 86400000;
+  const recent = m.errors.filter(r => r.at.getTime() >= dayAgo);
+  if (recent.length) {
+    const top = Object.entries(recent.reduce((t, r) => (t[r.Source || "other"] = (t[r.Source || "other"] || 0) + 1, t), {})).sort((a, b) => b[1] - a[1])[0];
+    out.push({ level: "warning", label: "Last 24 hours", text: `${recent.length} error(s) on ${new Set(recent.map(r => r.DeviceId)).size} device(s); most: ${top[0]} (${top[1]}).`, action: () => showTab("errors") });
+  }
+  for (const [source, label] of [["sign-in", "Sign-in problems"], ["start", "Drive didn't start"], ["drive letter", "Drive letter"], ["upload", "Uploads waiting"], ["conflict copy", "Conflict copies"]]) {
+    const rows = m.errors.filter(r => r.Source === source);
+    if (rows.length) out.push({ level: source === "conflict copy" ? "info" : "warning", label, text: `${rows.length} report(s) from ${new Set(rows.map(r => r.DeviceId)).size} device(s). Latest: ${clip(rows[0].Message, 160)}`, action: () => openGroupBySource(source) });
+  }
+  const throttledDays = m.statDays.filter(d => m.perDay[d].throttled > 0);
+  if (throttledDays.length) out.push({ level: "warning", label: "Throttling", text: `Microsoft throttled VFS365 on ${throttledDays.length} day(s): ${fmtInt(m.totals.throttled)} response(s), ${duration(m.totals.throttledSec)} waited. Lower ApiBudgetPerMinute or spread sign-ins if this repeats.` });
+  const waitedUsers = m.users.filter(u => u.budgetUser > 0).length;
+  if (m.totals.budgetUser > 0) out.push({ level: m.totals.budgetUser >= 60 ? "warning" : "info", label: "Users waited", text: `Opening and saving files waited ${duration(m.totals.budgetUser)} for the per-user API budget (ApiBudgetPerMinute), for ${waitedUsers} user(s). When Microsoft isn't throttling, a higher budget removes this.`, action: () => showTab("users") });
+  if (m.totals.budgetBackground > 60) out.push({ level: "info", label: "Background pacing", text: `Background work (discovery after sign-in, change checks, loading ahead) waited ${duration(m.totals.budgetBackground)} for the API budget. Users don't wait for this; it spreads VFS365's calls over time.` });
+  if (m.totals.budgetUnsplit > 60) out.push({ level: "info", label: "API budget", text: `Versions before 0.3.0 waited ${duration(m.totals.budgetUnsplit)} for the API budget; they don't report whether users or background work waited.` });
+  const outdated = m.devices.filter(d => d.version && m.latest && semverCompare(d.version, m.latest) < 0 && d.install?.Action !== "uninstall");
+  if (outdated.length) out.push({ level: "info", label: "Versions", text: `${outdated.length} device(s) run a version older than ${m.latest}.`, action: () => showTab("devices") });
+  const silent = m.devices.filter(d => d.install && d.install.Action !== "uninstall" && (!d.lastSeen || Date.now() - d.lastSeen > 3 * 86400000));
+  if (silent.length) out.push({ level: "info", label: "Not seen", text: `${silent.length} installed device(s) sent nothing for 3 days or more (switched off, or VFS365 not starting).`, action: () => showTab("devices") });
+  if (!data.sample) for (const f of sasFindings(c)) if (f.level !== "info") out.push({ level: f.level, label: "SAS", text: f.text });
+  if (pagingHidden) out.push({ level: "warning", label: "Incomplete", text: "A day has more than 1000 rows, and the browser can't see where the next rows start: set Exposed headers to * in the storage account's CORS rule for the Table service. Until then, rows after the first 1000 of such a day are missing." });
+  if (data.missing.size) out.push({ level: "info", label: "Tables", text: `No table yet for ${[...data.missing].join(", ")}: nothing was reported there, or the tables weren't created (errors, statistics, devices).` });
+  if (!data.devices.length && !data.missing.has("devices") && m.devices.length) out.push({ level: "info", label: "Installs", text: "No install reports yet: the installer reports only when MonitoringUrl is set as a computer policy at install time. Devices are listed from their statistics and errors." });
+  if (!out.some(i => i.level === "critical" || i.level === "warning")) out.unshift({ level: "good", label: "All clear", text: "No crashes, throttling or recent errors in this period." });
+  return out;
+}
+
+/* ---------- Charts ---------- */
+const tooltip = $("tooltip");
+function css(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
+function showTip(event, title, rows) {
+  tooltip.replaceChildren(h("div", { class: "t-title" }, title), ...rows.map(r => h("div", { class: "t-row" }, h("span", { class: r.line ? "key-line" : "key-rect", style: `background:${r.color}` }), r.label, h("b", {}, r.value))));
+  tooltip.style.display = "block";
+  const x = Math.min(event.clientX + 14, innerWidth - tooltip.offsetWidth - 8), y = Math.min(event.clientY + 14, innerHeight - tooltip.offsetHeight - 8);
+  tooltip.style.left = x + "px"; tooltip.style.top = y + "px";
+}
+const hideTip = () => { tooltip.style.display = "none"; };
+/* Round gridline steps per unit: 1-2-5 for counts, whole KB/MB/GB for bytes, minutes and hours for time */
+const BYTE_STEPS = [0, 1, 2, 3, 4].flatMap(k => [1, 2, 5, 10, 20, 50, 100, 200, 500].map(m => m * 1024 ** k));
+const TIME_STEPS = [1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200, 10800, 21600, 43200, 86400, 172800, 604800];
+function axis(max, kind) {
+  const raw = Math.max(max, 1) / 4;
+  const steps = kind === "bytes" ? BYTE_STEPS : kind === "seconds" ? TIME_STEPS : null;
+  let step;
+  if (steps) step = steps.find(v => v >= raw) || steps[steps.length - 1];
+  else { const p = Math.pow(10, Math.floor(Math.log10(raw < 1 ? 1 : raw))); step = [1, 2, 5, 10].map(f => f * p).find(v => v >= raw); }
+  const count = Math.max(1, Math.ceil(max / step));
+  return { step, count, top: count * step };
+}
+function legend(series, line, always) {
+  if (series.length < 2 && !always) return null;
+  return h("div", { class: "legend" }, series.map(sr => h("span", {}, h("span", { class: line ? "key-line" : "key-rect", style: `background:${css(sr.color)}` }), sr.label)));
+}
+/* Columns (stacked) or lines over days, one y-axis. series: [{label, color (css var), values[]}], format(v) */
+function timeChart(host, { days, series, type, format, kind, alwaysLegend }) {
+  const box = h("div", { class: "chart" });
+  host.replaceChildren(legend(series, type === "lines", alwaysLegend) || "", box);
+  const total = days.map((_, i) => type === "columns" ? series.reduce((t, sr) => t + sr.values[i], 0) : Math.max(0, ...series.map(sr => sr.values[i])));
+  if (!total.some(v => v > 0)) { box.append(h("div", { class: "empty" }, "No data in this period")); return; }
+  const width = Math.max(280, box.clientWidth || host.clientWidth || 600), height = 200, left = 44, bottom = 22, top = 8, right = 8;
+  const plotW = width - left - right, plotH = height - top - bottom, scale = axis(Math.max(...total), kind), max = scale.top;
+  const svg = s("svg", { viewBox: `0 0 ${width} ${height}`, height, role: "img" });
+  const y = v => top + plotH - (v / max) * plotH;
+  for (let i = 0; i <= scale.count; i++) {
+    const v = scale.step * i, yy = y(v);
+    svg.append(s("line", { x1: left, x2: width - right, y1: yy, y2: yy, stroke: i === 0 ? css("--axis") : css("--grid"), "stroke-width": 1 }));
+    const t = s("text", { x: left - 6, y: yy + 3.5, "text-anchor": "end" }); t.textContent = format(v); svg.append(t);
+  }
+  const band = plotW / days.length, xc = i => left + band * i + band / 2;
+  const labelEvery = Math.ceil(days.length / Math.max(2, Math.floor(plotW / 70)));
+  days.forEach((d, i) => {
+    if (i % labelEvery !== 0 && i !== days.length - 1) return;
+    if (i !== days.length - 1 && days.length - 1 - i < labelEvery / 2) return;
+    const t = s("text", { x: xc(i), y: height - 6, "text-anchor": "middle" }); t.textContent = shortDay(d); svg.append(t);
+  });
+  const surface = css("--surface");
+  if (type === "columns") {
+    const bw = Math.max(2, Math.min(24, band * 0.7));
+    days.forEach((d, i) => {
+      let base = 0;
+      const parts = series.map(sr => ({ sr, v: sr.values[i] })).filter(p => p.v > 0);
+      parts.forEach((p, k) => {
+        const y0 = y(base), y1 = y(base + p.v), topMost = k === parts.length - 1;
+        const x0 = xc(i) - bw / 2, hgt = Math.max(1, y0 - y1 - (k > 0 ? 2 : 0)), yTop = y0 - (k > 0 ? 2 : 0) - hgt;
+        const r = topMost ? Math.min(4, hgt, bw / 2) : 0;
+        const path = r > 0
+          ? `M${x0},${yTop + hgt}V${yTop + r}Q${x0},${yTop} ${x0 + r},${yTop}H${x0 + bw - r}Q${x0 + bw},${yTop} ${x0 + bw},${yTop + r}V${yTop + hgt}Z`
+          : `M${x0},${yTop + hgt}V${yTop}H${x0 + bw}V${yTop + hgt}Z`;
+        svg.append(s("path", { d: path, fill: css(p.sr.color) }));
+        base += p.v;
+      });
+    });
+  } else {
+    for (const sr of series) {
+      svg.append(s("path", { d: sr.values.map((v, i) => `${i ? "L" : "M"}${xc(i)},${y(v)}`).join(""), fill: "none", stroke: css(sr.color), "stroke-width": 2, "stroke-linejoin": "round", "stroke-linecap": "round" }));
+      const last = sr.values.length - 1;
+      svg.append(s("circle", { cx: xc(last), cy: y(sr.values[last]), r: 4, fill: css(sr.color), stroke: surface, "stroke-width": 2 }));
+    }
+  }
+  const cross = s("line", { y1: top, y2: top + plotH, stroke: css("--axis"), "stroke-width": 1, visibility: "hidden" });
+  svg.append(cross);
+  const hit = s("rect", { x: left, y: top, width: plotW, height: plotH, fill: "transparent" });
+  hit.addEventListener("pointermove", e => {
+    const rect = svg.getBoundingClientRect(), px = (e.clientX - rect.left) * (width / rect.width);
+    const i = Math.max(0, Math.min(days.length - 1, Math.floor((px - left) / band)));
+    cross.setAttribute("x1", xc(i)); cross.setAttribute("x2", xc(i)); cross.setAttribute("visibility", "visible");
+    // With many series (error sources) only the ones that occurred that day
+    const shown = series.filter(sr => series.length <= 2 || sr.values[i] > 0);
+    showTip(e, longDay(days[i]), shown.length ? shown.map(sr => ({ label: sr.label, value: format(sr.values[i]), color: css(sr.color), line: type === "lines" })) : [{ label: "none", value: "", color: "transparent" }]);
+  });
+  hit.addEventListener("pointerleave", () => { cross.setAttribute("visibility", "hidden"); hideTip(); });
+  svg.append(hit);
+  box.append(svg);
+}
+/* Horizontal bars, one per category; emphasis colors the one that matters */
+function barChart(host, items, { format, emphasis }) {
+  if (!items.length) { host.replaceChildren(h("div", { class: "empty" }, "No data in this period")); return; }
+  const width = Math.max(280, host.clientWidth || 500), rowH = 30, labelW = 70, valueW = 56;
+  const height = items.length * rowH + 4, max = Math.max(...items.map(i => i.value), 1);
+  const svg = s("svg", { viewBox: `0 0 ${width} ${height}`, height, role: "img" });
+  items.forEach((item, k) => {
+    const yy = k * rowH + 6, bw = Math.max(item.value ? 3 : 0, (item.value / max) * (width - labelW - valueW));
+    const t = s("text", { x: 0, y: yy + 13 }); t.textContent = item.label; t.style.fill = css("--ink-2"); svg.append(t);
+    if (bw > 0) {
+      const r = Math.min(4, bw), x0 = labelW, bh = 18;
+      svg.append(s("path", { d: `M${x0},${yy}H${x0 + bw - r}Q${x0 + bw},${yy} ${x0 + bw},${yy + r}V${yy + bh - r}Q${x0 + bw},${yy + bh} ${x0 + bw - r},${yy + bh}H${x0}Z`, fill: css(emphasis(item) ? "--s1" : "--other") }));
+    }
+    const v = s("text", { x: labelW + bw + 6, y: yy + 13 }); v.textContent = format(item.value); v.style.fill = css("--ink"); svg.append(v);
+    const hit = s("rect", { x: 0, y: yy - 4, width, height: rowH, fill: "transparent" });
+    hit.addEventListener("pointermove", e => showTip(e, item.label, [{ label: item.tip || "", value: format(item.value), color: css(emphasis(item) ? "--s1" : "--other") }]));
+    hit.addEventListener("pointerleave", hideTip);
+    svg.append(hit);
+  });
+  host.replaceChildren(svg);
+}
+function sparkline(values) {
+  const svg = s("svg", { viewBox: "0 0 100 28", preserveAspectRatio: "none", "aria-hidden": "true" });
+  if (values.length < 2 || !values.some(v => v > 0)) return svg;
+  const max = Math.max(...values), y = v => 25 - (v / max) * 22, x = i => (i / (values.length - 1)) * 96 + 2;
+  svg.append(s("path", { d: values.map((v, i) => `${i ? "L" : "M"}${x(i)},${y(v)}`).join(""), fill: "none", stroke: css("--other"), "stroke-width": 1.5, "vector-effect": "non-scaling-stroke" }));
+  svg.append(s("circle", { cx: x(values.length - 1), cy: y(values[values.length - 1]), r: 2.5, fill: css("--s1") }));
+  return svg;
+}
+/* A chart card with a Chart / Table switch: every value stays reachable without hovering */
+function chartCard(title, subtitle, draw, tableRows, columns, note) {
+  const body = h("div");
+  let asTable = false;
+  const toggle = h("button", { class: "btn small", "aria-pressed": "false", onclick: () => { asTable = !asTable; toggle.textContent = asTable ? "Chart" : "Table"; render(); } }, "Table");
+  const render = () => asTable ? body.replaceChildren(h("div", { class: "table-scroll" }, dataTable(columns, tableRows(), { limit: 400 }))) : draw(body);
+  const card = h("section", { class: "card" }, h("div", { class: "card-head" }, h("div", {}, h("h2", {}, title), subtitle ? h("div", { class: "sub" }, subtitle) : null), toggle), body,
+    note ? h("details", { class: "note" }, h("summary", {}, "How to read this"), note) : null);
+  chartRenders.push(() => { if (!asTable) draw(body); });
+  requestAnimationFrame(render);
+  return card;
+}
+let chartRenders = [];
+
+/* ---------- Tables ---------- */
+function dataTable(columns, rows, { onClick, limit = 50, sort } = {}) {
+  let sortCol = sort ? columns.findIndex(c => c.label === sort.label) : -1, dir = sort?.dir || -1, shown = limit;
+  const table = h("table", { class: "data" });
+  const draw = () => {
+    const sorted = sortCol < 0 ? rows : [...rows].sort((a, b) => {
+      const c = columns[sortCol], va = c.sort ? c.sort(a) : c.value(a), vb = c.sort ? c.sort(b) : c.value(b);
+      return (va > vb ? 1 : va < vb ? -1 : 0) * dir;
+    });
+    const head = h("tr", {}, columns.map((c, i) => h("th", { class: (c.num ? "num " : "") + "sortable" + (c.narrow ? " hide-narrow" : ""), title: "Sort", onclick: () => { dir = sortCol === i ? -dir : -1; sortCol = i; draw(); } },
+      c.label, sortCol === i ? (dir > 0 ? " ▲" : " ▼") : "")));
+    const body = sorted.slice(0, shown).map(r => h("tr", { class: onClick ? "click" : "", onclick: onClick ? () => onClick(r) : null },
+      columns.map(c => h("td", { class: (c.num ? "num" : c.wrap ? "msg" : "") + (c.narrow ? " hide-narrow" : "") }, c.render ? c.render(r) : c.value(r)))));
+    const more = sorted.length > shown ? h("tr", {}, h("td", { colspan: columns.length }, h("button", { class: "btn small more", onclick: () => { shown += 200; draw(); } }, `Show more (${fmtInt(sorted.length - shown)} left)`))) : null;
+    table.replaceChildren(h("thead", {}, head), h("tbody", {}, body, more));
+    if (!rows.length) table.querySelector("tbody").append(h("tr", {}, h("td", { colspan: columns.length, class: "empty" }, "Nothing in this period")));
+  };
+  draw();
+  return table;
+}
+const versionBadge = (v, latest) => v ? h("span", { class: "badge", title: latest && semverCompare(v, latest) < 0 ? `Older than ${latest}` : "" }, v + (latest && semverCompare(v, latest) < 0 ? " · older" : "")) : "";
+function sourceDot(source) { return h("span", {}, h("span", { class: "dot", style: `background:${css(SOURCE_COLOR[source] || "--other")}` }), source); }
+
+/* ---------- Page ---------- */
+const ui = { range: Number(store.get("range")) || 30, tab: "devices", filters: { tenant: "", version: "", text: "" }, conn: null, model: null, errorView: "groups" };
+let refreshTimer = null, nextRefreshAt = null, loading = false;
+
+function statusLine(c) {
+  const line = $("statusLine");
+  if (!c) { line.replaceChildren(); return; }
+  const parts = [h("span", { class: "chip", title: c.host }, data.sample ? "Sample data" : c.account)];
+  if (!data.sample && c.params.se) {
+    const end = new Date(c.params.se), soon = end - Date.now() < 3 * 86400000;
+    parts.push(h("span", { class: "chip", title: "When the SAS stops working" }, h("span", { class: "dot", style: `background:${css(end <= new Date() ? "--critical" : soon ? "--warning" : "--good")}` }), `SAS until ${dateTime(end)}`));
+  }
+  if (data.loadedAt) parts.push(h("span", { id: "lastRefresh" }, `Read ${ago(data.loadedAt)}`));
+  if (nextRefreshAt) parts.push(h("span", { class: "hide-narrow", id: "nextRefresh" }));
+  line.replaceChildren(...parts);
+}
+function scheduleRefresh() {
+  clearTimeout(refreshTimer);
+  const minutes = Number($("refreshEvery").value);
+  nextRefreshAt = minutes && ui.conn && !data.sample ? Date.now() + minutes * 60000 : null;
+  if (nextRefreshAt) refreshTimer = setTimeout(() => refresh(true), minutes * 60000);
+}
+setInterval(() => {
+  const next = $("nextRefresh"); if (next && nextRefreshAt) next.textContent = `next in ${Math.max(0, Math.ceil((nextRefreshAt - Date.now()) / 60000))} min`;
+  const last = $("lastRefresh"); if (last && data.loadedAt) last.textContent = `Read ${ago(data.loadedAt)}`;
+}, 15000);
+
+async function refresh(isRefresh) {
+  if (!ui.conn || loading) return;
+  if (data.sample) { render(); return; }
+  loading = true;
+  const main = $("main");
+  main.classList.add("loading");
+  let progress = $("progress");
+  if (!progress) { progress = h("div", { class: "progress", id: "progress" }, "Reading tables..."); main.prepend(progress); }
+  try {
+    const blocking = sasFindings(ui.conn).filter(f => f.level === "critical");
+    if (blocking.length) throw new Problem("This SAS can't work", blocking.map(f => f.text).concat([Fix.sas]));
+    await loadAll(ui.conn, ui.range, isRefresh, text => { progress.textContent = `Reading tables... ${text}`; });
+    render();
+  } catch (e) {
+    showProblem(e);
+  } finally {
+    loading = false;
+    main.classList.remove("loading");
+    $("progress")?.remove();
+    scheduleRefresh();
+    statusLine(ui.conn);
+  }
+}
+
+function showProblem(e) {
+  const problem = e instanceof Problem ? e : new Problem("Something went wrong", [String(e?.message || e)]);
+  const findings = ui.conn && !data.sample ? sasFindings(ui.conn).filter(f => !problem.details.includes(f.text)) : [];
+  $("main").replaceChildren(h("div", { class: "panel" },
+    h("section", { class: "card problem" + (problem.level === "warning" ? " warning" : "") },
+      h("h2", {}, problem.title),
+      problem.details.map(d => typeof d === "object" ? h("pre", { class: "cmd" }, d.cmd) : h("p", {}, d)),
+      findings.length ? h("div", {}, h("p", {}, h("strong", {}, "About this SAS")), h("ul", {}, findings.map(f => h("li", {}, f.text)))) : null,
+      h("div", { class: "row" }, h("button", { class: "btn primary", onclick: () => refresh(false) }, "Try again"), h("button", { class: "btn", onclick: connectionPanel }, "Change connection"))),
+    data.loadedAt ? h("p", { class: "footer" }, `The data shown before was read ${ago(data.loadedAt)}.`) : null));
+}
+
+function connectionPanel() {
+  clearTimeout(refreshTimer); nextRefreshAt = null;
+  const input = h("textarea", { id: "connInput", placeholder: "https://<account>.table.core.windows.net/?sv=...&ss=t&srt=co&sp=rl&se=...&sig=...\nor\nTableEndpoint=https://<account>.table.core.windows.net/;SharedAccessSignature=sv=...", spellcheck: "false", autocomplete: "off" });
+  input.value = store.get("connection") || "";
+  const remember = h("input", { type: "checkbox", id: "remember" }); remember.checked = !!store.get("connection");
+  const errorBox = h("div");
+  const connect = () => {
+    try {
+      const c = parseConnection(input.value);
+      store.set("connection", remember.checked ? input.value.trim() : null);
+      startWith(c);
+    } catch (e) {
+      errorBox.replaceChildren(h("section", { class: "card problem", style: "margin-top:12px" }, h("h2", {}, e.title || "Not a valid connection"), (e.details || [e.message]).map(d => h("p", {}, d))));
+    }
+  };
+  $("main").replaceChildren(h("div", { class: "panel" },
+    h("h1", {}, "Connect to your monitoring storage"),
+    h("p", { class: "sub" }, "VFS365 reports errors, daily usage and installs to the tables errors, statistics and devices when the MonitoringUrl policy is set. This page reads them straight from your storage account; nothing goes anywhere else."),
+    h("section", { class: "card", style: "margin-top:12px" },
+      h("label", { for: "connInput" }, h("strong", {}, "Table service SAS URL or SAS connection string")),
+      input,
+      h("div", { class: "row" },
+        h("label", {}, remember, " Remember on this computer (stored in this browser; anyone using it can read the data)"),
+        h("div", { class: "spacer" }),
+        h("button", { class: "btn", onclick: () => { data.sample = true; makeSample(); startWith({ base: "", sas: "", params: {}, account: "sample", host: "sample" }); } }, "Show sample data"),
+        h("button", { class: "btn primary", onclick: connect }, "Connect")),
+      errorBox),
+    h("section", { class: "card", style: "margin-top:12px" },
+      h("h2", {}, "What the SAS needs"),
+      h("ul", {},
+        h("li", {}, "Allowed services: Table. Allowed resource types: Container and Object. Allowed permissions: Read and List (nothing else; the agents use their own SAS with Add)."),
+        h("li", {}, "HTTPS only, and an expiry date. The page warns three days before it expires."),
+        h("li", {}, "Azure portal: Storage account > Security + networking > Shared access signature > Generate, then copy the Table service SAS URL.")),
+      h("h2", { style: "margin-top:12px" }, "What the storage account needs (CORS)"),
+      h("p", {}, "Browsers only let a page read storage that allows it. Under Settings > Resource sharing (CORS) > Table service, add: Allowed origins * (or the address this page is opened from), Allowed methods GET and OPTIONS, Allowed headers *, Exposed headers *, Max age 3600."),
+      h("p", { class: "sub" }, "Tip: open this page with #connect=<URL-encoded SAS URL> at the end of its address to connect right away; that address then holds the SAS, so keep it private."))));
+  input.focus();
+}
+
+function startWith(c) {
+  ui.conn = c;
+  if (!data.sample) { data.statistics = new Map(); data.errors = new Map(); data.devices = []; data.from = {}; data.loadedAt = null; }
+  $("main").replaceChildren(h("div", { class: "progress", id: "progress" }, "Reading tables..."));
+  statusLine(c);
+  refresh(false);
+}
+
+function filterRow(m) {
+  const ranges = [[2, "2 days"], [7, "7 days"], [30, "30 days"], [90, "90 days"]];
+  const seg = h("div", { class: "seg", role: "group", "aria-label": "Period" }, ranges.map(([d, label]) => h("button", { "aria-pressed": String(ui.range === d), onclick: () => { const wider = d > ui.range; ui.range = d; store.set("range", d); wider && !data.sample ? refresh(false) : render(); } }, label)));
+  const version = h("select", { "aria-label": "Version", onchange: e => { ui.filters.version = e.target.value; render(); } }, h("option", { value: "" }, "All versions"), m.allVersions.map(v => h("option", { value: v, selected: ui.filters.version === v }, v)));
+  const tenant = m.tenants.length > 1 ? h("select", { "aria-label": "Tenant", onchange: e => { ui.filters.tenant = e.target.value; render(); } }, h("option", { value: "" }, "All tenants"), m.tenants.map(t => h("option", { value: t, selected: ui.filters.tenant === t }, t))) : null;
+  const search = h("input", { type: "search", placeholder: "Device, user or text", value: ui.filters.text, "aria-label": "Search" });
+  let debounce; search.addEventListener("input", () => { clearTimeout(debounce); debounce = setTimeout(() => { ui.filters.text = search.value; render(); setTimeout(() => { const s2 = document.querySelector("input[type=search]"); s2?.focus(); s2?.setSelectionRange(s2.value.length, s2.value.length); }); }, 250); });
+  return h("div", { class: "filters" }, seg, version, tenant, search, ui.filters.text || ui.filters.version || ui.filters.tenant ? h("button", { class: "btn link", onclick: () => { ui.filters = { tenant: "", version: "", text: "" }; render(); } }, "Clear filters") : null);
+}
+
+function icon(level) {
+  const color = css({ critical: "--critical", warning: "--warning", good: "--good" }[level] || "--muted");
+  const svg = s("svg", { class: "icon", viewBox: "0 0 18 18", "aria-hidden": "true" });
+  svg.append(s("circle", { cx: 9, cy: 9, r: 8, fill: color }));
+  const glyph = s("path", { stroke: "#fff", "stroke-width": 2, "stroke-linecap": "round", fill: "none",
+    d: level === "good" ? "M5 9.5l2.5 2.5L13 6.5" : level === "info" ? "M9 8v5M9 5.2v.1" : level === "warning" ? "M9 4.8v5M9 12.8v.1" : "M6 6l6 6M12 6l-6 6" });
+  svg.append(glyph);
+  return svg;
+}
+
+function render() {
+  if (!ui.conn) return;
+  hideTip();
+  chartRenders = [];
+  const m = buildModel(ui.range, ui.filters);
+  ui.model = m;
+  const t = m.totals, perDay = d => m.perDay[d];
+  const errorsDelta = t.errors - t.previousErrors;
+  const kpi = (label, value, note, spark, title) => h("section", { class: "card kpi", title: title || "" }, h("div", { class: "label" }, label), h("div", { class: "value" }, value), h("div", { class: "note" }, note), spark ? sparkline(spark) : null);
+  const kpis = h("div", { class: "grid kpis" },
+    kpi("Devices", fmtInt(t.devices), t.installed ? `${fmtInt(t.installed)} installed` : "with data in this period", m.statDays.map(d => perDay(d).devices.size), "Devices that sent statistics or errors in this period"),
+    kpi("Users", fmtInt(t.users), t.userDays ? `${(t.userDays / Math.max(1, m.statDays.filter(d => perDay(d).users.size).length)).toFixed(1)} a day on average` : "", m.statDays.map(d => perDay(d).users.size)),
+    kpi("Errors", fmtInt(t.errors), h("span", {}, h("span", { class: errorsDelta > 0 ? "delta-bad" : errorsDelta < 0 ? "delta-good" : "" }, `${errorsDelta > 0 ? "+" : ""}${fmtInt(errorsDelta)}`), ` vs the ${ui.range} days before${t.crashes ? `, ${t.crashes} crash(es)` : ""}`), m.days.map(d => Object.values(perDay(d).errors).reduce((a, b) => a + b, 0))),
+    kpi("API requests", compact(t.graph + t.sp), `${compact(t.ru)} resource units${t.userDays ? `, ${compact(t.ru / t.userDays)} per user-day` : ""}`, m.statDays.map(d => perDay(d).graph + perDay(d).sp), "Graph and SharePoint requests; Microsoft limits resource units per app per tenant"),
+    kpi("Throttled", fmtInt(t.throttled), t.throttled ? `${duration(t.throttledSec)} waited` : "Microsoft didn't throttle", m.statDays.map(d => perDay(d).throttled), "429 and 503 answers from Microsoft 365"),
+    kpi("Data", bytes(t.rx + t.tx), `${bytes(t.rx)} in, ${bytes(t.tx)} out`, m.statDays.map(d => perDay(d).rx + perDay(d).tx)),
+    kpi("Running", `${fmtInt(t.minutes / 60)} h`, t.userDays ? `${(t.minutes / t.userDays / 60).toFixed(1)} h per user-day` : "", m.statDays.map(d => perDay(d).minutes), "Time the agent ran"));
+
+  const insightCard = h("section", { class: "card insights" }, h("div", { class: "card-head" }, h("div", {}, h("h2", {}, "Needs attention"), h("div", { class: "sub" }, `Last ${ui.range} days`))),
+    insights(m, ui.conn).map(i => h("div", { class: "insight" }, icon(i.level), h("div", { class: "text" }, h("span", { class: "label" }, i.label), i.text, i.action ? [" ", h("button", { class: "btn link", onclick: i.action }, "Show")] : null))));
+
+  const dayTable = cols => () => m.statDays.map(d => ({ day: d, ...cols(perDay(d)) }));
+  const sources = Object.keys(m.sourceTotals).sort((a, b) => m.sourceTotals[b] - m.sourceTotals[a]);
+  const shownSources = KNOWN_SOURCES.filter(src => sources.includes(src));
+  const otherSources = sources.filter(src => !shownSources.includes(src));
+  const errorSeries = shownSources.map(src => ({ label: src, color: SOURCE_COLOR[src], values: m.days.map(d => perDay(d).errors[src] || 0) }));
+  if (otherSources.length) errorSeries.push({ label: "other", color: "--other", values: m.days.map(d => otherSources.reduce((t2, src) => t2 + (perDay(d).errors[src] || 0), 0)) });
+  const waitSeries = [
+    { label: "Throttled by Microsoft", color: "--s1", values: m.statDays.map(d => perDay(d).throttledSec) },
+    { label: "Budget: user actions", color: "--s2", values: m.statDays.map(d => perDay(d).budgetUser) },
+    { label: "Budget: background", color: "--s3", values: m.statDays.map(d => perDay(d).budgetBackground) },
+  ];
+  if (m.totals.budgetUnsplit) waitSeries.push({ label: "Budget: not split", color: "--s4", values: m.statDays.map(d => perDay(d).budgetUnsplit) });
+
+  const charts = h("div", { class: "grid charts" },
+    chartCard("Microsoft 365 requests per day", "Graph (files) and SharePoint (discovery and transfers), up to yesterday",
+      el => timeChart(el, { days: m.statDays, type: "columns", format: compact, series: [{ label: "Graph", color: "--s1", values: m.statDays.map(d => perDay(d).graph) }, { label: "SharePoint", color: "--s2", values: m.statDays.map(d => perDay(d).sp) }] }),
+      dayTable(p => ({ graph: p.graph, sp: p.sp, ru: p.ru })), [{ label: "Day", value: r => r.day, render: r => shortDay(r.day) }, { label: "Graph", num: true, value: r => r.graph, render: r => fmtInt(r.graph) }, { label: "SharePoint", num: true, value: r => r.sp, render: r => fmtInt(r.sp) }, { label: "Resource units", num: true, value: r => r.ru, render: r => fmtInt(r.ru) }]),
+    chartCard("Errors per day", "By source; the most frequent first",
+      el => timeChart(el, { days: m.days, type: "columns", format: fmtInt, series: errorSeries, alwaysLegend: true }),
+      () => m.days.map(d => ({ day: d, ...perDay(d).errors })), [{ label: "Day", value: r => r.day, render: r => shortDay(r.day) }, ...sources.map(src => ({ label: src, num: true, value: r => r[src] || 0 }))]),
+    chartCard("Active users and devices per day", "Who used VFS365 that day; a day's statistics arrive the next day",
+      el => timeChart(el, { days: m.statDays, type: "lines", format: fmtInt, series: [{ label: "Users", color: "--s1", values: m.statDays.map(d => perDay(d).users.size) }, { label: "Devices", color: "--s2", values: m.statDays.map(d => perDay(d).devices.size) }] }),
+      dayTable(p => ({ users: p.users.size, devices: p.devices.size })), [{ label: "Day", value: r => r.day, render: r => shortDay(r.day) }, { label: "Users", num: true, value: r => r.users }, { label: "Devices", num: true, value: r => r.devices }]),
+    chartCard("Data transferred per day", "Downloaded and uploaded",
+      el => timeChart(el, { days: m.statDays, type: "columns", format: bytes, kind: "bytes", series: [{ label: "Received", color: "--s1", values: m.statDays.map(d => perDay(d).rx) }, { label: "Sent", color: "--s2", values: m.statDays.map(d => perDay(d).tx) }] }),
+      dayTable(p => ({ rx: p.rx, tx: p.tx })), [{ label: "Day", value: r => r.day, render: r => shortDay(r.day) }, { label: "Received", num: true, value: r => r.rx, render: r => bytes(r.rx) }, { label: "Sent", num: true, value: r => r.tx, render: r => bytes(r.tx) }]),
+    chartCard("Waiting for Microsoft 365 per day", "Time requests waited: because Microsoft throttled, or for VFS365's own API budget",
+      el => timeChart(el, { days: m.statDays, type: "lines", format: duration, kind: "seconds", series: waitSeries }),
+      dayTable(p => ({ throttled: p.throttled, sec: p.throttledSec, user: p.budgetUser, background: p.budgetBackground, unsplit: p.budgetUnsplit })),
+      [{ label: "Day", value: r => r.day, render: r => shortDay(r.day) }, { label: "Throttled answers", num: true, value: r => r.throttled }, { label: "Throttled wait", num: true, value: r => r.sec, render: r => duration(r.sec) },
+        { label: "Budget: user actions", num: true, value: r => r.user, render: r => duration(r.user) }, { label: "Budget: background", num: true, value: r => r.background, render: r => duration(r.background) },
+        ...(m.totals.budgetUnsplit ? [{ label: "Budget: not split", num: true, value: r => r.unsplit, render: r => duration(r.unsplit) }] : [])],
+      h("dl", {},
+        h("dt", {}, "Throttled by Microsoft"), h("dd", {}, "Microsoft answered 429 or 503 and asked VFS365 to wait. Microsoft's limit is per app per tenant, shared by all users."),
+        h("dt", {}, "API budget"), h("dd", {}, "VFS365's own limit per user (ApiBudgetPerMinute, default 600 resource units a minute). It paces requests; nothing fails."),
+        h("dt", {}, "User actions"), h("dd", {}, "Opening folders and files, and saving. Users notice this as a slower drive. When Microsoft isn't throttling, a higher ApiBudgetPerMinute removes it."),
+        h("dt", {}, "Background"), h("dd", {}, "Discovery after sign-in, change checks, loading ahead. Background work may only use half of the budget, so it waits first; users don't notice it."),
+        h("dt", {}, "Not split"), h("dd", {}, "Versions before 0.3.0 report one total, without the cause."),
+        h("dt", {}, "Added up over requests"), h("dd", {}, "Four requests that wait 10 seconds at the same time count 40 seconds, so the time someone actually waited is shorter."))),
+    chartCard("Versions in use", m.latest ? `Devices per version; ${m.latest} is the newest seen` : "Devices per version",
+      el => barChart(el, m.versions.map(v => ({ label: v.version, value: v.devices, tip: "devices" })), { format: fmtInt, emphasis: item => item.label === m.latest }),
+      () => m.versions, [{ label: "Version", value: r => r.version }, { label: "Devices", num: true, value: r => r.devices }]));
+
+  const tabs = [["devices", `Devices (${fmtInt(m.devices.length)})`], ["users", `Users (${fmtInt(m.users.length)})`], ["errors", `Errors (${fmtInt(m.errors.length)})`], ["installs", `Installs (${fmtInt(m.installs.length)})`]];
+  const tabBody = h("div");
+  const tabBar = h("div", { class: "tabs", role: "tablist" }, tabs.map(([key, label]) => h("button", { role: "tab", "aria-selected": String(ui.tab === key), onclick: () => { ui.tab = key; render(); } }, label)));
+  tabBody.append(tabContent(m));
+  const tables = h("div", { class: "grid tables" }, h("section", { class: "card", id: "tables" }, h("div", { class: "card-head" }, h("div", {}, tabBar)), h("div", { class: "table-scroll" }, tabBody)));
+
+  const footer = h("p", { class: "footer" }, `Read ${dateTime(data.loadedAt)} from ${data.sample ? "sample data" : ui.conn.host}. Statistics are per day, device and user, sent the day after; errors arrive at once; installs come from the installer.`);
+  $("main").replaceChildren(filterRow(m), insightCard, h("div", { style: "height:12px" }), kpis, charts, tables, footer);
+  statusLine(ui.conn);
+}
+
+function tabContent(m) {
+  if (ui.tab === "devices") return dataTable([
+    { label: "Device", value: r => r.name.toLowerCase(), render: r => r.name },
+    { label: "Users", value: r => r.users.size, num: true },
+    { label: "Version", value: r => r.version, sort: r => r.version.split(".").map(n => n.padStart(5, "0")).join("."), render: r => versionBadge(r.version, m.latest) },
+    { label: "Last seen", value: r => r.lastSeen?.getTime() || 0, render: r => ago(r.lastSeen) },
+    { label: "Errors", value: r => r.errors, num: true, render: r => r.crashes ? `${r.errors} (${r.crashes} crash)` : fmtInt(r.errors) },
+    { label: "Resource units", value: r => r.ru, num: true, render: r => compact(r.ru), narrow: true },
+    { label: "Throttled", value: r => r.throttled, num: true, narrow: true },
+    { label: "Install", value: r => r.install?.at?.getTime() || 0, render: r => r.install ? `${r.install.Action} ${r.install.Version}, ${dateTime(r.install.at)}` : "", narrow: true },
+  ], m.devices, { onClick: openDevice, sort: { label: "Errors" } });
+  if (ui.tab === "users") return dataTable([
+    { label: "User", value: r => r.key.toLowerCase(), render: r => r.upn || r.windows || r.key },
+    { label: "Windows user", value: r => r.windows, narrow: true },
+    { label: "Devices", value: r => r.devices.size, num: true },
+    { label: "Days active", value: r => r.days.size, num: true },
+    { label: "Last seen", value: r => r.lastSeen?.getTime() || 0, render: r => ago(r.lastSeen) },
+    { label: "Errors", value: r => r.errors, num: true },
+    { label: "Resource units", value: r => r.ru, num: true, render: r => compact(r.ru), narrow: true },
+    { label: "Data", value: r => r.rx + r.tx, num: true, render: r => bytes(r.rx + r.tx), narrow: true },
+    { label: "Budget wait", value: r => r.budgetUser, num: true, render: r => r.budgetUser ? duration(r.budgetUser) : "", narrow: true },
+  ], m.users, { onClick: openUser, sort: { label: "Errors" } });
+  if (ui.tab === "errors") {
+    const switcher = h("div", { class: "seg", style: "margin-bottom:8px" }, [["groups", "Grouped"], ["all", "Every error"]].map(([key, label]) => h("button", { "aria-pressed": String(ui.errorView === key), onclick: () => { ui.errorView = key; render(); } }, label)));
+    const table = ui.errorView === "groups"
+      ? dataTable([
+        { label: "Source", value: r => r.source, render: r => sourceDot(r.source) },
+        { label: "Error", value: r => r.pattern, wrap: true, render: r => r.sample },
+        { label: "Count", value: r => r.rows.length, num: true },
+        { label: "Devices", value: r => r.devices.size, num: true },
+        { label: "Users", value: r => r.users.size, num: true, narrow: true },
+        { label: "Last", value: r => r.last.getTime(), render: r => ago(r.last) },
+      ], m.groups, { onClick: openGroup })
+      : errorList(m.errors);
+    return h("div", {}, switcher, table);
+  }
+  return dataTable([
+    { label: "When", value: r => r.at.getTime(), render: r => dateTime(r.at) },
+    { label: "Device", value: r => (r.DeviceName || "").toLowerCase(), render: r => r.DeviceName },
+    { label: "Action", value: r => r.Action },
+    { label: "Version", value: r => r.Version || "" },
+    { label: "Signed-in users", value: r => r.Users || "", wrap: true, narrow: true },
+  ], m.installs, { onClick: r => openDevice(m.devices.find(d => d.id === r.DeviceId)) });
+}
+function errorList(rows) {
+  return dataTable([
+    { label: "When", value: r => r.at.getTime(), render: r => dateTime(r.at) },
+    { label: "Device", value: r => (r.DeviceName || "").toLowerCase(), render: r => r.DeviceName },
+    { label: "User", value: r => userOf(r).toLowerCase(), render: r => userOf(r), narrow: true },
+    { label: "Version", value: r => r.Version || "", narrow: true },
+    { label: "Source", value: r => r.Source || "", render: r => sourceDot(r.Source || "other") },
+    { label: "Message", value: r => r.Message || "", wrap: true },
+  ], rows, { onClick: r => openDevice(ui.model.devices.find(d => d.id === r.DeviceId)) });
+}
+function showTab(tab) { ui.tab = tab; render(); $("tables")?.scrollIntoView({ behavior: "smooth" }); }
+function openGroupBySource(source) { const g = ui.model.groups.find(x => x.source === source); g ? openGroup(g) : showTab("errors"); }
+
+/* ---------- Drilldowns ---------- */
+function drawer(title, subtitle, ...content) {
+  $("drawerBody").replaceChildren(h("div", { class: "card-head" }, h("div", {}, h("h2", {}, title), subtitle ? h("div", { class: "sub" }, subtitle) : null), h("button", { class: "btn small", onclick: closeDrawer }, "Close")), ...content);
+  $("drawer").style.display = "block"; $("drawerBack").style.display = "block";
+  $("drawer").scrollTop = 0;
+}
+function closeDrawer() { $("drawer").style.display = "none"; $("drawerBack").style.display = "none"; hideTip(); }
+$("drawerBack").addEventListener("click", closeDrawer);
+addEventListener("keydown", e => { if (e.key === "Escape") closeDrawer(); });
+const facts = list => h("div", { class: "grid kpis", style: "margin:12px 0" }, list.map(([label, value]) => h("section", { class: "card kpi" }, h("div", { class: "label" }, label), h("div", { class: "value", style: "font-size:20px" }, value))));
+const budgetFacts = x => [["Budget wait, user actions", duration(x.budgetUser)], ["Budget wait, background", duration(x.budgetBackground)],
+  ...(x.budgetUnsplit ? [["Budget wait, not split", duration(x.budgetUnsplit)]] : [])];
+function rowsFor(match) {
+  const m = ui.model;
+  const stats = [...data.statistics.values()].flat().filter(r => match(r) && r.PartitionKey >= m.statDays[0]);
+  const perDay = m.statDays.map(d => stats.filter(r => r.PartitionKey === d));
+  return { stats, perDay };
+}
+function usageCard(title, perDay) {
+  const m = ui.model;
+  const body = h("div");
+  const card = h("section", { class: "card", style: "margin-top:12px" }, h("div", { class: "card-head" }, h("div", {}, h("h2", {}, title))), body);
+  requestAnimationFrame(() => timeChart(body, { days: m.statDays, type: "columns", format: compact, series: [
+    { label: "Graph", color: "--s1", values: perDay.map(rows => rows.reduce((t, r) => t + num(r.GraphRequests), 0)) },
+    { label: "SharePoint", color: "--s2", values: perDay.map(rows => rows.reduce((t, r) => t + num(r.SharePointRequests), 0)) }] }));
+  return card;
+}
+function openDevice(d) {
+  if (!d) return;
+  const m = ui.model, { perDay } = rowsFor(r => r.DeviceId === d.id);
+  const errors = m.errors.filter(r => r.DeviceId === d.id), installs = data.devices.filter(r => r.DeviceId === d.id).map(r => ({ ...r, at: new Date(r.OccurredAt || r.Timestamp) })).sort((a, b) => b.at - a.at);
+  drawer(d.name, `Device ID ${d.id}${d.entra ? ` · Entra device ID ${d.entra}` : ""}`,
+    facts([["Version", d.version || "unknown"], ["Users", fmtInt(d.users.size)], ["Last seen", ago(d.lastSeen)], ["Errors", fmtInt(d.errors)], ["Resource units", compact(d.ru)], ["Running", `${fmtInt(d.minutes / 60)} h`], ...budgetFacts(d)]),
+    usageCard("Requests per day", perDay),
+    h("section", { class: "card", style: "margin-top:12px" }, h("h2", {}, "Users"), h("p", {}, [...d.users].join(", ") || "none")),
+    h("section", { class: "card", style: "margin-top:12px" }, h("h2", {}, `Errors (${errors.length})`), h("div", { class: "table-scroll" }, errorList(errors))),
+    h("section", { class: "card", style: "margin-top:12px" }, h("h2", {}, "Install history"), installs.length
+      ? h("div", { class: "table-scroll" }, dataTable([{ label: "When", value: r => r.at.getTime(), render: r => dateTime(r.at) }, { label: "Action", value: r => r.Action }, { label: "Version", value: r => r.Version }, { label: "Signed-in users", value: r => r.Users || "", wrap: true }], installs))
+      : h("p", { class: "sub" }, "No install reports for this device.")));
+}
+function openUser(u) {
+  const m = ui.model, { perDay } = rowsFor(r => userOf(r) === u.key);
+  const errors = m.errors.filter(r => userOf(r) === u.key);
+  drawer(u.upn || u.key, u.windows ? `Windows user ${u.windows}` : "",
+    facts([["Devices", fmtInt(u.devices.size)], ["Days active", fmtInt(u.days.size)], ["Last seen", ago(u.lastSeen)], ["Errors", fmtInt(u.errors)], ["Resource units", compact(u.ru)], ["Data", bytes(u.rx + u.tx)], ...budgetFacts(u)]),
+    usageCard("Requests per day", perDay),
+    h("section", { class: "card", style: "margin-top:12px" }, h("h2", {}, "Devices"), h("p", {}, [...u.devices].map(id => m.devices.find(d => d.id === id)?.name || id).join(", ") || "none")),
+    h("section", { class: "card", style: "margin-top:12px" }, h("h2", {}, `Errors (${errors.length})`), h("div", { class: "table-scroll" }, errorList(errors))));
+}
+function openGroup(g) {
+  const m = ui.model, body = h("div");
+  drawer(g.source, `Seen ${g.rows.length} time(s) on ${g.devices.size} device(s), ${g.users.size} user(s); first ${dateTime(g.first)}, last ${dateTime(g.last)}`,
+    h("section", { class: "card", style: "margin-top:12px" }, h("h2", {}, "Latest message"), h("p", { class: "msg" }, g.sample)),
+    h("section", { class: "card", style: "margin-top:12px" }, h("h2", {}, "Per day"), body),
+    h("section", { class: "card", style: "margin-top:12px" }, h("h2", {}, "Occurrences"), h("div", { class: "table-scroll" }, errorList(g.rows))));
+  requestAnimationFrame(() => timeChart(body, { days: m.days, type: "columns", format: fmtInt, series: [{ label: g.source, color: SOURCE_COLOR[g.source] || "--s1", values: m.days.map(d => g.rows.filter(r => localDay(r.at) === d).length) }] }));
+}
+
+/* ---------- Sample data (for a look without a storage account) ---------- */
+function makeSample() {
+  let seed = 7; const rnd = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
+  const pick = a => a[Math.floor(rnd() * a.length)];
+  const today = new Date(), stats = new Map(), errors = new Map(), devices = [];
+  const tenant = "00000000-0000-0000-0000-000000000365";
+  const hosts = Array.from({ length: 14 }, (_, i) => ({ id: crypto.randomUUID?.() || `device-${i}`, name: i < 6 ? `AVD-HOST-${pad(i + 1)}` : `LT-${1000 + i * 37}`, avd: i < 6 }));
+  const people = Array.from({ length: 60 }, (_, i) => `user${pad(i + 1)}@contoso.example`);
+  const versionOn = (day, k) => day < localDay(addDays(today, -40 + (k % 5))) ? "0.1.9" : k % 5 === 4 || day < localDay(addDays(today, -12 + (k % 4))) ? "0.2.0" : "0.3.0";
+  hosts.forEach((d, k) => {
+    devices.push({ PartitionKey: d.id, RowKey: "a" + k, DeviceId: d.id, DeviceName: d.name, Action: "install", Version: "0.1.9", OccurredAt: addDays(today, -58).toISOString(), Users: "" });
+    devices.push({ PartitionKey: d.id, RowKey: "b" + k, DeviceId: d.id, DeviceName: d.name, Action: "update", Version: "0.2.0", OccurredAt: addDays(today, -40 + (k % 5)).toISOString(), Users: "" });
+    if (k % 5 !== 4) devices.push({ PartitionKey: d.id, RowKey: "c" + k, DeviceId: d.id, DeviceName: d.name, Action: "update", Version: "0.3.0", OccurredAt: addDays(today, -12 + (k % 4)).toISOString(), Users: "" });
+  });
+  const sampleWaits = (version, back) => {
+    const background = back % 7 === 1 ? Math.round(rnd() * 40) : 0, user = back === 9 && rnd() < 0.3 ? Math.round(rnd() * 20) : 0;
+    return version === "0.3.0"
+      ? { BudgetWaitSeconds: String(user + background), BudgetWaitForegroundSeconds: String(user), BudgetWaitBackgroundSeconds: String(background) }
+      : { BudgetWaitSeconds: String(user + background) };
+  };
+  for (let back = 89; back >= 1; back--) {
+    const date = addDays(today, -back), day = localDay(date), weekend = [0, 6].includes(date.getDay());
+    const rows = [];
+    hosts.forEach((d, k) => {
+      if (k === 13 && back < 6) return;
+      const users = d.avd ? people.slice(k * 8, k * 8 + 8) : [people[48 + k - 6]];
+      for (const u of users) {
+        if (rnd() < (weekend ? 0.85 : 0.12)) continue;
+        const busy = 0.4 + rnd() * 1.6, throttle = back === 23 || back === 9 ? Math.floor(rnd() * 6) : 0;
+        const graph = Math.round(120 * busy), sp = Math.round(40 * busy + (back % 7 === 1 ? 300 : 0));
+        rows.push({ PartitionKey: day, RowKey: d.id + "_" + u, Day: day, DeviceId: d.id, DeviceName: d.name, User: u, WindowsUser: "CONTOSO\\" + u.split("@")[0], TenantId: tenant,
+          Version: versionOn(day, k), GraphRequests: String(graph), SharePointRequests: String(sp), ResourceUnits: String(graph * 1.4 + sp * 2 | 0),
+          BytesReceived: String(Math.round(busy * 9e7)), BytesSent: String(Math.round(busy * 2.2e7)), Throttled: String(throttle), ThrottledSeconds: String(throttle * 12),
+          Errors: 0, MinutesRunning: Math.round(300 + rnd() * 200), ...sampleWaits(versionOn(day, k), back) });
+      }
+    });
+    stats.set(day, rows);
+  }
+  const messages = {
+    upload: ["\\Sites\\Finance\\Documents\\Budget 2027.xlsx: The operation has timed out.", "\\OneDrive\\Exports\\report.csv: 503 Service Unavailable"],
+    "conflict copy": ["\\Sites\\Sales\\Documents\\Offer.docx was changed or locked in Microsoft 365; saved as Offer (conflict 2026-10-02 1412).docx"],
+    "sign-in": ["AADSTS50076: Due to a configuration change made by your administrator, you must use multi-factor authentication."],
+    "file system": ["IOException: The process cannot access the file because it is being used by another process."],
+    discovery: ["503 Service Unavailable from https://contoso.sharepoint.com/_api/search/query"],
+    crash: ["The agent stopped unexpectedly (exit code 0xC0000005) and was started again"],
+    "drive letter": ["T: is also remembered as a mapping to \\\\fs01\\data (HKCU\\Network\\T, from a drive mapping policy). Explorer can show that mapping as a disconnected network drive."],
+  };
+  for (let back = 89; back >= 0; back--) {
+    const n = Math.floor(rnd() * 4) + (back === 9 ? 14 : 0) + (back < 2 ? 3 : 0);
+    for (let i = 0; i < n; i++) {
+      const at = addDays(today, -back); at.setHours(8 + Math.floor(rnd() * 9), Math.floor(rnd() * 60));
+      if (at > today) continue;
+      const source = back === 9 && i < 10 ? "upload" : pick(["upload", "upload", "conflict copy", "sign-in", "file system", "discovery", "crash", "drive letter"]);
+      const d = pick(hosts), u = d.avd ? pick(people.slice(0, 48)) : people[48 + hosts.indexOf(d) - 6];
+      const key = utcDay(at);
+      if (!errors.has(key)) errors.set(key, []);
+      errors.get(key).push({ PartitionKey: key, RowKey: String(i), DeviceId: d.id, DeviceName: d.name, User: u, WindowsUser: "CONTOSO\\" + u.split("@")[0], TenantId: tenant, Version: versionOn(localDay(at), hosts.indexOf(d)), Source: source, Message: pick(messages[source]), OccurredAt: at.toISOString() });
+    }
+  }
+  data.statistics = stats; data.errors = errors; data.devices = devices; data.missing = new Set(); data.loadedAt = new Date(); data.sample = true;
+}
+
+/* ---------- Start ---------- */
+$("refreshNow").addEventListener("click", () => refresh(true));
+$("refreshEvery").value = store.get("refreshEvery") ?? "5";
+$("refreshEvery").addEventListener("change", e => { store.set("refreshEvery", e.target.value); scheduleRefresh(); statusLine(ui.conn); });
+$("changeConnection").addEventListener("click", () => { data.sample = false; ui.conn = null; statusLine(null); connectionPanel(); });
+$("themeToggle").addEventListener("click", () => {
+  const dark = document.documentElement.dataset.theme ? document.documentElement.dataset.theme === "dark" : matchMedia("(prefers-color-scheme: dark)").matches;
+  document.documentElement.dataset.theme = dark ? "light" : "dark"; store.set("theme", document.documentElement.dataset.theme); if (ui.conn) render();
+});
+if (store.get("theme")) document.documentElement.dataset.theme = store.get("theme");
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => { if (ui.conn) render(); });
+let resizeTimer; addEventListener("resize", () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(() => chartRenders.forEach(f => f()), 150); });
+
+(function start() {
+  const hash = new URLSearchParams(location.hash.slice(1));
+  const initial = hash.get("connect") || store.get("connection");
+  if (hash.has("sample")) { makeSample(); startWith({ base: "", sas: "", params: {}, account: "sample", host: "sample" }); return; }
+  if (initial) { try { startWith(parseConnection(initial)); return; } catch { } }
+  connectionPanel();
+})();
+</script>
+</body>
+</html>

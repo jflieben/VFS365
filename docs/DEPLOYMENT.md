@@ -10,6 +10,7 @@ VFS365 shows Microsoft 365 files (OneDrive, Teams and SharePoint libraries) as a
 | `VFS365-<version>-x64.msi`, `VFS365-<version>-arm64.msi` | VFS365 alone, for when WinFsp is deployed separately |
 | `winfsp-<version>.msi` | The unmodified WinFsp installer the setup contains |
 | `VFS365-<version>-policy.zip` (`policy\VFS365.admx`, `policy\en-US\VFS365.adml`) | Policy templates for Intune (ADMX import) or Group Policy |
+| `vfs365-monitoring.html` | Dashboard for the monitoring tables, see [Monitoring](#monitoring) |
 | `SHA256SUMS.txt` | Checksums |
 
 Releases are on the repository's GitHub Releases page; the guides, `LICENSE` and `THIRD-PARTY-NOTICES.md` are in the repository (a local `./build.ps1 release` also copies them next to the installers).
@@ -86,7 +87,7 @@ Microsoft limits every app per tenant, for all its users together: 1,250 resourc
 - When Microsoft throttles anyway (429 or 503), every request waits as long as Microsoft asks, and background work stops for `ThrottlePauseMinutes` (default 15).
 - `ChangeCheckSeconds` (default 20), `WalkPrefetchFolders` (default 10) and `ReadAheadFiles` (default 8) tune the background work. Uploads of new files are the user's own data and use the whole budget.
 
-Lower the budget when many users work at the same time in a tenant with few licenses; raise it in large tenants. The daily statistics (see Monitoring) show what each user used and whether Microsoft throttled.
+Lower the budget when many users work at the same time in a tenant with few licenses; raise it in large tenants. The daily statistics (see Monitoring) show what each user used, whether Microsoft throttled, and how long requests waited for the budget: for user actions (opening, saving: users notice this) and for background work (discovery after sign-in, change checks, loading ahead: nobody waits for it). Waits are added up over requests, so four requests waiting 10 s at the same time count 40 s. Background waits are normal pacing; repeated waits for user actions while Microsoft doesn't throttle mean the budget can go up.
 
 ## Monitoring
 
@@ -94,8 +95,8 @@ With `MonitoringUrl` set, VFS365 sends reports to your own Azure table storage. 
 
 | Table | Rows | Sent |
 |---|---|---|
-| `errors` | Partition: UTC date. Device name and ID, Entra device ID, user (UPN) and Windows user, tenant, version, source (start, sign-in, upload, conflict copy, discovery, file system, agent), message, time | At once; at most 20 an hour per user, the same error once an hour |
-| `statistics` | Partition: day. One row per device and Windows user: Graph and SharePoint requests, resource units, bytes received and sent, times throttled and seconds waited, seconds waited for the budget, errors, minutes running, version | The next day, 1 to 15 minutes after the start or after midnight |
+| `errors` | Partition: UTC date. Device name and ID, Entra device ID, user (UPN) and Windows user, tenant, version, source (start, sign-in, upload, conflict copy, discovery, file system, drive letter, crash, agent), message, time | At once; at most 20 an hour per user, the same error once an hour |
+| `statistics` | Partition: day. One row per device and Windows user: Graph and SharePoint requests, resource units, bytes received and sent, times throttled and seconds waited, seconds waited for the budget (`BudgetWaitSeconds`; from 0.3.0 also split into `BudgetWaitForegroundSeconds` for what users wait for and `BudgetWaitBackgroundSeconds`; added up over requests), errors, minutes running, version | The next day, 1 to 15 minutes after the start or after midnight |
 | `devices` | Partition: device ID. Device name, Entra device ID, signed-in users, version, action (`install`, `update`, `uninstall`), time | By the installer, at once |
 
 The device ID is Windows' `MachineGuid`. Errors contain file and folder paths. Reporting is best effort: nothing waits for it and nothing is retried. The first failure after a start is written to the local log once, with the reason (for example a missing table or a SAS without the Add permission).
@@ -107,16 +108,27 @@ Setup:
 3. Set `MonitoringUrl` to it as a **computer** policy. Install, update and uninstall reports come from the installer, which only sees computer policy.
 4. Renew the SAS before it expires: an expired one sends nothing, and the log says so once.
 
-Read the tables with Azure Storage Explorer, Excel or Power BI (Azure Table Storage connector).
+### Dashboard
+
+`vfs365-monitoring.html` (in each release and in the repository's `monitoring` folder) shows the tables in a browser. It is one file; it reads straight from the storage account and sends nothing anywhere else.
+
+- **What it shows.** What needs attention: crashes, sign-in and upload problems, drive letter conflicts, throttling, older versions, quiet devices, an expiring SAS. Totals compared with the period before, charts per day, and tables of devices, users, errors (grouped by cause) and installs. Click a row for its details. Every chart has a table view.
+- **Refresh.** Every 5 minutes by default (1 minute to 1 hour, or off). A refresh reads only the last days again.
+- **A SAS of its own.** Allowed services Table, resource types Container and Object, permissions **Read** and **List**, HTTPS only, an expiry date. Paste its Table service SAS URL or its connection string. The dashboard checks the SAS first (expired, not valid yet, missing permissions, more than reading) and explains what Azure refuses.
+- **A CORS rule**, so a browser may read the storage account. Under Settings, Resource sharing (CORS), Table service: allowed origins `*` (or where the page is hosted), methods GET and OPTIONS, allowed headers `*`, exposed headers `*`, max age 3600. Exposed headers are needed for days with more than 1000 rows. Or run:
+  `az storage cors add --account-name <account> --services t --methods GET OPTIONS --origins "*" --allowed-headers "*" --exposed-headers "*" --max-age 3600`
+- **Connecting.** Adding `#connect=<URL-encoded SAS URL>` to the page's address connects at once, for example on a wall screen; that address then contains the SAS. "Remember" keeps the SAS in that browser.
+
+Azure Storage Explorer, Excel and Power BI (Azure Table Storage connector) read the tables too.
 
 ## What users get
 
-- At logon the drive shows at once with the libraries and folders of the last session; discovery and changes made elsewhere arrive in the background. Big folders show their first entries while the rest loads.
+- At logon the drive shows at once with the libraries and folders of the last session; discovery (5 to 90 minutes after sign-in when the last session is less than a week old) and changes made elsewhere arrive in the background. Big folders show their first entries while the rest loads.
 - Changes made in the browser or on another device appear in open Explorer windows, within about 20 s for a library in use (`ChangeCheckSeconds`).
 - Tree walks (copying a folder tree, searching, backups) get up to `WalkPrefetchFolders` folders listed ahead of them, in their own order; the log reports per walk how many were used.
 - Copies of many small files run at about disk speed: to the drive, new files upload right after they are closed (`BackgroundUploads`); out of the drive, the next small files are downloaded ahead (`ReadAheadFiles`). Measured with 300 small files and Microsoft Defender on: to the drive 3 s (all uploaded after 29 s), out of the drive 21 s with nothing cached.
 - Apps that write a file in many small pieces, or append and close it again and again, upload it once when done or once per `RepeatSaveSeconds`, not on every close.
-- A tray icon shows the status and notifies about conflict copies, uploads that wait (offline, throttled) and sign-in problems. Its menu: Show files, Show log, Restart, Help (`HelpUrl`), and the version, which opens the JSolve website.
+- A tray icon shows the status and notifies about conflict copies, uploads that wait (offline, throttled) and sign-in problems. Its menu: Status, Show files, Show log, Refresh (reads all libraries and folders again; once a day, and only when the libraries were read more than an hour ago; when greyed out, pointing at it says why), Restart, Help (`HelpUrl`), and the version, which opens the JSolve website.
 - `vfs365.exe pin <url>` adds a site, library or folder link for the user (`unpin`, `pins` to list); it shows after Restart.
 - `vfs365.exe signout` stops the drive in the session, forgets the sign-in and removes the cached data (unsaved changes stay).
 
@@ -130,7 +142,8 @@ Per user in `%LOCALAPPDATA%\VFS365`:
 | `metadata.bin` | Folder listings for a fast start | AES-GCM with the same key |
 | `discovery.json` | Libraries shown, their drive IDs | Plain (site and library names) |
 | `staging\` | Unsaved changes until they upload | Plain, deleted after upload |
-| `agent.log` | Log | Plain |
+| `agent.log` | Log of the current sign-in, starting with the settings in effect and where each comes from | Plain |
+| `logs\` | Logs of earlier sign-ins (`agent-<time of the last line>.log`): kept 7 days, at most 50 files; a log that reaches 10 MB continues in a new file | Plain |
 
 Wiped automatically: everything but staging on another account or tenant and when the device leaves Intune (MDM unenrollment); a library's copies when it is no longer shown; an item's copies when it is deleted.
 
@@ -168,10 +181,17 @@ Other antivirus products: the same idea applies. Leave the drive scanned, and ex
 
 ## Troubleshooting
 
-- Log: `%LOCALAPPDATA%\VFS365\agent.log` (per user).
+- Log: `%LOCALAPPDATA%\VFS365\agent.log` (per user, this sign-in; Show log in the tray opens it). It starts with the settings that differ from the defaults and where each comes from (computer or user policy, marked Intune when Intune set it, or the config file); `vfs365.exe settings` shows them all. Earlier sign-ins are in `logs\`, 7 days back.
 - `C:\Program Files\VFS365\vfs365.exe settings` shows the effective settings and where each comes from; `vfs365.exe discover` lists the libraries found for the signed-in user (`--audit` also checks what it might miss); `vfs365.exe about` shows the version and notices.
 - `vfs365.exe inspect <path>` shows what Graph has at a path on the volume (`--versions` counts versions); `vfs365.exe watch <folder>` shows push notifications for its library.
 - `vfs365.exe machine-report install` sends an install row to the `devices` table, or says why it can't; `vfs365.exe settings` shows the monitoring account (never the SAS) and the API use settings.
 - Unsaved changes wait in `%LOCALAPPDATA%\VFS365\staging` and upload at the next start.
+- Crashes: `vfs365-agent.exe` runs the agent as a child process (`--child`) and starts it again when it crashes, at most 3 times in 15 minutes. The log then shows "stopped unexpectedly", the exit code and what Windows recorded (also in Event Viewer, Application log, sources .NET Runtime and Application Error). Please send those lines with a bug report.
+- "Disconnected Network Drive" (Dutch "Niet-verbonden netwerkstation") on VFS365's letter while the drive works: Explorer labels a network drive by asking Windows' network providers who owns the letter, and shows it as disconnected when none answers or when a remembered mapping claims the letter. The agent checks this at the start and every 5 minutes and logs a `Warning:` line with the cause and the fix:
+  - another share remembered on the same letter (`HKCU\Network\<letter>`, from a drive mapping policy, a logon script or `net use /persistent:yes`): remove that mapping from the policy or script, or delete the registry key. Don't use `net use <letter> /delete`: it disconnects VFS365.
+  - no provider reports the letter: WinFsp.Np is missing from `HKLM\SYSTEM\CurrentControlSet\Control\NetworkProvider\Order`, often because a policy or another installer replaced the order. Add it back (with VFS365.Np after it), or run `vfs365.exe machine-setup` as an administrator.
+  - the letter is gone (removed by another tool, for example `net use * /delete` in a logon script): the drive stays reachable at `\\VFS365\<user>`; Restart in the tray assigns the letter again.
+  - Explorer can also keep showing an old state after the agent restarted; F5 in This PC refreshes it.
+- Elevated apps ("Run as administrator") don't see VFS365's drive letter: Windows gives an elevated process its own set of drive letters. Use the UNC path `\\VFS365\<user>` there.
 - "SharePoint has the library read-only for now" in the log: SharePoint answered `403 serviceReadOnly` ("Database Is Read Only"), usually during maintenance or while a site is moved, and it passes. The change check backs off (up to 30 minutes), saves into that library wait and retry, and the log says when it works again. If it lasts for days, check the site in the SharePoint admin center (a read-only lock or an archived site).
 - Known WinFsp 2.1 issue: scripts that enumerate deep trees recursively (`Get-ChildItem -Recurse`, .NET `AllDirectories`) can fail with "The network path was not found". Explorer is not affected. Fixed in WinFsp 2026 (2.2), which a later release will bundle.

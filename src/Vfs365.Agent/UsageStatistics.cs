@@ -20,6 +20,8 @@ public sealed class UsageStatistics(string filePath)
         public long Throttled { get; set; }
         public long ThrottledSeconds { get; set; }
         public long BudgetWaitSeconds { get; set; }
+        public long BudgetWaitForegroundSeconds { get; set; }
+        public long BudgetWaitBackgroundSeconds { get; set; }
         public int Errors { get; set; }
         public double MinutesRunning { get; set; }
     }
@@ -64,7 +66,9 @@ public sealed class UsageStatistics(string filePath)
         day.BytesSent += delta.BytesSent;
         day.Throttled += delta.Throttled;
         day.ThrottledSeconds += delta.ThrottledSeconds;
-        day.BudgetWaitSeconds += delta.BudgetWaitSeconds;
+        day.BudgetWaitForegroundSeconds += delta.BudgetWaitForegroundSeconds;
+        day.BudgetWaitBackgroundSeconds += delta.BudgetWaitBackgroundSeconds;
+        day.BudgetWaitSeconds += delta.BudgetWaitForegroundSeconds + delta.BudgetWaitBackgroundSeconds;
         day.Errors += errors - seenErrors;
         if (lastFold is { } last)
         {
@@ -88,6 +92,7 @@ public sealed class UsageStatistics(string filePath)
         ("Day", day), ("GraphRequests", usage.GraphRequests), ("SharePointRequests", usage.SharePointRequests),
         ("ResourceUnits", usage.ResourceUnits), ("BytesReceived", usage.BytesReceived), ("BytesSent", usage.BytesSent),
         ("Throttled", usage.Throttled), ("ThrottledSeconds", usage.ThrottledSeconds), ("BudgetWaitSeconds", usage.BudgetWaitSeconds),
+        ("BudgetWaitForegroundSeconds", usage.BudgetWaitForegroundSeconds), ("BudgetWaitBackgroundSeconds", usage.BudgetWaitBackgroundSeconds),
         ("Errors", usage.Errors), ("MinutesRunning", (int)Math.Round(usage.MinutesRunning)),
     ];
 

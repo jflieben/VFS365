@@ -53,7 +53,7 @@ public class DiscoveryServiceTests
     static Task<DiscoveryResult> Run(FakeApi api, DiscoveryState? previous = null, TimeSpan later = default) =>
         new DiscoveryService(api, new DiscoveryOptions { Clock = () => DateTimeOffset.UtcNow + later }).RunAsync(previous);
 
-    static readonly TimeSpan NextDay = TimeSpan.FromHours(25);
+    static readonly TimeSpan NextDay = TimeSpan.FromHours(49);
 
     static string Id(int n) => $"00000000-0000-0000-0000-{n:x12}";
 
@@ -95,7 +95,7 @@ public class DiscoveryServiceTests
     }
 
     [Fact]
-    public async Task Known_libraries_reuse_their_metadata_for_a_day()
+    public async Task Known_libraries_reuse_their_metadata_for_two_days()
     {
         var api = new FakeApi();
         api.Add("Finance", Id(1), "Documents");
@@ -114,6 +114,43 @@ public class DiscoveryServiceTests
         Assert.True(nextDay.State.MetadataAt > first.State.MetadataAt);
         Assert.Equal("b!finance", nextDay.Libraries.Single(l => l.SiteTitle == "Finance").DriveId);
         Assert.Equal("b!me", nextDay.State.OneDrive?.DriveId);
+    }
+
+    [Fact]
+    public async Task Each_library_is_looked_up_again_only_when_its_own_metadata_is_two_days_old()
+    {
+        var api = new FakeApi();
+        api.Add("Finance", Id(1), "Documents");
+        var first = await Run(api);
+        api.Add("Sales", Id(2), "Documents");
+
+        api.ListCalls = 0;
+        var dayTwo = await Run(api, first.State, TimeSpan.FromHours(30));
+        Assert.Equal(1, api.ListCalls); // Sales is new; Finance is 30 h old
+
+        api.ListCalls = 0;
+        var dayThree = await Run(api, dayTwo.State, TimeSpan.FromHours(50));
+        Assert.Equal(1, api.ListCalls); // Finance is 50 h old; Sales 20 h
+        Assert.Equal(["Finance", "Sales"], dayThree.Libraries.Select(l => l.SiteTitle).Order());
+
+        api.ListCalls = 0;
+        await new DiscoveryService(api, new DiscoveryOptions { MetadataMaxAge = TimeSpan.Zero }).RunAsync(dayThree.State);
+        Assert.Equal(2, api.ListCalls); // a refresh reads everything
+    }
+
+    [Fact]
+    public async Task State_of_earlier_versions_without_check_times_uses_its_metadata_time()
+    {
+        var api = new FakeApi();
+        api.Add("Finance", Id(1), "Documents");
+        var first = await Run(api);
+        var old = first.State with { Libraries = [.. first.State.Libraries.Select(l => l with { CheckedAt = null })] };
+
+        api.ListCalls = 0;
+        await Run(api, old, TimeSpan.FromHours(30));
+        Assert.Equal(0, api.ListCalls);
+        await Run(api, old, TimeSpan.FromHours(50));
+        Assert.Equal(1, api.ListCalls);
     }
 
     static PinnedLocation Pinned(string web, params (string Id, string Title, string? InternalName)[] lists) =>

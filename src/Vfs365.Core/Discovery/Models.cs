@@ -29,7 +29,7 @@ public sealed record PinnedLibrary(string ListId, ListMetadata List);
 /// <summary>A pinned URL resolved: the web it belongs to and its document libraries (all of them for a site URL, one for a library URL).</summary>
 public sealed record PinnedLocation(string WebUrl, string SiteId, string WebId, string SiteTitle, SiteMetadata Site, IReadOnlyList<PinnedLibrary> Libraries);
 
-/// <summary>A library shown to the user.</summary>
+/// <summary>A library shown to the user. CheckedAt: when its site and library metadata was read (null in state of earlier versions).</summary>
 public sealed record LibraryEntry(
     string Key,
     string SiteId,
@@ -41,7 +41,8 @@ public sealed record LibraryEntry(
     bool ReadOnly,
     long ItemCount,
     string? DriveId = null,
-    string? InternalName = null);
+    string? InternalName = null,
+    DateTimeOffset? CheckedAt = null);
 
 public sealed record SkippedLibrary(string Key, string WebUrl, string Title, string Reason, string? InternalName = null)
 {
@@ -51,7 +52,7 @@ public sealed record SkippedLibrary(string Key, string WebUrl, string Title, str
 
 /// <summary>
 /// Kept between runs: the visible set (for the hiding safety check and to mount before discovery runs), libraries that never need
-/// another lookup, and when site and library metadata were last read in full.
+/// another lookup, and the oldest time a shown library's metadata was read (the fallback for entries without CheckedAt).
 /// </summary>
 public sealed record DiscoveryState(
     DateTimeOffset RunAt,

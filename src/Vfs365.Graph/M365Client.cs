@@ -27,11 +27,12 @@ public sealed class M365RequestException(HttpStatusCode status, Uri uri, string 
 
 /// <summary>What a client did since it started, for statistics.</summary>
 public readonly record struct ClientUsage(long GraphRequests, long SharePointRequests, long ResourceUnits, long BytesReceived, long BytesSent,
-    long Throttled, long ThrottledSeconds, long BudgetWaitSeconds)
+    long Throttled, long ThrottledSeconds, long BudgetWaitForegroundSeconds, long BudgetWaitBackgroundSeconds)
 {
     public ClientUsage Since(ClientUsage earlier) => new(GraphRequests - earlier.GraphRequests, SharePointRequests - earlier.SharePointRequests,
         ResourceUnits - earlier.ResourceUnits, BytesReceived - earlier.BytesReceived, BytesSent - earlier.BytesSent, Throttled - earlier.Throttled,
-        ThrottledSeconds - earlier.ThrottledSeconds, BudgetWaitSeconds - earlier.BudgetWaitSeconds);
+        ThrottledSeconds - earlier.ThrottledSeconds, BudgetWaitForegroundSeconds - earlier.BudgetWaitForegroundSeconds,
+        BudgetWaitBackgroundSeconds - earlier.BudgetWaitBackgroundSeconds);
 }
 
 /// <summary>
@@ -61,7 +62,7 @@ public sealed class M365Client(HttpClient http, ITokenSource tokens, RequestBudg
 
     public ClientUsage Usage => new(GraphRequests, SharePointRequests, Interlocked.Read(ref resourceUnits), Interlocked.Read(ref bytesReceived),
         Interlocked.Read(ref bytesSent), Interlocked.Read(ref throttledResponses), (long)TimeSpan.FromTicks(Interlocked.Read(ref throttledTicks)).TotalSeconds,
-        (long)(budget?.Waited.TotalSeconds ?? 0));
+        (long)(budget?.WaitedForeground.TotalSeconds ?? 0), (long)(budget?.WaitedBackground.TotalSeconds ?? 0));
 
     void Received(long bytes) => Interlocked.Add(ref bytesReceived, bytes);
 

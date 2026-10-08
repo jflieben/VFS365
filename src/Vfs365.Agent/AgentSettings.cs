@@ -109,6 +109,50 @@ public sealed class AgentSettings
         ? url
         : DefaultHelpUrl;
 
+    public const string ComputerPolicy = "computer policy", UserPolicy = "user policy", Default = "default";
+
+    /// <summary>
+    /// Every setting as the agent uses it, with where it comes from: computer or user policy (marked Intune when Intune's policy store
+    /// holds it, else Group Policy or another tool wrote it), the config file, or "default". The monitoring URL shows only its storage
+    /// account, never the SAS.
+    /// </summary>
+    public IReadOnlyList<(string Name, string Value, string Source)> Effective()
+    {
+        string From(string name) => Raw(name, out var source) is null ? Default
+            : source == ComputerPolicy && FromIntune("device", name) ? $"{ComputerPolicy} (Intune)"
+            : source == UserPolicy && FromIntune(System.Security.Principal.WindowsIdentity.GetCurrent().User?.Value, name) ? $"{UserPolicy} (Intune)"
+            : source!;
+        static string OnOff(bool value) => value ? "on" : "off";
+        var defaults = new Core.Discovery.DiscoveryOptions();
+        var monitoring = MonitoringTarget.Parse(MonitoringUrl, out var problem);
+        return
+        [
+            ("ClientId", ClientId.Value!, From("ClientId")),
+            ("TenantId", TenantId.Value ?? "detected", From("TenantId")),
+            ("DriveLetter", DriveLetter, From("DriveLetter")),
+            ("Label", Label, From("Label")),
+            ("Scope", Scope.ToString(), From("Scope")),
+            ("IncludedSites", string.Join("; ", IncludedSites ?? defaults.IncludedSites), From("IncludedSites")),
+            ("ExcludedSites", string.Join("; ", ExcludedSites ?? defaults.ExcludedSites), From("ExcludedSites")),
+            ("PinnedLocations", PinnedLocations.Count == 0 ? "none" : string.Join("; ", PinnedLocations), From("PinnedLocations")),
+            ("NavigationPane", OnOff(NavigationPane), From("NavigationPane")),
+            ("CacheSizeMB", CacheSizeMB.ToString(), From("CacheSizeMB")),
+            ("TrayIcon", OnOff(TrayIcon), From("TrayIcon")),
+            ("HelpUrl", HelpUrl, From("HelpUrl")),
+            ("ChangeCheckSeconds", ChangeCheckSeconds == 0 ? "0 (push only)" : ChangeCheckSeconds.ToString(), From("ChangeCheckSeconds")),
+            ("ApiBudgetPerMinute", ApiBudgetPerMinute == 0 ? "0 (no limit of its own)" : ApiBudgetPerMinute.ToString(), From("ApiBudgetPerMinute")),
+            ("ThrottlePauseMinutes", ThrottlePauseMinutes.ToString(), From("ThrottlePauseMinutes")),
+            ("WalkPrefetchFolders", WalkPrefetchFolders == 0 ? "0 (off)" : WalkPrefetchFolders.ToString(), From("WalkPrefetchFolders")),
+            ("ReadAheadFiles", ReadAheadFiles == 0 ? "0 (off)" : ReadAheadFiles.ToString(), From("ReadAheadFiles")),
+            ("BackgroundUploads", OnOff(BackgroundUploads), From("BackgroundUploads")),
+            ("RepeatSaveSeconds", RepeatSaveSeconds == 0 ? "0 (every close uploads)" : RepeatSaveSeconds.ToString(), From("RepeatSaveSeconds")),
+            ("DatabaseFiles", DatabaseFiles.ToString(), From("DatabaseFiles")),
+            ("MonitoringUrl", monitoring is not null
+                ? $"{monitoring.Account}{(monitoring.Expires is { } expires ? $" (SAS valid until {expires.ToLocalTime():yyyy-MM-dd HH:mm})" : "")}"
+                : problem ?? "off", From("MonitoringUrl")),
+        ];
+    }
+
     /// <summary>Config file: <paramref name="configPath"/>, else vfs365.local.json in the working directory, else vfs365.json next to the exe.</summary>
     public static AgentSettings Load(string? configPath, bool policies = true)
     {
@@ -119,8 +163,8 @@ public sealed class AgentSettings
         var settings = new AgentSettings();
         if (policies)
         {
-            settings.sources.Add(("policy (HKLM)", name => FromRegistry(Registry.LocalMachine, name)));
-            settings.sources.Add(("policy (HKCU)", name => FromRegistry(Registry.CurrentUser, name)));
+            settings.sources.Add((ComputerPolicy, name => FromRegistry(Registry.LocalMachine, name)));
+            settings.sources.Add((UserPolicy, name => FromRegistry(Registry.CurrentUser, name)));
         }
         var file = configPath ?? new[]
         {
@@ -157,6 +201,34 @@ public sealed class AgentSettings
         string text => Clean(text.Split([';', '\r', '\n'])),
         _ => null,
     };
+
+    /// <summary>
+    /// Intune applies imported ADMX policies through its policy store, HKLM\SOFTWARE\Microsoft\PolicyManager\current\&lt;device or user
+    /// SID&gt;\&lt;app&gt;~Policy~..., before writing the registry policy. A value there for this setting means Intune set it.
+    /// </summary>
+    static bool FromIntune(string? scope, string name)
+    {
+        if (scope is null)
+        {
+            return false;
+        }
+        try
+        {
+            using var store = Registry.LocalMachine.OpenSubKey($@"SOFTWARE\Microsoft\PolicyManager\current\{scope}");
+            foreach (var area in store?.GetSubKeyNames().Where(n => n.Contains("VFS365", StringComparison.OrdinalIgnoreCase)) ?? [])
+            {
+                using var key = store!.OpenSubKey(area);
+                if (key?.GetValue(name) is not null)
+                {
+                    return true;
+                }
+            }
+        }
+        catch (Exception e) when (e is System.Security.SecurityException or UnauthorizedAccessException or IOException)
+        {
+        }
+        return false;
+    }
 
     int? Number(string name) => Raw(name, out _) switch
     {

@@ -11,7 +11,8 @@ public sealed class RequestBudget
     readonly Func<DateTimeOffset> clock;
     double tokens;
     DateTimeOffset last;
-    long waitedTicks;
+    long foregroundTicks;
+    long backgroundTicks;
 
     public RequestBudget(int perMinute, Func<DateTimeOffset>? clock = null)
     {
@@ -23,8 +24,9 @@ public sealed class RequestBudget
 
     public int PerMinute { get; }
 
-    /// <summary>Total time requests waited for the budget.</summary>
-    public TimeSpan Waited => TimeSpan.FromTicks(Interlocked.Read(ref waitedTicks));
+    /// <summary>Time requests waited for the budget, added up over requests: those a user waits for, and background work.</summary>
+    public TimeSpan WaitedForeground => TimeSpan.FromTicks(Interlocked.Read(ref foregroundTicks));
+    public TimeSpan WaitedBackground => TimeSpan.FromTicks(Interlocked.Read(ref backgroundTicks));
 
     /// <summary>Takes <paramref name="cost"/> units when they are there; otherwise how long to wait before asking again.</summary>
     public bool TryTake(int cost, bool background, out TimeSpan wait)
@@ -54,7 +56,7 @@ public sealed class RequestBudget
     {
         while (!TryTake(cost, background, out var wait))
         {
-            Interlocked.Add(ref waitedTicks, wait.Ticks);
+            Interlocked.Add(ref background ? ref backgroundTicks : ref foregroundTicks, wait.Ticks);
             await Task.Delay(wait, ct);
         }
     }

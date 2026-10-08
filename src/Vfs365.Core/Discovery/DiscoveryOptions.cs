@@ -20,8 +20,8 @@ public sealed record DiscoveryOptions
 
     public int MaxParallelSites { get; init; } = 4;
 
-    /// <summary>Libraries shown in the last run keep their site and library metadata this long; only new ones are looked up.</summary>
-    public TimeSpan MetadataMaxAge { get; init; } = TimeSpan.FromHours(24);
+    /// <summary>A library's site and library metadata is reused this long after it was read; older and new ones are looked up.</summary>
+    public TimeSpan MetadataMaxAge { get; init; } = TimeSpan.FromHours(48);
 
     public Func<DateTimeOffset> Clock { get; init; } = () => DateTimeOffset.UtcNow;
 }

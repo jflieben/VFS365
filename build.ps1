@@ -5,7 +5,7 @@
     .DESCRIPTION
     release: builds the version in VERSION (it needs a "## <version>" entry in CHANGELOG.md): runs the tests, publishes
     self-contained x64 and ARM64 builds, wraps each in an MSI and in a setup program that installs WinFsp first, and puts these, the
-    unmodified WinFsp MSI, the policy templates (also zipped), licence, notices, guides and checksums in release\<version>\. The
+    unmodified WinFsp MSI, the policy templates (also zipped), the monitoring dashboard, licence, notices, guides and checksums in release\<version>\. The
     version's CHANGELOG entry goes to artifacts\release-notes.md. GitHub Actions runs this when VERSION changes on main.
 
     bump: raises the patch number in VERSION.
@@ -172,6 +172,7 @@ if($Task -eq 'release'){
     foreach($file in 'LICENSE', 'THIRD-PARTY-NOTICES.md'){ Copy-Item -LiteralPath (Join-Path $PSScriptRoot $file) -Destination $output }
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'policy') -Destination (Join-Path $output 'policy') -Recurse
     Compress-Archive -Path (Join-Path $PSScriptRoot 'policy\*') -DestinationPath (Join-Path $output "VFS365-$version-policy.zip")
+    Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'monitoring\vfs365-monitoring.html') -Destination $output
     foreach($doc in 'DEPLOYMENT.md', 'APP-REGISTRATION.md'){ Copy-Item -LiteralPath (Join-Path $PSScriptRoot "docs\$doc") -Destination $output }
     Get-ChildItem -LiteralPath $output -Recurse -File | Where-Object Name -ne 'SHA256SUMS.txt' | ForEach-Object {
         "{0}  {1}" -f (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLower(), $_.FullName.Substring($output.Length + 1)

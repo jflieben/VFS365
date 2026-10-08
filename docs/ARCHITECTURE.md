@@ -72,7 +72,12 @@ Error mapping: 404 to `ERROR_FILE_NOT_FOUND` / `ERROR_PATH_NOT_FOUND`, 403 to `E
 
 ## Start
 
-The agent mounts with what the last run knew: libraries, their drive IDs and the OneDrive from `discovery.json`, and the folder listings the change feeds kept current from `metadata.bin` (sealed). Explorer gets the drive in about 0.1 s without a network call; discovery then runs in the background (search only, metadata reused for a day) and new or removed libraries appear live. The first run mounts with the OneDrive and fills in the sites when discovery finishes.
+The agent mounts with what the last run knew: libraries, their drive IDs and the OneDrive from `discovery.json`, and the folder listings the change feeds kept current from `metadata.bin` (sealed). Explorer gets the drive in about 0.1 s without a network call; discovery then runs in the background and new or removed libraries appear live. With a state under a week old it waits a random 5 to 90 minutes first (spreading a tenant's morning sign-ins), then searches and reads the details only of libraries checked more than 48 hours ago (`LibraryEntry.CheckedAt`). Refresh in the tray runs it at once and reads every library's details (`MetadataMaxAge` zero), once a day and only when the last run is more than an hour old (`RefreshRule`); it also marks every cached folder listing stale (`DriveEngine.ExpireListings`), so folders are read again when opened. The first run mounts with the OneDrive and fills in the sites when discovery finishes.
+
+## Agent process
+
+- `vfs365-agent.exe` started at sign-in is a supervisor (`AgentSupervisor`): it runs the agent as a child (`--child`) and starts it again after a crash (an NTSTATUS error exit; not 0, 1, 2, a kill or Ctrl+C), at most 3 times in 15 minutes and not while the session ends. A restart from the tray starts a new supervisor; the old one ends with its child. After a crash the supervisor logs what Windows recorded (Application Error 1000 and .NET Runtime 1026, read with `wevtutil`), and the new child gets `--restarted <code>` and reports it to monitoring.
+- Drive letter check (`DriveLetterReport`): at the start and every 5 minutes, from the agent's own sign-in, it reads the letter's DOS device, `WNetGetConnection` (what Explorer asks), a remembered mapping in `HKCU\Network\<letter>` and the network provider order. Problems are logged with the fix when they change.
 
 ## Tray
 
@@ -81,7 +86,7 @@ The agent mounts with what the last run knew: libraries, their drive IDs and the
 - Icons come from `tray\tray-{light,dark}-{normal,waiting,error}.ico` (made by `tools/New-TrayIcons.ps1`). The set follows the taskbar theme and changes with it; the size matches the system DPI.
 - Show files opens the navigation pane entry (`shell:::{CLSID}`), else the drive letter or UNC path. Explorer can't parse `\\VFS365` until it has loaded the network provider.
 - Restart starts the same exe with the same arguments plus `--after <pid>`. The new agent waits for the old one to exit, then mounts.
-- Other items: status, Show log, Help (`HelpUrl`), and the version line, which opens the JSolve website.
+- Other items: status ("Status: up to date"; the icon's tooltip says "VFS365: up to date"), Show log, Refresh (greyed out with a hint saying why: a plain popup window painted with user32 and gdi32, shown on `WM_MENUSELECT`, because standard menus have no tooltips and the common controls tooltip crashed the process on ARM64), Restart, Help (`HelpUrl`), and the version line, which opens the JSolve website.
 
 ## Caches and transfers
 
@@ -117,7 +122,7 @@ M365AutoLink's user-version method, proven in production:
 
 Differences from M365AutoLink: no item-count limits (nothing is synced), and removal means hiding the folder. The deletion circuit breaker stays: when a search page fails, or the result shrinks by more than 40% against the last run, nothing is hidden that run. Access is enforced by SharePoint anyway, so a stale folder only costs a 403.
 
-Cost: site and library metadata are cached on the device with their static exclusions and reused for a day, so a routine refresh is just the search pages plus lookups for new libraries (measured: 1 search call, 1.4 s; a full refresh is about 90 calls). SharePoint publishes no RU cost for REST search. `vfs365 discover --audit` checks recall against site search, followed sites and hubs.
+Cost: site and library metadata are cached on the device with their static exclusions and reused for 48 hours per library, so a routine run is the search pages plus lookups for new libraries and those checked more than 48 hours ago (measured: 1 search call, 1.4 s; a full refresh is about 90 calls). SharePoint publishes no RU cost for REST search. `vfs365 discover --audit` checks recall against site search, followed sites and hubs.
 
 Not found by search: sites excluded from search, Restricted Content Discovery sites, sites newer than the index, the root site (outside the default include patterns), and other tenants (guests can't search the host tenant).
 
@@ -125,7 +130,7 @@ Pinned locations cover these within the tenant (other tenants are out of scope):
 
 - The web is the longest path prefix that answers `_api/web`, never above `/sites/x`. Non-JSON answers count as "not a web": SharePoint returns a page for paths below a page.
 - A site URL adds its document libraries; a library, folder or view URL adds the list `GetList` finds at the longest prefix.
-- Pinned libraries pass the library rules but not the site patterns, show under their site, reuse metadata for a day and keep their last result when a lookup fails.
+- Pinned libraries pass the library rules but not the site patterns, show under their site, reuse metadata for 48 hours and keep their last result when a lookup fails.
 
 ## Throttling
 

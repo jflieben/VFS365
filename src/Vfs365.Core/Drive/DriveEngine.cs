@@ -176,6 +176,9 @@ public sealed partial class DriveEngine(DriveNamespace ns, IDriveApi api, Conten
             }
         }
 
+        /// <summary>Stale from now on: the next open answers from it and reads it again in the background.</summary>
+        public void Expire() => FetchedAt = DateTimeOffset.MinValue;
+
         public void Fail(Exception e)
         {
             lock (gate)
@@ -221,6 +224,19 @@ public sealed partial class DriveEngine(DriveNamespace ns, IDriveApi api, Conten
 
     readonly ConcurrentDictionary<string, Listing> listings = new(StringComparer.OrdinalIgnoreCase);
     readonly ConcurrentDictionary<string, (DriveItemInfo? Item, DateTimeOffset At)> lookups = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Every cached folder listing and path lookup counts as stale (a refresh asked for by the user). Nothing is read now: a folder is
+    /// read again when it is next opened, and what changed is reported then.
+    /// </summary>
+    public void ExpireListings()
+    {
+        foreach (var listing in listings.Values.Where(l => l.IsLoaded))
+        {
+            listing.Expire();
+        }
+        lookups.Clear();
+    }
     readonly ConcurrentDictionary<string, LocalState> overlay = new(StringComparer.OrdinalIgnoreCase);
     readonly DateTimeOffset startedAt = options.Clock();
 

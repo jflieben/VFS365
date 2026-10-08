@@ -125,6 +125,29 @@ public sealed class ChangeFeedTests : IDisposable
     }
 
     [Fact]
+    public async Task After_a_refresh_every_folder_is_read_again_when_opened()
+    {
+        // A change the feed doesn't see (as if it was missed): only a refresh brings it in
+        var api = new FakeDriveApi();
+        api.Add("a.txt");
+        var engine = Create(api);
+        await engine.PollAsync("b!me");
+        Assert.Equal(["a.txt"], await Names(engine, "\\"));
+        api.AddUnnoticed("b.txt");
+        Assert.Equal(["a.txt"], await Names(engine, "\\"));
+        var lists = api.ListCalls;
+
+        engine.ExpireListings();
+        Assert.Equal(lists, api.ListCalls); // nothing is read until a folder is opened
+        var stale = await Names(engine, "\\");
+        await Eventually(() => Saw("\\b.txt", ChangeKind.Added));
+
+        Assert.Equal(["a.txt"], stale);
+        Assert.Equal(lists + 1, api.ListCalls);
+        Assert.Equal(["a.txt", "b.txt"], await Names(engine, "\\"));
+    }
+
+    [Fact]
     public async Task Stale_listing_answers_at_once_and_reports_what_the_refresh_found()
     {
         var api = new FakeDriveApi { DeltaUnavailable = true };

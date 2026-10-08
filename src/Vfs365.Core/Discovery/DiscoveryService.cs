@@ -20,8 +20,10 @@ public sealed class DiscoveryService(ISharePointDiscoveryApi api, DiscoveryOptio
         var sameRules = previous?.RulesVersion == LibraryRules.Version;
         var knownStatic = sameRules ? previous!.StaticExclusions : new Dictionary<string, string>();
         var now = options.Clock();
-        var reuse = sameRules && now - previous!.MetadataAt < options.MetadataMaxAge
-            ? previous.Libraries.ToDictionary(l => l.Key, StringComparer.OrdinalIgnoreCase)
+        // Each library's metadata is read again once it is MetadataMaxAge old, so only part of them is looked up per run
+        var reuse = sameRules
+            ? previous!.Libraries.Where(l => now - (l.CheckedAt ?? previous.MetadataAt) is var age && age >= TimeSpan.Zero && age < options.MetadataMaxAge)
+                .ToDictionary(l => l.Key, StringComparer.OrdinalIgnoreCase)
             : new Dictionary<string, LibraryEntry>(StringComparer.OrdinalIgnoreCase);
         var knownDrives = previous?.Libraries.Where(l => l.DriveId is not null).ToDictionary(l => l.Key, l => l.DriveId!, StringComparer.OrdinalIgnoreCase)
             ?? new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
@@ -118,7 +120,7 @@ public sealed class DiscoveryService(ISharePointDiscoveryApi api, DiscoveryOptio
                 var readOnly = verdict.Access == LibraryAccess.ReadOnly || siteMetadata.ReadOnly || siteMetadata.WriteLocked;
                 var title = string.IsNullOrWhiteSpace(list.Title) ? library.ListTitle : list.Title;
                 found.Add(new LibraryEntry(library.Key, library.SiteId, library.WebId, library.ListId, site.Key, library.SiteTitle, title, readOnly, list.ItemCount,
-                    knownDrives.GetValueOrDefault(library.Key), list.InternalName));
+                    knownDrives.GetValueOrDefault(library.Key), list.InternalName, now));
             }
         });
 
@@ -151,7 +153,7 @@ public sealed class DiscoveryService(ISharePointDiscoveryApi api, DiscoveryOptio
                     var key = LibraryKey.Of(siteId, webId, listId);
                     var readOnly = verdict.Access == LibraryAccess.ReadOnly || location.Site.ReadOnly || location.Site.WriteLocked;
                     found.Add(new LibraryEntry(key, siteId, webId, listId, location.WebUrl.TrimEnd('/'), location.SiteTitle, library.List.Title, readOnly,
-                        library.List.ItemCount, knownDrives.GetValueOrDefault(key), library.List.InternalName));
+                        library.List.ItemCount, knownDrives.GetValueOrDefault(key), library.List.InternalName, now));
                     keys.Add(key);
                 }
                 pinned[url] = keys;
@@ -182,7 +184,7 @@ public sealed class DiscoveryService(ISharePointDiscoveryApi api, DiscoveryOptio
             .ThenBy(library => library.LibraryTitle, StringComparer.OrdinalIgnoreCase)
             .ToList();
         var state = new DiscoveryState(now, tenantRoot, libraries, new Dictionary<string, string>(staticExclusions), LibraryRules.Version, oneDrive,
-            reuse.Count > 0 ? previous!.MetadataAt : now, previous?.TenantHint, pinned);
+            libraries.Count == 0 ? now : libraries.Min(l => l.CheckedAt ?? now), previous?.TenantHint, pinned);
 
         return new DiscoveryResult(
             oneDrive,

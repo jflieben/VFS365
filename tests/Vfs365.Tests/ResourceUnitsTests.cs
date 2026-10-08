@@ -73,6 +73,19 @@ public class ResourceUnitsTests
     }
 
     [Fact]
+    public async Task Waits_are_counted_per_kind()
+    {
+        var now = DateTimeOffset.UnixEpoch;
+        var budget = new RequestBudget(60, () => now);
+        Assert.True(budget.TryTake(30, background: true, out _)); // the upper half is gone
+        var waiting = budget.TakeAsync(2, background: true, CancellationToken.None);
+        now += TimeSpan.FromSeconds(10);
+        await waiting;
+        Assert.Equal(TimeSpan.FromSeconds(2), budget.WaitedBackground);
+        Assert.Equal(TimeSpan.Zero, budget.WaitedForeground);
+    }
+
+    [Fact]
     public void No_budget_never_waits()
     {
         var budget = new RequestBudget(0);

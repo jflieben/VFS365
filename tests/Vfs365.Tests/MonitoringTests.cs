@@ -136,9 +136,9 @@ public sealed class MonitoringTests : IDisposable
     public void Statistics_add_up_per_day_and_finished_days_are_ready()
     {
         var statistics = UsageStatistics.Load(statisticsFile);
-        statistics.Fold(new ClientUsage(10, 2, 30, 1000, 500, 0, 0, 0), 1, new DateTime(2026, 10, 6, 23, 0, 0));
-        statistics.Fold(new ClientUsage(15, 2, 40, 1500, 500, 1, 5, 0), 1, new DateTime(2026, 10, 6, 23, 30, 0));
-        statistics.Fold(new ClientUsage(20, 3, 50, 2000, 600, 1, 5, 2), 3, new DateTime(2026, 10, 7, 0, 10, 0));
+        statistics.Fold(new ClientUsage(10, 2, 30, 1000, 500, 0, 0, 0, 0), 1, new DateTime(2026, 10, 6, 23, 0, 0));
+        statistics.Fold(new ClientUsage(15, 2, 40, 1500, 500, 1, 5, 3, 4), 1, new DateTime(2026, 10, 6, 23, 30, 0));
+        statistics.Fold(new ClientUsage(20, 3, 50, 2000, 600, 1, 5, 3, 6), 3, new DateTime(2026, 10, 7, 0, 10, 0));
         statistics.Save();
 
         var reloaded = UsageStatistics.Load(statisticsFile);
@@ -150,6 +150,10 @@ public sealed class MonitoringTests : IDisposable
         Assert.Equal(1, day.Throttled);
         Assert.Equal(1, day.Errors);
         Assert.Equal(30, day.MinutesRunning);
+        Assert.Equal(3, day.BudgetWaitForegroundSeconds);
+        Assert.Equal(4, day.BudgetWaitBackgroundSeconds);
+        Assert.Equal(7, day.BudgetWaitSeconds);
+        Assert.Equal(2, reloaded.Days["2026-10-07"].BudgetWaitBackgroundSeconds);
         Assert.Equal(5, reloaded.Days["2026-10-07"].GraphRequests);
         Assert.Equal(2, reloaded.Days["2026-10-07"].Errors);
     }

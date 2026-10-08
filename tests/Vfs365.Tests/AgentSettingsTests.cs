@@ -75,5 +75,22 @@ public sealed class AgentSettingsTests : IDisposable
         Assert.Equal(0, Load("""{ "ApiBudgetPerMinute": 0 }""").ApiBudgetPerMinute);
     }
 
+    [Fact]
+    public void Effective_settings_name_their_source_and_hide_the_sas()
+    {
+        var settings = Load("""
+            { "DriveLetter": "M", "ReadAheadFiles": 0,
+              "MonitoringUrl": "https://contoso.table.core.windows.net/?sv=2026-02-06&ss=t&srt=o&sp=a&se=2027-01-01T00:00:00Z&sig=secret123" }
+            """);
+        var effective = settings.Effective().ToDictionary(s => s.Name);
+
+        Assert.Equal(("M", Path.GetFileName(file)), (effective["DriveLetter"].Value, effective["DriveLetter"].Source));
+        Assert.Equal(("VFS365", "default"), (effective["Label"].Value, effective["Label"].Source));
+        Assert.Equal("0 (off)", effective["ReadAheadFiles"].Value);
+        Assert.StartsWith("contoso.table.core.windows.net", effective["MonitoringUrl"].Value);
+        Assert.DoesNotContain(settings.Effective(), s => s.Value.Contains("secret123") || s.Value.Contains("sig="));
+        Assert.Equal(21, effective.Count);
+    }
+
     public void Dispose() => File.Delete(file);
 }

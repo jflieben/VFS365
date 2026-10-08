@@ -52,5 +52,5 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           $version = '${{ steps.version.outputs.version }}'
-          $assets = Get-ChildItem "release/$version" -File | Where-Object { $_.Extension -in '.exe', '.msi', '.zip' -or $_.Name -eq 'SHA256SUMS.txt' } | ForEach-Object FullName
+          $assets = Get-ChildItem "release/$version" -File | Where-Object { $_.Extension -in '.exe', '.msi', '.zip', '.html' -or $_.Name -eq 'SHA256SUMS.txt' } | ForEach-Object FullName
           gh release create "v$version" --target $env:GITHUB_SHA --title "VFS365 $version" --notes-file artifacts/release-notes.md @assets
