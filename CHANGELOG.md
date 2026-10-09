@@ -1,6 +1,11 @@
 # Changelog
 
-## 0.3.1 (unreleased)
+## 0.3.2
+
+- Sites by template: the new `IncludedSiteTemplates` and `ExcludedSiteTemplates` policies show or hide libraries by their site's template, for example only `GROUP` (team sites with a Microsoft 365 group, Teams) or everything but `TEAMCHANNEL` (private and shared channel sites). The template comes with the search results, so it costs no extra calls. `vfs365 discover` shows each library's template.
+- Fixed: excluding sites by policy now takes effect even when it hides more than 40% of the libraries. Before, discovery's safety check (nothing is hidden when the set shrinks that much, against search hiccups) kept them all visible.
+
+## 0.3.1
 
 - Downloads: a file that Microsoft 365 serves with another length than it lists (changed since the folder was listed, or an Office file SharePoint writes library properties into) no longer fails three times with "Unable to read beyond the end of the stream", and a longer one is no longer cut off without notice. The read fails once, the drive takes the length served, and opening the file again works; the log names the file.
 - Downloads that break off are tried again after 1 and 2 s. Only when all three attempts fail is the error logged, now with the file's path, and reported to monitoring.

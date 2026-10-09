@@ -7,7 +7,7 @@ namespace Vfs365.Graph;
 /// <summary>Discovery calls: Graph for the user's OneDrive and library drives, SharePoint REST for search and metadata.</summary>
 public sealed class SharePointDiscoveryApi(M365Client client) : ISharePointDiscoveryApi
 {
-    const string SelectProperties = "Title,Path,ListId,SiteId,WebId,SPWebUrl,SPSiteUrl,SiteTitle";
+    const string SelectProperties = "Title,Path,ListId,SiteId,WebId,SPWebUrl,SPSiteUrl,SiteTitle,SiteTemplate";
     const string ListSelect = "Title,Hidden,BaseTemplate,IsCatalog,IsSystemList,TemplateFeatureId,ForceCheckout,ExcludeFromOfflineClient,ItemCount,EntityTypeName";
 
     public async Task<MyDrive> GetMyDriveAsync(CancellationToken ct)
@@ -132,7 +132,8 @@ public sealed class SharePointDiscoveryApi(M365Client client) : ISharePointDisco
                 webUrl,
                 Get("SPSiteUrl")?.TrimEnd('/') ?? webUrl,
                 Get("SiteTitle") ?? webUrl[(webUrl.LastIndexOf('/') + 1)..],
-                Get("Title") ?? ""));
+                Get("Title") ?? "",
+                Get("SiteTemplate")));
         }
         return new SearchPage(libraries, rows.GetArrayLength());
     }

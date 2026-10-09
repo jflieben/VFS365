@@ -44,6 +44,11 @@ public sealed class AgentSettings
 
     public IReadOnlyList<string>? ExcludedSites => List("ExcludedSites");
 
+    /// <summary>Site templates (GROUP, STS, SITEPAGEPUBLISHING, ...) to show or hide; none set: all.</summary>
+    public IReadOnlyList<string> IncludedSiteTemplates => List("IncludedSiteTemplates") ?? [];
+
+    public IReadOnlyList<string> ExcludedSiteTemplates => List("ExcludedSiteTemplates") ?? [];
+
     /// <summary>Site or library URLs always shown, also where search doesn't reach (restricted, excluded from search, root or portal sites).</summary>
     public IReadOnlyList<string> PinnedLocations => List("PinnedLocations") ?? [];
 
@@ -134,6 +139,8 @@ public sealed class AgentSettings
             ("Scope", Scope.ToString(), From("Scope")),
             ("IncludedSites", string.Join("; ", IncludedSites ?? defaults.IncludedSites), From("IncludedSites")),
             ("ExcludedSites", string.Join("; ", ExcludedSites ?? defaults.ExcludedSites), From("ExcludedSites")),
+            ("IncludedSiteTemplates", IncludedSiteTemplates.Count == 0 ? "all" : string.Join("; ", IncludedSiteTemplates), From("IncludedSiteTemplates")),
+            ("ExcludedSiteTemplates", ExcludedSiteTemplates.Count == 0 ? "none" : string.Join("; ", ExcludedSiteTemplates), From("ExcludedSiteTemplates")),
             ("PinnedLocations", PinnedLocations.Count == 0 ? "none" : string.Join("; ", PinnedLocations), From("PinnedLocations")),
             ("NavigationPane", OnOff(NavigationPane), From("NavigationPane")),
             ("CacheSizeMB", CacheSizeMB.ToString(), From("CacheSizeMB")),

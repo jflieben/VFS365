@@ -120,7 +120,7 @@ M365AutoLink's user-version method, proven in production:
 4. Per library: `<web>/_api/lists/GetById('<listId>')`, retried on the site collection URL on 404. Skipped: `Hidden`, `BaseTemplate` other than 101, `IsCatalog`, `IsSystemList`, system libraries by internal name (`EntityTypeName`: `SiteAssets`, `Style Library`, `FormServerTemplates` and so on, the same in every site language), M365AutoLink's template feature IDs, `ExcludeFromOfflineClient` (admin opted the library out of offline clients). Never by title: titles are localized. `ForceCheckout` libraries show read-only.
 5. Library key `siteId|webId|listId`. The Graph drive is resolved lazily on first open (`/sites/{host},{siteId},{webId}/lists/{listId}/drive`) and cached.
 
-Differences from M365AutoLink: no item-count limits (nothing is synced), and removal means hiding the folder. The deletion circuit breaker stays: when a search page fails, or the result shrinks by more than 40% against the last run, nothing is hidden that run. Access is enforced by SharePoint anyway, so a stale folder only costs a 403.
+Differences from M365AutoLink: no item-count limits (nothing is synced), and removal means hiding the folder. The deletion circuit breaker stays: when a search page fails, or the result shrinks by more than 40% against the last run, nothing is hidden that run. Libraries hidden by policy (site URL patterns and site templates) don't count: they go whatever their share. Access is enforced by SharePoint anyway, so a stale folder only costs a 403.
 
 Cost: site and library metadata are cached on the device with their static exclusions and reused for 48 hours per library, so a routine run is the search pages plus lookups for new libraries and those checked more than 48 hours ago (measured: 1 search call, 1.4 s; a full refresh is about 90 calls). SharePoint publishes no RU cost for REST search. `vfs365 discover --audit` checks recall against site search, followed sites and hubs.
 
@@ -130,7 +130,8 @@ Pinned locations cover these within the tenant (other tenants are out of scope):
 
 - The web is the longest path prefix that answers `_api/web`, never above `/sites/x`. Non-JSON answers count as "not a web": SharePoint returns a page for paths below a page.
 - A site URL adds its document libraries; a library, folder or view URL adds the list `GetList` finds at the longest prefix.
-- Pinned libraries pass the library rules but not the site patterns, show under their site, reuse metadata for 48 hours and keep their last result when a lookup fails.
+- Site templates come with each search hit (`SiteTemplate`, the site collection's; no configuration number), so template rules cost no calls.
+- Pinned libraries pass the library rules but not the site patterns or templates, show under their site, reuse metadata for 48 hours and keep their last result when a lookup fails.
 
 ## Throttling
 

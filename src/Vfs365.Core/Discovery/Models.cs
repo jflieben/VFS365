@@ -1,7 +1,11 @@
 namespace Vfs365.Core.Discovery;
 
-/// <summary>A document library as returned by SharePoint Search.</summary>
-public sealed record DiscoveredLibrary(string SiteId, string WebId, string ListId, string WebUrl, string SiteCollectionUrl, string SiteTitle, string ListTitle)
+/// <summary>
+/// A document library as returned by SharePoint Search. SiteTemplate: its site collection's template (GROUP, SITEPAGEPUBLISHING, ...), when
+/// search reports it; subsites have their site collection's.
+/// </summary>
+public sealed record DiscoveredLibrary(string SiteId, string WebId, string ListId, string WebUrl, string SiteCollectionUrl, string SiteTitle, string ListTitle,
+    string? SiteTemplate = null)
 {
     public string Key => LibraryKey.Of(SiteId, WebId, ListId);
 }
@@ -29,7 +33,10 @@ public sealed record PinnedLibrary(string ListId, ListMetadata List);
 /// <summary>A pinned URL resolved: the web it belongs to and its document libraries (all of them for a site URL, one for a library URL).</summary>
 public sealed record PinnedLocation(string WebUrl, string SiteId, string WebId, string SiteTitle, SiteMetadata Site, IReadOnlyList<PinnedLibrary> Libraries);
 
-/// <summary>A library shown to the user. CheckedAt: when its site and library metadata was read (null in state of earlier versions).</summary>
+/// <summary>
+/// A library shown to the user. CheckedAt: when its site and library metadata was read (null in state of earlier versions). SiteTemplate:
+/// its site collection's template as search reports it.
+/// </summary>
 public sealed record LibraryEntry(
     string Key,
     string SiteId,
@@ -42,7 +49,8 @@ public sealed record LibraryEntry(
     long ItemCount,
     string? DriveId = null,
     string? InternalName = null,
-    DateTimeOffset? CheckedAt = null);
+    DateTimeOffset? CheckedAt = null,
+    string? SiteTemplate = null);
 
 public sealed record SkippedLibrary(string Key, string WebUrl, string Title, string Reason, string? InternalName = null)
 {

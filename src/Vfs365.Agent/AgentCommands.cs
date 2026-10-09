@@ -258,7 +258,12 @@ public static class AgentCommands
                 return await PutAsync(settings, api, client, args[1], args[2], Say);
             }
 
-            var discoveryOptions = new DiscoveryOptions { PinnedLocations = [.. settings.PinnedLocations, .. UserPins.Load()] };
+            var discoveryOptions = new DiscoveryOptions
+            {
+                PinnedLocations = [.. settings.PinnedLocations, .. UserPins.Load()],
+                IncludedSiteTemplates = settings.IncludedSiteTemplates,
+                ExcludedSiteTemplates = settings.ExcludedSiteTemplates,
+            };
             if (settings.IncludedSites is { } included)
             {
                 discoveryOptions = discoveryOptions with { IncludedSites = included };
@@ -310,7 +315,7 @@ public static class AgentCommands
             Say($"Libraries:  {libraries.Count} shown ({libraries.Count(l => l.ReadOnly)} read-only), {result.Skipped.Count} skipped, {result.Errors.Count} errors");
             foreach (var library in libraries)
             {
-                Say($"  {$"{library.SiteTitle} / {library.LibraryTitle}",-60} {library.ItemCount,10:N0} items{(library.ReadOnly ? "  read-only" : "")}{(library.DriveId is null ? "" : $"  {library.DriveId}")}");
+                Say($"  {$"{library.SiteTitle} / {library.LibraryTitle}",-60} {library.ItemCount,10:N0} items  {library.SiteTemplate ?? "?",-20}{(library.ReadOnly ? "  read-only" : "")}{(library.DriveId is null ? "" : $"  {library.DriveId}")}");
             }
             Say("Skipped:");
             foreach (var group in result.Skipped.GroupBy(s => s.Reason).OrderByDescending(g => g.Count()))

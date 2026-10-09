@@ -42,10 +42,10 @@ public class DiscoveryServiceTests
             return FailPins ? throw new HttpRequestException("site down") : Task.FromResult(Pins.GetValueOrDefault(url));
         }
 
-        public void Add(string site, string listId, string title, ListMetadata? metadata = null, string? listUrlBase = null)
+        public void Add(string site, string listId, string title, ListMetadata? metadata = null, string? listUrlBase = null, string? template = null)
         {
             var webUrl = $"{Root}/sites/{site}";
-            Hits.Add(new DiscoveredLibrary("aaaaaaaa-0000-0000-0000-000000000001", $"bbbbbbbb-0000-0000-0000-{site.GetHashCode() & 0xFFFF:x12}", listId, webUrl, webUrl, site, title));
+            Hits.Add(new DiscoveredLibrary("aaaaaaaa-0000-0000-0000-000000000001", $"bbbbbbbb-0000-0000-0000-{site.GetHashCode() & 0xFFFF:x12}", listId, webUrl, webUrl, site, title, template));
             Lists[$"{listUrlBase ?? webUrl}|{listId}"] = metadata ?? new ListMetadata(title, false, 101, false, false, null, false, false, 5);
         }
     }
@@ -76,6 +76,50 @@ public class DiscoveryServiceTests
         Assert.Contains(result.Skipped, s => s.Title == "Site Assets" && s.Reason == "System or catalog library");
         Assert.Contains(result.Skipped, s => s.Title == "Apps" && s.Reason == "Site excluded by pattern");
         Assert.Empty(result.Errors);
+    }
+
+    /// <summary>Teams-connected, communication, channel and unreported sites.</summary>
+    static FakeApi TemplateSites()
+    {
+        var api = new FakeApi();
+        api.Add("Sales", Id(1), "Documents", template: "GROUP");
+        api.Add("Intranet", Id(2), "Documents", template: "SITEPAGEPUBLISHING");
+        api.Add("Sales-Private", Id(3), "Documents", template: "TEAMCHANNEL");
+        api.Add("Old", Id(4), "Documents");
+        return api;
+    }
+
+    static async Task<string[]> Shown(FakeApi api, DiscoveryOptions options) =>
+        (await new DiscoveryService(api, options).RunAsync(null)).Libraries.Select(l => l.SiteTitle).Order().ToArray();
+
+    [Fact]
+    public async Task Site_templates_can_be_excluded_or_be_the_only_ones_shown()
+    {
+        var excluded = await new DiscoveryService(TemplateSites(), new DiscoveryOptions { ExcludedSiteTemplates = ["teamchannel"] }).RunAsync(null);
+        Assert.Equal(["Intranet", "Old", "Sales"], excluded.Libraries.Select(l => l.SiteTitle).Order());
+        Assert.Contains(excluded.Skipped, s => s.WebUrl.EndsWith("Sales-Private") && s.Reason == "Site template TEAMCHANNEL excluded");
+        Assert.Equal("GROUP", excluded.Libraries.Single(l => l.SiteTitle == "Sales").SiteTemplate);
+
+        // A configuration number is ignored (search reports none); a template search didn't report is never held against a site
+        Assert.Equal(["Old", "Sales", "Sales-Private"], await Shown(TemplateSites(), new DiscoveryOptions { IncludedSiteTemplates = ["GROUP#0", "TEAM*"] }));
+        Assert.Equal(["Old", "Sales"], await Shown(TemplateSites(), new DiscoveryOptions { IncludedSiteTemplates = ["GROUP", "TEAMCHANNEL"], ExcludedSiteTemplates = ["TEAMCHANNEL"] }));
+    }
+
+    [Fact]
+    public async Task Libraries_hidden_by_policy_go_even_when_most_of_them_do()
+    {
+        var api = TemplateSites();
+        for (var i = 0; i < 6; i++)
+        {
+            api.Add("Sales", Id(10 + i), $"Library {i}", template: "GROUP");
+        }
+        var before = await Run(api);
+        Assert.Equal(10, before.Libraries.Count);
+
+        var after = await new DiscoveryService(api, new DiscoveryOptions { ExcludedSiteTemplates = ["GROUP"] }).RunAsync(before.State);
+
+        Assert.Null(after.HidingSkippedReason);
+        Assert.Equal(["Intranet", "Old", "Sales-Private"], after.Libraries.Select(l => l.SiteTitle).Order());
     }
 
     [Fact]

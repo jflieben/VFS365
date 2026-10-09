@@ -58,6 +58,8 @@ Policy key `HKLM\SOFTWARE\Policies\JSolve\VFS365` (devices) or `HKCU\...` (users
 | `Scope` | REG_SZ | `SharePoint` | `SharePoint` or `OneDrive`: only that, as the root of the drive. `All`: OneDrive and Sites folders |
 | `IncludedSites` | REG_MULTI_SZ | `*/sites/*`, `*/teams/*` | Site URL patterns to show; `*` matches any characters, patterns match the whole URL |
 | `ExcludedSites` | REG_MULTI_SZ | system sites (app catalog, content type hub, Viva Engage and so on) | Site URL patterns to hide; exclusions win; setting it replaces the built-in list |
+| `IncludedSiteTemplates` | REG_MULTI_SZ | all | Show only sites with these templates: `GROUP` (team sites with a Microsoft 365 group, including Teams), `SITEPAGEPUBLISHING` (communication sites), `TEAMCHANNEL` (private and shared channel sites), `STS` (team sites without a group). `*` matches any characters. A subsite has its site collection's template; a number after `#` is ignored (search doesn't report it). `vfs365.exe discover` shows each library's template |
+| `ExcludedSiteTemplates` | REG_MULTI_SZ | none | Hide sites with these templates, for example `TEAMCHANNEL`; exclusions win. Template and URL rules both apply; pinned locations always show |
 | `NavigationPane` | REG_DWORD | `1` | `0`: no navigation pane entry. With a `DriveLetter` the drive shows under This PC with that letter only; with `None` just the UNC path is left |
 | `CacheSizeMB` | REG_DWORD | `2048` | Most space copies of opened files take per user, in MB (at least 100); least recently used go first |
 | `TrayIcon` | REG_DWORD | `1` | `0` hides the tray icon and its notifications (conflict copies, waiting uploads, sign-in problems) |

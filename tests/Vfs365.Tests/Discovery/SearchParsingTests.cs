@@ -20,7 +20,8 @@ public class SearchParsingTests
                     { "Key": "SiteId", "Value": "aaaaaaaa-0000-0000-0000-000000000001", "ValueType": "Edm.String" },
                     { "Key": "WebId", "Value": "bbbbbbbb-0000-0000-0000-000000000002", "ValueType": "Edm.String" },
                     { "Key": "SPSiteUrl", "Value": "https://contoso.sharepoint.com/sites/Finance", "ValueType": "Edm.String" },
-                    { "Key": "SiteTitle", "Value": "Finance", "ValueType": "Edm.String" }
+                    { "Key": "SiteTitle", "Value": "Finance", "ValueType": "Edm.String" },
+                    { "Key": "SiteTemplate", "Value": "GROUP", "ValueType": "Edm.String" }
                   ] },
                   { "Cells": [
                     { "Key": "Title", "Value": "No ids", "ValueType": "Edm.String" },
@@ -45,6 +46,7 @@ public class SearchParsingTests
         Assert.Equal("7a9b2c4d-1111-2222-3333-444455556666", library.ListId);
         Assert.Equal("https://contoso.sharepoint.com/sites/Finance", library.WebUrl);
         Assert.Equal("Finance", library.SiteTitle);
+        Assert.Equal("GROUP", library.SiteTemplate);
         Assert.Equal("Documents", library.ListTitle);
         Assert.Equal("aaaaaaaa-0000-0000-0000-000000000001|bbbbbbbb-0000-0000-0000-000000000002|7a9b2c4d-1111-2222-3333-444455556666", library.Key);
     }

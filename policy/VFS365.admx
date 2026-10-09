@@ -75,6 +75,20 @@
         <multiText id="ExcludedSites" valueName="ExcludedSites" />
       </elements>
     </policy>
+    <policy name="IncludedSiteTemplates" class="Both" displayName="$(string.IncludedSiteTemplates)" explainText="$(string.IncludedSiteTemplates_Help)" presentation="$(presentation.IncludedSiteTemplates)" key="Software\Policies\JSolve\VFS365">
+      <parentCategory ref="VFS365" />
+      <supportedOn ref="SUPPORTED_Windows11" />
+      <elements>
+        <multiText id="IncludedSiteTemplates" valueName="IncludedSiteTemplates" />
+      </elements>
+    </policy>
+    <policy name="ExcludedSiteTemplates" class="Both" displayName="$(string.ExcludedSiteTemplates)" explainText="$(string.ExcludedSiteTemplates_Help)" presentation="$(presentation.ExcludedSiteTemplates)" key="Software\Policies\JSolve\VFS365">
+      <parentCategory ref="VFS365" />
+      <supportedOn ref="SUPPORTED_Windows11" />
+      <elements>
+        <multiText id="ExcludedSiteTemplates" valueName="ExcludedSiteTemplates" />
+      </elements>
+    </policy>
     <policy name="CacheSizeMB" class="Both" displayName="$(string.CacheSizeMB)" explainText="$(string.CacheSizeMB_Help)" presentation="$(presentation.CacheSizeMB)" key="Software\Policies\JSolve\VFS365">
       <parentCategory ref="VFS365" />
       <supportedOn ref="SUPPORTED_Windows11" />

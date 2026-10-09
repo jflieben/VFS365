@@ -36,6 +36,12 @@ For a drive letter only, set a letter here and disable "Show in the navigation p
       <string id="ExcludedSites">Excluded sites</string>
       <string id="ExcludedSites_Help">Site URL patterns to hide, one per line, for example */sites/HR*. Replaces the built-in list (app catalog, content type hub, Viva Engage and similar system sites).</string>
 
+      <string id="IncludedSiteTemplates">Included site templates</string>
+      <string id="IncludedSiteTemplates_Help">Show only libraries of sites with these templates, one per line: GROUP (team sites with a Microsoft 365 group, including Teams), SITEPAGEPUBLISHING (communication sites), TEAMCHANNEL (private and shared channel sites), STS (team sites without a group). * matches any characters. A subsite counts as its site collection's template; a number after # is ignored. Default: all templates. Exclusions win; vfs365.exe discover shows each library's template.</string>
+
+      <string id="ExcludedSiteTemplates">Excluded site templates</string>
+      <string id="ExcludedSiteTemplates_Help">Hide libraries of sites with these templates, one per line, for example TEAMCHANNEL to leave out private and shared channel sites. Same names as Included site templates. Applies on top of the site URL patterns; pinned locations always show.</string>
+
       <string id="CacheSizeMB">Cache size</string>
       <string id="CacheSizeMB_Help">Most space, in MB, that copies of opened files take per user (encrypted, in %LOCALAPPDATA%\VFS365\cache). The least recently used go first. Default 2048, at least 100.</string>
 
@@ -120,6 +126,8 @@ Disabled: no entry. With a drive letter (see "Drive letter") the drive shows und
       <presentation id="DatabaseFiles"><dropdownList refId="DatabaseFiles" defaultItem="0">Database files</dropdownList></presentation>
       <presentation id="HelpUrl"><textBox refId="HelpUrl"><label>Address</label><defaultValue>https://jsolve.nl</defaultValue></textBox></presentation>
       <presentation id="ExcludedSites"><multiTextBox refId="ExcludedSites">Site URL patterns, one per line</multiTextBox></presentation>
+      <presentation id="IncludedSiteTemplates"><multiTextBox refId="IncludedSiteTemplates">Site templates, one per line</multiTextBox></presentation>
+      <presentation id="ExcludedSiteTemplates"><multiTextBox refId="ExcludedSiteTemplates">Site templates, one per line</multiTextBox></presentation>
     </presentationTable>
   </resources>
 </policyDefinitionResources>

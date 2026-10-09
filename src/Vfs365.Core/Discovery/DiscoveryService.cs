@@ -30,20 +30,23 @@ public sealed class DiscoveryService(ISharePointDiscoveryApi api, DiscoveryOptio
 
         var found = new ConcurrentBag<LibraryEntry>();
         var skipped = new ConcurrentBag<SkippedLibrary>();
+        var hiddenByPolicy = new ConcurrentBag<string>();
         var errors = new ConcurrentBag<SkippedLibrary>();
         var staticExclusions = new ConcurrentDictionary<string, string>();
 
         var sites = hits.DistinctBy(library => library.Key).GroupBy(library => library.WebUrl, StringComparer.OrdinalIgnoreCase);
         await Parallel.ForEachAsync(sites, new ParallelOptions { MaxDegreeOfParallelism = options.MaxParallelSites, CancellationToken = ct }, async (site, token) =>
         {
+            var template = site.Select(library => library.SiteTemplate).FirstOrDefault(t => t is not null);
             var siteRule = Wildcard.MatchesAny(site.Key, options.ExcludedSites) ? "Site excluded by pattern"
                 : !Wildcard.MatchesAny(site.Key, options.IncludedSites) ? "Site not included by pattern"
-                : null;
+                : options.TemplateRule(template);
             if (siteRule is not null)
             {
                 foreach (var library in site)
                 {
                     skipped.Add(SkippedLibrary.For(library, siteRule));
+                    hiddenByPolicy.Add(library.Key);
                 }
                 return;
             }
@@ -58,7 +61,7 @@ public sealed class DiscoveryService(ISharePointDiscoveryApi api, DiscoveryOptio
                 }
                 else if (reuse.TryGetValue(library.Key, out var known))
                 {
-                    found.Add(known);
+                    found.Add(known with { SiteTemplate = template });
                 }
                 else
                 {
@@ -120,7 +123,7 @@ public sealed class DiscoveryService(ISharePointDiscoveryApi api, DiscoveryOptio
                 var readOnly = verdict.Access == LibraryAccess.ReadOnly || siteMetadata.ReadOnly || siteMetadata.WriteLocked;
                 var title = string.IsNullOrWhiteSpace(list.Title) ? library.ListTitle : list.Title;
                 found.Add(new LibraryEntry(library.Key, library.SiteId, library.WebId, library.ListId, site.Key, library.SiteTitle, title, readOnly, list.ItemCount,
-                    knownDrives.GetValueOrDefault(library.Key), list.InternalName, now));
+                    knownDrives.GetValueOrDefault(library.Key), list.InternalName, now, template));
             }
         });
 
@@ -177,7 +180,8 @@ public sealed class DiscoveryService(ISharePointDiscoveryApi api, DiscoveryOptio
             found.DistinctBy(l => l.Key, StringComparer.OrdinalIgnoreCase).ToList(),
             errors.Select(error => error.Key).ToHashSet(),
             searchError is not null,
-            options.HidingSafetyRatio);
+            options.HidingSafetyRatio,
+            hiddenByPolicy.Except(found.Select(l => l.Key)).ToHashSet());
 
         var libraries = reconciliation.Visible
             .OrderBy(library => library.SiteTitle, StringComparer.OrdinalIgnoreCase)
