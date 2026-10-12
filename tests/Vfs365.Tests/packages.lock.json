@@ -31,9 +31,9 @@
       },
       "xunit.runner.visualstudio": {
         "type": "Direct",
-        "requested": "[4.0.0, )",
-        "resolved": "4.0.0",
-        "contentHash": "kzLFyBYUnoidpGOXvpNOfIo8C92gVgVR6X8ncHwhcrDYugiOut5rrhDkr0L3cWHd7J2pKXf6LgaeXoBBDlx1ag=="
+        "requested": "[4.0.1, )",
+        "resolved": "4.0.1",
+        "contentHash": "8CoAaZkniVekR1ycJyxn+hOz+6ZQCDPcoIsIs6ujd4WyFcBMlxGNU15Qb8Uxd4iO4UmOuETb0M6vzBbwX/mfLA=="
       },
       "Microsoft.CodeCoverage": {
         "type": "Transitive",
@@ -111,12 +111,12 @@
       "vfs365.agent": {
         "type": "Project",
         "dependencies": {
-          "Microsoft.Identity.Client": "[4.90.1, )",
-          "Microsoft.Identity.Client.Broker": "[4.90.1, )",
+          "Microsoft.Identity.Client": "[4.91.0, )",
+          "Microsoft.Identity.Client.Broker": "[4.91.0, )",
           "System.Security.Cryptography.ProtectedData": "[10.0.12, )",
-          "Vfs365.Core": "[0.3.2, )",
-          "Vfs365.Drive.WinFsp": "[0.3.2, )",
-          "Vfs365.Graph": "[0.3.2, )"
+          "Vfs365.Core": "[0.4.0, )",
+          "Vfs365.Drive.WinFsp": "[0.4.0, )",
+          "Vfs365.Graph": "[0.4.0, )"
         }
       },
       "vfs365.core": {
@@ -125,32 +125,32 @@
       "vfs365.drive.winfsp": {
         "type": "Project",
         "dependencies": {
-          "Vfs365.Core": "[0.3.2, )",
+          "Vfs365.Core": "[0.4.0, )",
           "winfsp.net": "[2.1.25156, )"
         }
       },
       "vfs365.graph": {
         "type": "Project",
         "dependencies": {
-          "Vfs365.Core": "[0.3.2, )"
+          "Vfs365.Core": "[0.4.0, )"
         }
       },
       "Microsoft.Identity.Client": {
         "type": "CentralTransitive",
-        "requested": "[4.90.1, )",
-        "resolved": "4.90.1",
-        "contentHash": "GLsf4cfEfIZD4pBkmBc8kCjfE811PKsM29T9nMZQDS2px/buM/Ha8jVYiGPdiA7cqjYNIX+G5d0S12TtGZS6RA==",
+        "requested": "[4.91.0, )",
+        "resolved": "4.91.0",
+        "contentHash": "u+j8hdM/Eez1j0rQVodY+4MRfsLgmsskjMgVkf74xkLWssbW4mqSgz0Tx4H0CJTtrDes00M5s4545rbLN61/uw==",
         "dependencies": {
           "Microsoft.IdentityModel.Abstractions": "8.14.0"
         }
       },
       "Microsoft.Identity.Client.Broker": {
         "type": "CentralTransitive",
-        "requested": "[4.90.1, )",
-        "resolved": "4.90.1",
-        "contentHash": "n1sD4oVBfQjyekTXULWwgANj2DMCAmJcJq5pzBfAceCK2FauVyf8U0KxJ9jHWkA0d7cOfAangOmkeJ2uo4xhcw==",
+        "requested": "[4.91.0, )",
+        "resolved": "4.91.0",
+        "contentHash": "scM6YnngTsDyTesX7DhMuDG583ujw8e7cCtaw0dq+sort+a5N9K4K+elIuLIwcEi9HEQxitlG87AmFeKO24t3g==",
         "dependencies": {
-          "Microsoft.Identity.Client": "4.90.1",
+          "Microsoft.Identity.Client": "4.91.0",
           "Microsoft.Identity.Client.NativeInterop": "0.20.6"
         }
       },
