@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.4.0 (unreleased)
+## 0.4.0 (2026-10-12)
 
 Result of a full review of the code (security, data safety, reliability, API use, user experience).
 
