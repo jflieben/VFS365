@@ -91,6 +91,47 @@ public sealed class DownloadTests : IDisposable
         Assert.Equal(longer, await ReadAllAsync("\\OneDrive\\budget.xlsx"));
     }
 
+    [Fact]
+    public async Task A_same_size_change_during_a_download_is_never_mixed_into_it()
+    {
+        const int MiB = 1024 * 1024;
+        var original = Data(40 * MiB);
+        api.Add("data.accdb", original);
+        var file = (await engine.GetEntryAsync("\\OneDrive\\data.accdb", default))!;
+        var edited = Data(40 * MiB, seed: 9);
+
+        using (var source = await engine.OpenContentAsync(file, default))
+        {
+            var head = new byte[4096];
+            await source.ReadAsync(0, head, default);
+            Assert.Equal(original.AsSpan(0, 4096).ToArray(), head);
+            api.RemoteEdit("data.accdb", edited);
+            await Assert.ThrowsAsync<ContentChangedException>(() => source.ReadAsync(30 * MiB, new byte[4096], default).AsTask());
+        }
+
+        Assert.Contains(log, line => line.Contains("data.accdb") && line.Contains("another version is served"));
+        Assert.Equal(edited, await ReadAllAsync("\\OneDrive\\data.accdb"));
+    }
+
+    [Fact]
+    public async Task A_download_that_gave_up_is_started_afresh_by_the_next_open()
+    {
+        var data = Data(100_000);
+        api.Add("notes.txt", data);
+        api.FailDownloads = 3;
+        var file = (await engine.GetEntryAsync("\\OneDrive\\notes.txt", default))!;
+
+        using var broken = await engine.OpenContentAsync(file, default);
+        await Assert.ThrowsAsync<IOException>(() => broken.ReadAsync(0, new byte[4096], default).AsTask());
+        // The first handle is still open: a new one doesn't inherit its failure
+        using var fresh = await engine.OpenContentAsync(file, default);
+        var buffer = new byte[data.Length];
+        var read = await fresh.ReadAsync(0, buffer, default);
+
+        Assert.Equal(data.Length, read);
+        Assert.Equal(data, buffer);
+    }
+
     public void Dispose()
     {
         try

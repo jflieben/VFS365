@@ -86,6 +86,35 @@ public class ResourceUnitsTests
     }
 
     [Fact]
+    public async Task Promoted_work_takes_from_the_whole_budget()
+    {
+        var now = DateTimeOffset.UnixEpoch;
+        var never = new TaskCompletionSource();
+        var budget = new RequestBudget(60, () => now, (_, _) => never.Task);
+        Assert.True(budget.TryTake(30, background: true, out _)); // the upper half is gone
+        var holder = new Core.PriorityHolder();
+
+        var waiting = budget.TakeAsync(2, () => holder.IsBackground, CancellationToken.None, holder.Promoted);
+        Assert.False(waiting.IsCompleted);
+        holder.Promote();
+
+        await waiting.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Equal(TimeSpan.FromSeconds(2), budget.WaitedBackground);
+    }
+
+    [Fact]
+    public void Adjust_takes_more_or_gives_back()
+    {
+        var now = DateTimeOffset.UnixEpoch;
+        var budget = new RequestBudget(60, () => now);
+        budget.Adjust(70);
+        Assert.False(budget.TryTake(1, background: false, out var wait));
+        Assert.Equal(11, wait.TotalSeconds, 3);
+        budget.Adjust(-100);
+        Assert.True(budget.TryTake(60, background: false, out _));
+    }
+
+    [Fact]
     public void No_budget_never_waits()
     {
         var budget = new RequestBudget(0);

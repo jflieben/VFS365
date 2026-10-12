@@ -12,6 +12,7 @@ Thanks for helping. VFS365 is maintained by JSolve B.V. Bug reports, fixes and w
 
 - Windows 10 or 11, the .NET 10 SDK, and PowerShell 7. Running the drive also needs [WinFsp](https://winfsp.dev); building and the tests don't.
 - `./build.ps1 test` builds and runs the tests. `./build.ps1 np` builds the C network provider (it fetches a pinned Zig).
+- NuGet packages are locked (`packages.lock.json`); CI restores in locked mode. After changing a package reference, build once locally and commit the updated lock files.
 - `./build.ps1 run <command>` runs the console tool against your own test tenant. Put tenant and app IDs in `vfs365.local.json` (git-ignored), never in code.
 - Test against a test tenant and a test folder, never production data.
 

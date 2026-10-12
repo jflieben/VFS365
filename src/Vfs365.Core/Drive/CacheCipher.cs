@@ -1,18 +1,24 @@
-using System.Buffers;
 using System.Buffers.Binary;
-using System.Numerics;
 using System.Security.Cryptography;
+using Microsoft.Win32.SafeHandles;
 
 namespace Vfs365.Core.Drive;
 
 /// <summary>
-/// Encrypts cached file content with AES-256 in counter mode. Each cache file has its own keystream (nonce from its name), so any
-/// byte range can be written or read on its own, as the streaming download needs. A cache file only ever holds one version of
-/// one item, so a keystream never covers different content.
+/// Encrypts cached file content with AES-256-GCM in 64 KiB chunks, so any range can be written (as the streaming download does) and
+/// read on its own. Each cache file has a random nonce; each chunk is authenticated together with the file's cache name (drive, item
+/// and version), its position and the content length, so a changed, moved or truncated cache file fails to read instead of serving
+/// wrong bytes. Layout: content, one 16-byte tag per chunk, then nonce (12), content length (8) and a format marker (4).
 /// </summary>
 public sealed class CacheCipher
 {
-    readonly ThreadLocal<Aes> aes;
+    public const int ChunkSize = 64 * 1024;
+    const int TagSize = 16;
+    const int NonceSize = 12;
+    const int FooterSize = NonceSize + 8 + 4;
+    static readonly uint Marker = BinaryPrimitives.ReadUInt32LittleEndian("VC01"u8);
+
+    readonly ThreadLocal<AesGcm> aes;
 
     public CacheCipher(byte[] key)
     {
@@ -21,55 +27,131 @@ public sealed class CacheCipher
             throw new ArgumentException("The cache key is 32 bytes", nameof(key));
         }
         var copy = key.ToArray();
-        aes = new ThreadLocal<Aes>(() =>
-        {
-            var created = Aes.Create();
-            created.Key = copy;
-            return created;
-        });
+        aes = new ThreadLocal<AesGcm>(() => new AesGcm(copy, TagSize));
         KeyId = Convert.ToHexString(SHA256.HashData(copy))[..16];
     }
 
     /// <summary>Identifies the key without revealing it, so content written with another key is never read back as plaintext.</summary>
     public string KeyId { get; }
 
-    public static byte[] NonceFor(string fileName) => SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(fileName))[..8];
+    /// <summary>Changes when the file layout does, so caches written by other versions are dropped at start.</summary>
+    public const string Format = "gcm1";
 
-    /// <summary>Encrypts or decrypts (the same operation) <paramref name="data"/>, which sits at <paramref name="offset"/> in the file.</summary>
-    public void Apply(Span<byte> data, long offset, ReadOnlySpan<byte> nonce)
+    /// <summary>Bytes on disk for <paramref name="length"/> bytes of content.</summary>
+    public static long StoredLength(long length) => length + Chunks(length) * TagSize + FooterSize;
+
+    static long Chunks(long length) => (length + ChunkSize - 1) / ChunkSize;
+
+    /// <summary>Starts a cache file: sets its size and writes the footer with a new nonce. Chunks are written with <see cref="Write"/>.</summary>
+    internal SealedFile Create(SafeFileHandle file, long length, string name)
     {
-        if (data.IsEmpty)
+        var footer = new byte[FooterSize];
+        RandomNumberGenerator.Fill(footer.AsSpan(0, NonceSize));
+        BinaryPrimitives.WriteInt64LittleEndian(footer.AsSpan(NonceSize), length);
+        BinaryPrimitives.WriteUInt32LittleEndian(footer.AsSpan(NonceSize + 8), Marker);
+        RandomAccess.SetLength(file, StoredLength(length));
+        RandomAccess.Write(file, footer, StoredLength(length) - FooterSize);
+        return new SealedFile(this, file, length, footer[..NonceSize], name);
+    }
+
+    /// <summary>Opens a complete cache file; throws <see cref="CacheDamagedException"/> when it isn't one of this format.</summary>
+    internal SealedFile Open(SafeFileHandle file, string name)
+    {
+        var stored = RandomAccess.GetLength(file);
+        var footer = new byte[FooterSize];
+        if (stored < FooterSize || RandomAccess.Read(file, footer, stored - FooterSize) != FooterSize
+            || BinaryPrimitives.ReadUInt32LittleEndian(footer.AsSpan(NonceSize + 8)) != Marker
+            || BinaryPrimitives.ReadInt64LittleEndian(footer.AsSpan(NonceSize)) is var length && (length < 0 || StoredLength(length) != stored))
         {
-            return;
+            throw new CacheDamagedException(name);
         }
-        var first = offset / 16;
-        var skip = (int)(offset % 16);
-        var length = (skip + data.Length + 15) / 16 * 16;
-        var counters = ArrayPool<byte>.Shared.Rent(length);
-        var stream = ArrayPool<byte>.Shared.Rent(length);
-        try
+        return new SealedFile(this, file, length, footer[..NonceSize], name);
+    }
+
+    /// <summary>One cache file's content, encrypted chunk by chunk. Reads decrypt and verify whole chunks; the last one read is kept.</summary>
+    internal sealed class SealedFile(CacheCipher cipher, SafeFileHandle file, long length, byte[] nonce, string name)
+    {
+        readonly Lock gate = new();
+        byte[]? chunk, sealedChunk;
+        long cached = -1;
+
+        public long Length { get; } = length;
+
+        long TagOffset(long index) => Length + index * TagSize;
+
+        /// <summary>Encrypts and writes <paramref name="plain"/>, which starts at a chunk boundary and ends at one or at the end.</summary>
+        public void Write(long offset, ReadOnlySpan<byte> plain)
         {
-            for (var block = 0; block < length / 16; block++)
+            var sealedBytes = new byte[Math.Min(plain.Length, ChunkSize)];
+            Span<byte> tag = stackalloc byte[TagSize];
+            for (var done = 0; done < plain.Length; done += ChunkSize)
             {
-                nonce[..8].CopyTo(counters.AsSpan(block * 16, 8));
-                BinaryPrimitives.WriteInt64BigEndian(counters.AsSpan(block * 16 + 8, 8), first + block);
-            }
-            aes.Value!.EncryptEcb(counters.AsSpan(0, length), stream.AsSpan(0, length), PaddingMode.None);
-            var keystream = stream.AsSpan(skip, data.Length);
-            var i = 0;
-            for (; i <= data.Length - Vector<byte>.Count; i += Vector<byte>.Count)
-            {
-                (new Vector<byte>(data[i..]) ^ new Vector<byte>(keystream[i..])).CopyTo(data[i..]);
-            }
-            for (; i < data.Length; i++)
-            {
-                data[i] ^= keystream[i];
+                var part = plain.Slice(done, Math.Min(ChunkSize, plain.Length - done));
+                var index = (offset + done) / ChunkSize;
+                cipher.aes.Value!.Encrypt(Nonce(index), part, sealedBytes.AsSpan(0, part.Length), tag, Associated(index));
+                RandomAccess.Write(file, sealedBytes.AsSpan(0, part.Length), offset + done);
+                RandomAccess.Write(file, tag, TagOffset(index));
             }
         }
-        finally
+
+        /// <summary>Decrypts content at <paramref name="offset"/> into <paramref name="buffer"/>; the chunks must have been written.</summary>
+        public int Read(long offset, Span<byte> buffer)
         {
-            ArrayPool<byte>.Shared.Return(counters);
-            ArrayPool<byte>.Shared.Return(stream);
+            var total = (int)Math.Max(0, Math.Min(buffer.Length, Length - offset));
+            lock (gate)
+            {
+                chunk ??= new byte[ChunkSize];
+                for (var done = 0; done < total;)
+                {
+                    var index = (offset + done) / ChunkSize;
+                    if (index != cached)
+                    {
+                        cached = -1;
+                        Decrypt(index, chunk);
+                        cached = index;
+                    }
+                    var within = (int)(offset + done - index * ChunkSize);
+                    var take = Math.Min(total - done, ChunkLength(index) - within);
+                    chunk.AsSpan(within, take).CopyTo(buffer[done..]);
+                    done += take;
+                }
+            }
+            return total;
         }
+
+        int ChunkLength(long index) => (int)Math.Min(ChunkSize, Length - index * ChunkSize);
+
+        /// <summary>Called under the gate.</summary>
+        void Decrypt(long index, Span<byte> plain)
+        {
+            var length = ChunkLength(index);
+            var sealedBytes = (sealedChunk ??= new byte[ChunkSize]).AsSpan(0, length);
+            Span<byte> tag = stackalloc byte[TagSize];
+            if (RandomAccess.Read(file, sealedBytes, index * ChunkSize) != length || RandomAccess.Read(file, tag, TagOffset(index)) != TagSize)
+            {
+                throw new CacheDamagedException(name);
+            }
+            try
+            {
+                cipher.aes.Value!.Decrypt(Nonce(index), sealedBytes, tag, plain[..length], Associated(index));
+            }
+            catch (AuthenticationTagMismatchException)
+            {
+                throw new CacheDamagedException(name);
+            }
+        }
+
+        /// <summary>The file's nonce with the chunk number in its last 4 bytes.</summary>
+        byte[] Nonce(long index)
+        {
+            var result = nonce.ToArray();
+            BinaryPrimitives.WriteUInt32BigEndian(result.AsSpan(NonceSize - 4), BinaryPrimitives.ReadUInt32BigEndian(nonce.AsSpan(NonceSize - 4)) ^ (uint)index);
+            return result;
+        }
+
+        byte[] Associated(long index) => System.Text.Encoding.UTF8.GetBytes($"{name}|{Length}|{index}");
     }
 }
+
+/// <summary>A cache file failed its integrity check, or isn't in the current format. It is dropped and downloaded again.</summary>
+public sealed class CacheDamagedException(string name) : IOException($"cached content {name} is damaged; it is downloaded again on the next open");

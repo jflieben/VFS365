@@ -2,8 +2,8 @@ using System.Collections.Concurrent;
 
 namespace Vfs365.Core.Drive;
 
-/// <summary>A cached folder listing as kept between runs.</summary>
-public sealed record FolderSnapshot(string Path, string FolderId, IReadOnlyList<DriveItemInfo> Items);
+/// <summary>A cached folder listing as kept between runs. FetchedAt and ParentId are missing in files written by older versions.</summary>
+public sealed record FolderSnapshot(string Path, string FolderId, IReadOnlyList<DriveItemInfo> Items, DateTimeOffset? FetchedAt = null, string? ParentId = null);
 
 /// <summary>A drive's cached listings with the delta link that continues from the moment they reflect.</summary>
 public sealed record DriveSnapshot(string DriveId, string DeltaLink, DateTimeOffset SavedAt, IReadOnlyList<FolderSnapshot> Folders);
@@ -25,6 +25,22 @@ public sealed partial class DriveEngine
         public bool Broken { get; set; }
         public bool Pushed { get; set; }
         public Task? Polling { get; set; }
+
+        /// <summary>Really used: more than the library's top listed once. Only then the feed runs and the drive counts as active.</summary>
+        public bool Engaged { get; set; }
+
+        /// <summary>Reads in a row that brought no change: with push up, hot polling slows down.</summary>
+        public int EmptyReads { get; set; }
+
+        /// <summary>Held while changes are applied to listings, or replayed onto one that just loaded.</summary>
+        public Lock ApplyGate { get; } = new();
+
+        /// <summary>
+        /// Changes applied lately, with when: a listing that was loading meanwhile gets those from after its request replayed.
+        /// Changes up to DroppedUpTo were let go.
+        /// </summary>
+        public List<(DateTimeOffset At, DriveChange Change)> Recent { get; } = [];
+        public DateTimeOffset DroppedUpTo { get; set; } = DateTimeOffset.MinValue;
 
         /// <summary>Reads that failed in a row; no read before RetryAt. Problem is what the log last said about it.</summary>
         public int Failures { get; set; }
@@ -76,16 +92,41 @@ public sealed partial class DriveEngine
     bool Maintained(string driveId, Listing listing) =>
         listing.FolderId is not null && feeds.TryGetValue(driveId, out var feed) && feed.Maintains(listing.RequestedAt);
 
-    void Touch(string driveId)
+    /// <summary>
+    /// The drive is used. Without <paramref name="engage"/> (a glance at the library's top) a drive not used for real yet stays
+    /// without feed, polling and push channel.
+    /// </summary>
+    void Touch(string driveId, bool engage = true)
     {
         var feed = feeds.GetOrAdd(driveId, _ => NewFeed());
+        if (!engage && !feed.Engaged)
+        {
+            return;
+        }
+        feed.Engaged = true;
         feed.LastUsed = Now;
-        var interval = !feed.Pushed ? options.PollInterval : HotPolling ? options.HotPollInterval : options.PushedPollInterval;
+        var interval = !feed.Pushed ? options.PollInterval : HotPolling ? HotInterval(feed) : options.PushedPollInterval;
         if (Now - feed.LastPoll >= interval)
         {
             _ = PollAsync(driveId);
         }
     }
+
+    /// <summary>This engine changed the drive: hot polling goes back to its base interval.</summary>
+    void LocalWrite(string driveId)
+    {
+        if (feeds.TryGetValue(driveId, out var feed))
+        {
+            feed.EmptyReads = 0;
+        }
+        Interlocked.Increment(ref metadataVersion);
+        Touch(driveId);
+    }
+
+    const int MaxHotBackoff = 3;
+
+    /// <summary>HotPollInterval, doubled for each empty read in a row while push is up (20, 40, 80, 160 s by default).</summary>
+    TimeSpan HotInterval(Feed feed) => feed.Pushed ? options.HotPollInterval * (1 << Math.Min(feed.EmptyReads, MaxHotBackoff)) : options.HotPollInterval;
 
     /// <summary>A push channel for the drive came up or went down. While up, changes are read when notified instead of by polling.</summary>
     public void SetPush(string driveId, bool connected)
@@ -99,10 +140,14 @@ public sealed partial class DriveEngine
         }
     }
 
-    /// <summary>Reads a drive's changes now, or joins the read already running. After failures, not before the back-off ends.</summary>
+    /// <summary>
+    /// Reads a drive's changes now, or joins the read already running. After failures, not before the back-off ends. The drive's feed
+    /// runs from now on (the drive counts as active only when used).
+    /// </summary>
     public Task PollAsync(string driveId)
     {
         var feed = feeds.GetOrAdd(driveId, _ => NewFeed());
+        feed.Engaged = true;
         lock (feed)
         {
             if (feed.Polling is { IsCompleted: false } running)
@@ -114,8 +159,7 @@ public sealed partial class DriveEngine
                 return Task.CompletedTask;
             }
             feed.LastPoll = Now;
-            var requestedAt = Now;
-            return feed.Polling = Task.Run(() => PollCoreAsync(driveId, feed, requestedAt));
+            return feed.Polling = Task.Run(() => PollCoreAsync(driveId, feed));
         }
     }
 
@@ -127,13 +171,14 @@ public sealed partial class DriveEngine
     {
         FinishWalks();
         FinishReadWalks();
+        Maintain();
         return Task.WhenAll(feeds
             .Where(f => Now - f.Value.LastUsed < options.ActiveWindow && Now - f.Value.LastPoll >= Interval(f.Value))
             .Select(f => PollAsync(f.Key)));
     }
 
     TimeSpan Interval(Feed feed) =>
-        HotPolling && Now - feed.LastUsed < options.HotWindow ? options.HotPollInterval
+        HotPolling && Now - feed.LastUsed < options.HotWindow ? HotInterval(feed)
         : feed.Pushed ? options.PushedPollInterval
         : options.BackgroundPollInterval;
 
@@ -145,31 +190,44 @@ public sealed partial class DriveEngine
     /// <summary>Drives used within ActiveWindow (for push subscriptions).</summary>
     public IReadOnlyList<string> ActiveDrives() => feeds.Where(f => Now - f.Value.LastUsed < options.ActiveWindow).Select(f => f.Key).ToList();
 
-    /// <summary><paramref name="started"/> is when the read was asked for: listings asked for from then on count as covered by a new baseline.</summary>
-    async Task PollCoreAsync(string driveId, Feed feed, DateTimeOffset started)
+    /// <summary>
+    /// A catch-up longer than this many pages, on a drive with fewer cached listings than pages read, starts over from now instead:
+    /// reading those folders again costs less than the rest of the catch-up.
+    /// </summary>
+    const int CatchUpPages = 10;
+
+    async Task PollCoreAsync(string driveId, Feed feed)
     {
         RequestPriority.MarkBackground();
         try
         {
             if (feed.DeltaLink is not { } link)
             {
-                await BaselineAsync(driveId, feed, started);
+                await BaselineAsync(driveId, feed);
                 return;
             }
             var changes = new List<DriveChange>();
-            while (true)
+            for (var pages = 1; ; pages++)
             {
                 var page = await api.GetDeltaAsync(link, CancellationToken.None);
                 changes.AddRange(page.Changes);
                 if (page.NextLink is { } next)
                 {
+                    if (pages >= CatchUpPages && pages > CachedListings(driveId))
+                    {
+                        Log($"change feed of {FeedName(driveId)} is more than {pages} pages behind; starting over, folders are read again");
+                        DropDrive(driveId);
+                        await BaselineAsync(driveId, feed);
+                        return;
+                    }
                     link = next;
                     continue;
                 }
                 link = page.DeltaLink ?? link;
                 break;
             }
-            Apply(driveId, changes);
+            Apply(driveId, feed, changes);
+            feed.EmptyReads = changes.Count == 0 ? feed.EmptyReads + 1 : 0;
             feed.DeltaLink = link;
             Recovered(driveId, feed);
         }
@@ -180,7 +238,7 @@ public sealed partial class DriveEngine
             DropDrive(driveId);
             try
             {
-                await BaselineAsync(driveId, feed, started);
+                await BaselineAsync(driveId, feed);
             }
             catch (Exception again) when (again is not OperationCanceledException)
             {
@@ -194,10 +252,17 @@ public sealed partial class DriveEngine
         }
     }
 
-    async Task BaselineAsync(string driveId, Feed feed, DateTimeOffset started)
+    int CachedListings(string driveId)
+    {
+        var prefix = Key(driveId, "");
+        return listings.Keys.Count(k => k.StartsWith(prefix, StringComparison.Ordinal));
+    }
+
+    /// <summary>Listings asked for after the link came back are covered by it (not those asked for while it was on its way).</summary>
+    async Task BaselineAsync(string driveId, Feed feed)
     {
         feed.DeltaLink = await api.GetLatestDeltaLinkAsync(driveId, CancellationToken.None);
-        feed.BaselineAt = started;
+        feed.BaselineAt = Now;
         Recovered(driveId, feed);
     }
 
@@ -480,73 +545,199 @@ public sealed partial class DriveEngine
         }
     }
 
-    /// <summary>Applies changes to the cached listings and lookups of a drive and reports them.</summary>
-    void Apply(string driveId, IReadOnlyList<DriveChange> changes)
+    static readonly TimeSpan RecentWindow = TimeSpan.FromMinutes(10);
+    const int MaxRecent = 20_000;
+
+    /// <summary>Applies changes read from the feed to the cached listings and lookups of a drive, reports them and keeps them for replays.</summary>
+    void Apply(string driveId, Feed feed, IReadOnlyList<DriveChange> changes)
     {
         if (changes.Count == 0)
         {
             return;
         }
         Log($"change feed of drive {driveId}: {changes.Count} change(s)");
-        var prefix = Key(driveId, "");
-        var cached = listings.Where(l => l.Key.StartsWith(prefix, StringComparison.Ordinal) && l.Value.IsLoaded)
-            .ToDictionary(l => l.Key[prefix.Length..], l => l.Value, StringComparer.OrdinalIgnoreCase);
-        var folders = new Dictionary<string, string>(StringComparer.Ordinal);
-        var located = new Dictionary<string, (string Folder, string Name)>(StringComparer.Ordinal);
-        foreach (var (folderPath, listing) in cached)
+        lock (feed.ApplyGate)
         {
-            if (listing.FolderId is { } folderId)
+            var at = Now;
+            feed.Recent.AddRange(changes.Select(change => (at, change)));
+            var drop = feed.Recent.FindIndex(r => at - r.At <= RecentWindow);
+            drop = Math.Max(drop < 0 ? feed.Recent.Count : drop, feed.Recent.Count - MaxRecent);
+            if (drop > 0)
             {
-                folders[folderId] = folderPath;
+                feed.DroppedUpTo = feed.Recent[drop - 1].At;
+                feed.Recent.RemoveRange(0, drop);
             }
-            foreach (var item in listing.Items.Values)
-            {
-                located[item.Id] = (folderPath, item.Name);
-            }
-        }
-
-        foreach (var change in changes)
-        {
-            if (change.Deleted)
-            {
-                content.ForgetItem(driveId, change.Id);
-            }
-            var known = located.TryGetValue(change.Id, out var was);
-            var newFolder = change.ParentId is { } parentId && folders.TryGetValue(parentId, out var folder) ? folder : null;
-            var item = change.Deleted ? null : change.Item;
-            var moved = known && (item is null || newFolder is null || !was.Folder.Equals(newFolder, StringComparison.OrdinalIgnoreCase) || was.Name != item.Name);
-            if (moved && cached.TryGetValue(was.Folder, out var oldListing) && oldListing.Items.TryGetValue(was.Name, out var old) && old.Id == change.Id)
-            {
-                var oldPath = JoinDrivePath(was.Folder, was.Name);
-                oldListing.Items.TryRemove(was.Name, out _);
-                lookups.TryRemove(Key(driveId, oldPath), out _);
-                if (old.IsFolder)
-                {
-                    DropBelow(driveId, oldPath);
-                }
-                located.Remove(change.Id);
-                Report(driveId, oldPath, ChangeKind.Removed, old.IsFolder);
-            }
-            if (item is null || newFolder is null || !cached.TryGetValue(newFolder, out var listing))
-            {
-                continue;
-            }
-            var path = JoinDrivePath(newFolder, item.Name);
-            var existing = listing.Items.GetValueOrDefault(item.Name);
-            if (existing is not null && existing.Id == item.Id && existing.ETag == item.ETag && existing.Size == item.Size)
-            {
-                continue; // already known, for example an echo of this engine's own upload
-            }
-            listing.Items[item.Name] = item;
-            located[item.Id] = (newFolder, item.Name);
-            lookups.TryRemove(Key(driveId, path), out _);
-            Report(driveId, path, existing is null ? ChangeKind.Added : ChangeKind.Modified, item.IsFolder);
+            ApplyCore(driveId, changes, null);
         }
     }
 
     /// <summary>
-    /// A download served another length than the listing says: the file changed since it was listed, or SharePoint serves an Office file
-    /// with properties written into it. The listing takes the item as served, so opening it again reads it whole.
+    /// Called under the feed's ApplyGate when a listing finished loading or was read again: changes applied since it was asked for
+    /// may be missing from it, so they are applied to it again. When some of those were let go it is marked stale instead.
+    /// </summary>
+    void Replay(string driveId, string folderPath, Listing listing)
+    {
+        if (!feeds.TryGetValue(driveId, out var feed))
+        {
+            return;
+        }
+        if (listing.RequestedAt <= feed.DroppedUpTo)
+        {
+            listing.Expire();
+            return;
+        }
+        var missed = feed.Recent.Where(r => r.At >= listing.RequestedAt).Select(r => r.Change).ToList();
+        if (missed.Count > 0)
+        {
+            ApplyCore(driveId, missed, folderPath);
+        }
+    }
+
+    /// <summary>
+    /// Applies changes to the drive's loaded listings (or only to <paramref name="onlyPath"/>'s) by item ID. A folder whose listing is
+    /// cached and that moved, was renamed or deleted loses what is cached at and below its old path, whether or not its parent is
+    /// cached; so do two listings that claim the same folder ID (one of them is stale).
+    /// </summary>
+    void ApplyCore(string driveId, IReadOnlyList<DriveChange> changes, string? onlyPath)
+    {
+        var prefix = Key(driveId, "");
+        var all = listings.Where(l => l.Key.StartsWith(prefix, StringComparison.Ordinal) && l.Value.IsLoaded)
+            .ToDictionary(l => l.Key[prefix.Length..], l => l.Value, StringComparer.OrdinalIgnoreCase);
+        var folders = new Dictionary<string, string>(StringComparer.Ordinal);
+        var shared = new List<string>();
+        foreach (var (path, listing) in all)
+        {
+            if (listing.FolderId is { } folderId && !folders.TryAdd(folderId, path))
+            {
+                shared.Add(folders[folderId]);
+                shared.Add(path);
+            }
+        }
+        var cached = onlyPath is null ? all
+            : all.TryGetValue(onlyPath, out var only) ? new Dictionary<string, Listing>(StringComparer.OrdinalIgnoreCase) { [onlyPath] = only }
+            : new Dictionary<string, Listing>(StringComparer.OrdinalIgnoreCase);
+        var changed = false;
+        foreach (var path in shared.Distinct(StringComparer.OrdinalIgnoreCase).ToList())
+        {
+            Log($"two cached listings of drive {driveId} claim one folder ID; '{path}' is read again");
+            DropSubtree(path);
+        }
+
+        foreach (var change in changes)
+        {
+            if (change.Deleted && onlyPath is null)
+            {
+                content.ForgetItem(driveId, change.Id);
+            }
+            var item = change.Deleted ? null : change.Item;
+            var newFolder = change.ParentId is { } parentId && folders.TryGetValue(parentId, out var folder) ? folder : null;
+
+            if (folders.TryGetValue(change.Id, out var folderPath) && all.TryGetValue(folderPath, out var folderListing)
+                && FolderMoved(folderPath, folderListing, item, change.ParentId))
+            {
+                var parentCached = all.ContainsKey(ParentOf(folderPath));
+                DropSubtree(folderPath);
+                if (!parentCached)
+                {
+                    Report(driveId, folderPath, ChangeKind.Removed, true);
+                }
+            }
+
+            // Where the item is cached now: usually in the folder it is reported in
+            string? wasFolder = null, wasName = null;
+            Listing? wasListing = null;
+            if (newFolder is not null && cached.TryGetValue(newFolder, out var here) && here.ById.TryGetValue(change.Id, out var hereName))
+            {
+                (wasFolder, wasListing, wasName) = (newFolder, here, hereName);
+            }
+            else
+            {
+                foreach (var (path, listing) in cached)
+                {
+                    if (listing.ById.TryGetValue(change.Id, out var name))
+                    {
+                        (wasFolder, wasListing, wasName) = (path, listing, name);
+                        break;
+                    }
+                }
+            }
+            var moved = wasListing is not null && (item is null || newFolder is null || !wasFolder!.Equals(newFolder, StringComparison.OrdinalIgnoreCase) || wasName != item.Name);
+            if (moved && wasListing!.Items.TryGetValue(wasName!, out var old) && old.Id == change.Id)
+            {
+                var oldPath = JoinDrivePath(wasFolder!, wasName!);
+                wasListing.Remove(wasName!, out _);
+                lookups.TryRemove(Key(driveId, oldPath), out _);
+                if (old.IsFolder)
+                {
+                    DropSubtree(oldPath);
+                }
+                Report(driveId, oldPath, ChangeKind.Removed, old.IsFolder);
+                changed = true;
+            }
+            if (item is null || newFolder is null || !cached.TryGetValue(newFolder, out var target))
+            {
+                continue;
+            }
+            var itemPath = JoinDrivePath(newFolder, item.Name);
+            var existing = target.Items.GetValueOrDefault(item.Name);
+            if (existing is not null && existing.Id == item.Id && existing.ETag == item.ETag && existing.Size == item.Size)
+            {
+                continue; // already known, for example an echo of this engine's own upload
+            }
+            target.Set(item);
+            lookups.TryRemove(Key(driveId, itemPath), out _);
+            Report(driveId, itemPath, existing is null ? ChangeKind.Added : ChangeKind.Modified, item.IsFolder);
+            changed = true;
+        }
+        if (changed)
+        {
+            Interlocked.Increment(ref metadataVersion);
+        }
+
+        // Is the folder listed at folderPath somewhere else now (or gone)? Only the name and, where known, the parent tell: a change to
+        // anything inside a folder also reports the folder itself.
+        bool FolderMoved(string folderPath, Listing listing, DriveItemInfo? item, string? parentId)
+        {
+            if (item is null)
+            {
+                return true;
+            }
+            if (folderPath.Length == 0)
+            {
+                return false;
+            }
+            if (!item.Name.Equals(NameOf(folderPath), StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+            var expected = all.TryGetValue(ParentOf(folderPath), out var parent) && parent.FolderId is { } id ? id : listing.ParentId;
+            if (expected is null || parentId is null)
+            {
+                listing.ParentId ??= parentId;
+                return false;
+            }
+            return expected != parentId;
+        }
+
+        // Drops what is cached at and below a path, here and in the maps this pass uses
+        void DropSubtree(string path)
+        {
+            DropBelow(driveId, path);
+            foreach (var gone in all.Keys.Where(k => k.Equals(path, StringComparison.OrdinalIgnoreCase) || path.Length == 0 || k.StartsWith(path + "/", StringComparison.OrdinalIgnoreCase)).ToList())
+            {
+                if (all.Remove(gone, out var listing) && listing.FolderId is { } id && folders.GetValueOrDefault(id) is { } mapped && mapped.Equals(gone, StringComparison.OrdinalIgnoreCase))
+                {
+                    folders.Remove(id);
+                }
+                cached.Remove(gone);
+            }
+            changed = true;
+        }
+    }
+
+    /// <summary>
+    /// A download served other content than the listing says: the file changed since it was listed, or SharePoint serves an Office
+    /// file with properties written into it. The listing takes the item as served, so opening it again reads it whole.
     /// </summary>
     void ContentChanged(string driveId, DriveItemInfo current)
     {
@@ -556,10 +747,11 @@ public sealed partial class DriveEngine
         var listed = 0L;
         foreach (var (key, listing) in listings)
         {
-            if (key.StartsWith(prefix, StringComparison.Ordinal) && listing.IsLoaded && listing.Items.Values.FirstOrDefault(i => i.Id == current.Id) is { } known)
+            if (key.StartsWith(prefix, StringComparison.Ordinal) && listing.IsLoaded && listing.ById.TryGetValue(current.Id, out var name)
+                && listing.Items.TryGetValue(name, out var known) && known.Id == current.Id)
             {
                 (path, listed) = (JoinDrivePath(key[prefix.Length..], known.Name), known.Size);
-                listing.Items[known.Name] = current with { Name = known.Name };
+                listing.Set(current with { Name = known.Name });
             }
         }
         foreach (var (key, lookup) in lookups)
@@ -574,10 +766,72 @@ public sealed partial class DriveEngine
         {
             return;
         }
+        Interlocked.Increment(ref metadataVersion);
         var shown = ns.VolumePathOf(driveId) is { } top ? Join(top, path.Replace('/', '\\')) : path;
-        Log($"{shown}: {listed} bytes listed, {current.Size} served (changed in Microsoft 365, or SharePoint wrote properties into it); " +
-            "a read failed, opening it again works");
+        Log(listed == current.Size
+            ? $"{shown}: changed in Microsoft 365 since it was listed (another version is served); a read failed, opening it again works"
+            : $"{shown}: {listed} bytes listed, {current.Size} served (changed in Microsoft 365, or SharePoint wrote properties into it); " +
+              "a read failed, opening it again works");
         Report(driveId, path, ChangeKind.Modified, false);
+    }
+
+    DateTimeOffset nextMaintenance;
+    static readonly TimeSpan MaintenanceInterval = TimeSpan.FromSeconds(30);
+
+    /// <summary>A listing used this recently is never evicted.</summary>
+    static readonly TimeSpan ListingKeep = TimeSpan.FromMinutes(2);
+
+    /// <summary>
+    /// Every 30 s (from <see cref="PollActiveAsync"/>): lookups past their TTL go, and listings beyond MaxCachedItems, least recently
+    /// used first.
+    /// </summary>
+    void Maintain()
+    {
+        if (Now < nextMaintenance)
+        {
+            return;
+        }
+        nextMaintenance = Now + MaintenanceInterval;
+        var lookupAge = options.LookupTtl > options.NotFoundTtl ? options.LookupTtl : options.NotFoundTtl;
+        foreach (var lookup in lookups)
+        {
+            if (Now - lookup.Value.At >= lookupAge)
+            {
+                lookups.TryRemove(lookup);
+            }
+        }
+        foreach (var burst in lookupBursts)
+        {
+            if (Now - burst.Value.Since > options.WalkWindow)
+            {
+                lookupBursts.TryRemove(burst);
+            }
+        }
+
+        var size = listings.Values.Sum(l => (long)l.Items.Count + 1);
+        if (size <= options.MaxCachedItems)
+        {
+            return;
+        }
+        var target = options.MaxCachedItems / 10 * 9;
+        var evicted = 0;
+        foreach (var old in listings.Where(l => l.Value.IsLoaded && Now - l.Value.LastUsed > ListingKeep).OrderBy(l => l.Value.LastUsed).ToList())
+        {
+            if (size <= target)
+            {
+                break;
+            }
+            if (listings.TryRemove(old))
+            {
+                size -= old.Value.Items.Count + 1;
+                evicted++;
+            }
+        }
+        if (evicted > 0)
+        {
+            Interlocked.Increment(ref metadataVersion);
+            Log($"{evicted} folder listing(s) left memory (least recently used); they are read again when opened");
+        }
     }
 
     /// <summary>Lengths downloads served that differ from the listed size, per item, for the content version they were served for.</summary>
@@ -616,6 +870,14 @@ public sealed partial class DriveEngine
             listings.TryRemove(key, out _);
             lookups.TryRemove(key, out _);
         }
+        if (feeds.TryGetValue(driveId, out var feed))
+        {
+            lock (feed.ApplyGate)
+            {
+                feed.Recent.Clear();
+            }
+        }
+        Interlocked.Increment(ref metadataVersion);
         if (ns.VolumePathOf(driveId) is { } top)
         {
             options.Changed?.Invoke(new EngineChange(top, ChangeKind.Modified, true));
@@ -653,7 +915,7 @@ public sealed partial class DriveEngine
             var folders = listings.Where(l => l.Key.StartsWith(prefix, StringComparison.Ordinal) && l.Value.IsLoaded && l.Value.FolderId is not null && feed.Maintains(l.Value.RequestedAt))
                 .OrderByDescending(l => l.Value.LastUsed)
                 .Take(maxFoldersPerDrive)
-                .Select(l => new FolderSnapshot(l.Key[prefix.Length..], l.Value.FolderId!, l.Value.Items.Values.ToList()))
+                .Select(l => new FolderSnapshot(l.Key[prefix.Length..], l.Value.FolderId!, l.Value.Items.Values.ToList(), l.Value.FetchedAt, l.Value.ParentId))
                 .ToList();
             if (folders.Count > 0)
             {
@@ -665,16 +927,19 @@ public sealed partial class DriveEngine
 
     /// <summary>
     /// Restores listings from an earlier run. They answer at once; the first read of each drive's feed (on first use) applies
-    /// what changed since, and an expired link drops them.
+    /// what changed since, and an expired link drops them. They are read again only after MaintainedListingMaxAge from when they
+    /// were fetched.
     /// </summary>
     public void ImportSnapshots(IEnumerable<DriveSnapshot> snapshots)
     {
         foreach (var snapshot in snapshots)
         {
-            feeds[snapshot.DriveId] = new Feed { DeltaLink = snapshot.DeltaLink, BaselineAt = DateTimeOffset.MinValue, LastUsed = DateTimeOffset.MinValue };
+            feeds[snapshot.DriveId] = new Feed { DeltaLink = snapshot.DeltaLink, BaselineAt = DateTimeOffset.MinValue, LastUsed = DateTimeOffset.MinValue, Engaged = true };
             foreach (var folder in snapshot.Folders)
             {
-                listings.TryAdd(Key(snapshot.DriveId, folder.Path), Listing.Loaded(folder.Items, DateTimeOffset.MinValue, snapshot.SavedAt, folder.FolderId));
+                var listing = Listing.Loaded(folder.Items, DateTimeOffset.MinValue, folder.FetchedAt ?? snapshot.SavedAt, folder.FolderId);
+                listing.ParentId = folder.ParentId;
+                listings.TryAdd(Key(snapshot.DriveId, folder.Path), listing);
             }
         }
     }

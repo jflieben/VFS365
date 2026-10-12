@@ -2,7 +2,7 @@ namespace Vfs365.Core.Discovery;
 
 public enum LibraryAccess { ReadWrite, ReadOnly }
 
-/// <summary>Static exclusions can't change, so they are cached and never looked up again.</summary>
+/// <summary>Static exclusions can't change, so they are cached and never looked up again. Others are checked again with the library metadata.</summary>
 public sealed record LibraryVerdict(bool Include, LibraryAccess Access, string? Reason, bool Static)
 {
     internal static LibraryVerdict Excluded(string reason, bool isStatic) => new(false, LibraryAccess.ReadOnly, reason, isStatic);
@@ -11,8 +11,16 @@ public sealed record LibraryVerdict(bool Include, LibraryAccess Access, string? 
 /// <summary>Which discovered libraries to show. Language independent: internal names and flags, never titles.</summary>
 public static class LibraryRules
 {
-    /// <summary>Bump when rules change: cached static exclusions from older rules are dropped.</summary>
+    /// <summary>
+    /// Bump when rules change: cached static exclusions and library metadata from older rules are dropped, so every library is read
+    /// again (a burst for every user of a tenant on the upgrade day). When only a reason stops being static, drop it instead (<see cref="NoLongerStatic"/>).
+    /// </summary>
     public const int Version = 2;
+
+    public const string HiddenReason = "Hidden library";
+
+    /// <summary>Static exclusions earlier versions cached that are checked again now: hiding a library can be undone (until 0.3.2 static).</summary>
+    public static bool NoLongerStatic(string reason) => reason == HiddenReason;
 
     /// <summary>Internal names (EntityTypeName) of system libraries, compared without spaces. These don't follow the site language.</summary>
     static readonly HashSet<string> SystemInternalNames = new(StringComparer.OrdinalIgnoreCase)
@@ -32,7 +40,7 @@ public static class LibraryRules
     {
         if (list.Hidden)
         {
-            return LibraryVerdict.Excluded("Hidden library", true);
+            return LibraryVerdict.Excluded(HiddenReason, false);
         }
         if (list.BaseTemplate is int template && template != 101)
         {

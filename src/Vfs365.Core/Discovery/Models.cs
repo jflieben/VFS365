@@ -10,7 +10,8 @@ public sealed record DiscoveredLibrary(string SiteId, string WebId, string ListI
     public string Key => LibraryKey.Of(SiteId, WebId, ListId);
 }
 
-public sealed record SearchPage(IReadOnlyList<DiscoveredLibrary> Libraries, int RowCount);
+/// <summary>LastDocId: the DocId of the page's last row, which the next page starts after; null when search didn't return it.</summary>
+public sealed record SearchPage(IReadOnlyList<DiscoveredLibrary> Libraries, int RowCount, long? LastDocId = null);
 
 public sealed record MyDrive(string DriveId, string WebUrl);
 
@@ -28,6 +29,7 @@ public sealed record ListMetadata(
     long ItemCount,
     string? InternalName = null);
 
+/// <summary>A document library of a web with its metadata, as listed by the web (pinned locations, discovery per site).</summary>
 public sealed record PinnedLibrary(string ListId, ListMetadata List);
 
 /// <summary>A pinned URL resolved: the web it belongs to and its document libraries (all of them for a site URL, one for a library URL).</summary>
@@ -58,9 +60,15 @@ public sealed record SkippedLibrary(string Key, string WebUrl, string Title, str
         new(library.Key, library.WebUrl, library.ListTitle, reason, internalName);
 }
 
+/// <summary>A library or pinned URL left out for a reason that can change, and when that was checked; reused like library metadata.</summary>
+public sealed record CheckedExclusion(string Reason, DateTimeOffset CheckedAt);
+
 /// <summary>
 /// Kept between runs: the visible set (for the hiding safety check and to mount before discovery runs), libraries that never need
 /// another lookup, and the oldest time a shown library's metadata was read (the fallback for entries without CheckedAt).
+/// TenantId: the signed-in tenant, when the caller passed it. Misses: shown libraries search didn't return, with the number of runs in
+/// a row (hidden at the second). Exclusions: libraries left out for a reason that can change (hidden, offline clients excluded).
+/// EmptyPins: pinned URLs where nothing was found or nothing is shown.
 /// </summary>
 public sealed record DiscoveryState(
     DateTimeOffset RunAt,
@@ -71,7 +79,11 @@ public sealed record DiscoveryState(
     MyDrive? OneDrive = null,
     DateTimeOffset MetadataAt = default,
     string? TenantHint = null,
-    IReadOnlyDictionary<string, IReadOnlyList<string>>? Pinned = null);
+    IReadOnlyDictionary<string, IReadOnlyList<string>>? Pinned = null,
+    string? TenantId = null,
+    IReadOnlyDictionary<string, int>? Misses = null,
+    IReadOnlyDictionary<string, CheckedExclusion>? Exclusions = null,
+    IReadOnlyDictionary<string, CheckedExclusion>? EmptyPins = null);
 
 public sealed record DiscoveryResult(
     MyDrive OneDrive,

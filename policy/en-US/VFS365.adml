@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <policyDefinitionResources xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" revision="1.0" schemaVersion="1.0" xmlns="http://schemas.microsoft.com/GroupPolicy/2006/07/PolicyDefinitions">
   <displayName>VFS365</displayName>
-  <description>Settings for VFS365, which shows Microsoft 365 files as a drive and in Explorer's navigation pane.</description>
+  <description>Settings for VFS365, which shows Microsoft 365 files as a drive and in Explorer's navigation pane. A running VFS365 keeps the settings it started with: changes apply at the next sign-in, or after Restart in the tray menu (the tray says so when a setting changed). Computer policy wins over user policy, also for lists, which are not merged.</description>
   <resources>
     <stringTable>
       <string id="SUPPORTED_Windows11">Windows 11 with WinFsp and VFS365 installed</string>
@@ -17,7 +17,9 @@
       <string id="TenantId_Help">Tenant (directory) ID to sign in to. Normally not needed: VFS365 uses the tenant the device is joined or registered to, else the tenant of the account that signs in.</string>
 
       <string id="DriveLetter">Drive letter</string>
-      <string id="DriveLetter_Help">Drive letter for the drive, for example M. Use * for the first free letter counting down from Z, or None for no drive letter (the default when not configured): the files are then reachable through the navigation pane and the UNC path \\VFS365\&lt;user name&gt; only. On multi-session hosts a drive letter gives every user the same path.
+      <string id="DriveLetter_Help">Drive letter for the drive, for example M (M: and M:\ work too). Use * for the first free letter counting down from Z, or None for no drive letter (the default when not configured): the files are then reachable through the navigation pane and the UNC path \\VFS365\&lt;user name&gt; only. On multi-session hosts a drive letter gives every user the same path.
+
+When the letter is in use (another drive, a mapping) or the value is not valid, the drive starts without a letter; the tray and the log say why.
 
 For a drive letter only, set a letter here and disable "Show in the navigation pane". The UNC path always works as well.</string>
 
@@ -46,23 +48,28 @@ For a drive letter only, set a letter here and disable "Show in the navigation p
       <string id="CacheSizeMB_Help">Most space, in MB, that copies of opened files take per user (encrypted, in %LOCALAPPDATA%\VFS365\cache). The least recently used go first. Default 2048, at least 100.</string>
 
       <string id="TrayIcon">Tray icon and notifications</string>
-      <string id="TrayIcon_Help">Shows a VFS365 icon in the notification area with its status, and notifications for conflict copies, uploads that wait and sign-in problems. Enabled by default; disable to show neither.</string>
+      <string id="TrayIcon_Help">Shows a VFS365 icon in the notification area with its status, and notifications for conflict copies, uploads that wait and sign-in problems. Its menu has Sign in when a sign-in is needed: the only way VFS365 shows a sign-in window after it started. Enabled by default; disable to show neither.</string>
+
+      <string id="NotifyUploads">Notify when waiting files are uploaded</string>
+      <string id="NotifyUploads_Help">Enabled (the default): after files had to wait (offline, throttled), a notification says when they are uploaded after all. Notifications that arrive within a few seconds are combined into one.
+
+Disabled: no "Uploaded" notifications. Conflict copies and uploads that wait are always notified.</string>
 
       <string id="PinnedLocations">Pinned locations</string>
       <string id="PinnedLocations_Help">Site or library addresses to show for everyone who can open them, one per line, also where SharePoint Search doesn't find them (Restricted Content Discovery, sites excluded from search, the root site, portals, new sites). A link copied from the browser works. Users add their own with vfs365.exe pin.</string>
 
       <string id="ChangeCheckSeconds">Change check interval</string>
-      <string id="ChangeCheckSeconds_Help">How often, in seconds, a library someone used in the last 2 minutes is checked for changes made elsewhere, on top of SharePoint's push notifications (which take 20 to 30 seconds). Default 20; 0 leaves it to push notifications; 5 to 300. Each check costs 1 resource unit of the tenant's API budget. Checking pauses after Microsoft throttles (see "Pause after throttling").</string>
+      <string id="ChangeCheckSeconds_Help">How often, in seconds, a library someone used in the last 2 minutes is checked for changes made elsewhere, on top of SharePoint's push notifications (which take 20 to 30 seconds). Default 20; 0 leaves it to push notifications; 5 to 300 (1 to 4 count as 5, and the log says so). Each check costs 1 resource unit of the tenant's API budget. Checking pauses after Microsoft throttles (see "Pause after throttling").</string>
 
       <string id="ApiBudgetPerMinute">API budget per user</string>
-      <string id="ApiBudgetPerMinute_Help">The most SharePoint resource units one user's VFS365 uses per minute. Default 600; 0: no limit of its own; at least 60.
+      <string id="ApiBudgetPerMinute_Help">The most SharePoint resource units one user's VFS365 uses per minute. Default 600; 0: no limit of its own; at least 60 (1 to 59 count as 60, and the log says so).
 
 Microsoft limits every app per tenant, for all its users together: 1,250 resource units per minute up to 1,000 licenses, rising to 6,250 above 50,000 licenses, plus limits per user. Listing a folder costs 2 units; opening a file or checking for changes 1. VFS365 users share their tenant's budget for the app they sign in with (JSolve's app or your own). See https://learn.microsoft.com/en-us/sharepoint/dev/general-development/how-to-avoid-getting-throttled-or-blocked-in-sharepoint-online#application-throttling
 
 Normal use stays far below the default. It caps peaks, such as copying a large folder tree, so one user can't use up most of a small tenant's budget. Background work (loading ahead, change checks, discovery) only uses the second half of the budget, so what users wait for goes first. Lower it when many users work at the same time in a tenant with few licenses; raise it for larger tenants. Requests wait when the budget is used up; nothing fails.</string>
 
       <string id="ThrottlePauseMinutes">Pause after throttling</string>
-      <string id="ThrottlePauseMinutes_Help">When Microsoft throttles (HTTP 429 or 503), every request waits as long as Microsoft asks. On top of that, background work (loading folders ahead of a tree walk, the frequent change check) stops for this many minutes. Default 15; 0 to 240. See https://learn.microsoft.com/en-us/sharepoint/dev/general-development/how-to-avoid-getting-throttled-or-blocked-in-sharepoint-online#application-throttling</string>
+      <string id="ThrottlePauseMinutes_Help">When Microsoft throttles (HTTP 429 or 503), every request waits as long as Microsoft asks. On top of that, background work (loading ahead, change checks, discovery) waits this many minutes; what users open and save goes on. Default 15; 0 to 240. See https://learn.microsoft.com/en-us/sharepoint/dev/general-development/how-to-avoid-getting-throttled-or-blocked-in-sharepoint-online#application-throttling</string>
 
       <string id="WalkPrefetchFolders">Folders loaded ahead of a tree walk</string>
       <string id="WalkPrefetchFolders_Help">When an app walks a folder tree (copying, searching or backing up a folder with its subfolders), VFS365 lists the next folders before the app gets there, two at a time. This sets how many folders it may have listed ahead that the app hasn't opened yet. Default 10; 0 turns it off; at most 200.
@@ -89,9 +96,18 @@ The changes are kept safely on the PC until then. Saves by Office and other apps
       <string id="MonitoringUrl">Report to Azure table storage</string>
       <string id="MonitoringUrl_Help">A table service SAS URL of your own Azure storage account, for example https://account.table.core.windows.net/?sv=...&amp;ss=t&amp;srt=o&amp;sp=a&amp;se=...&amp;sig=... Not configured: nothing is reported.
 
-When set, VFS365 adds rows to three tables, which must exist: errors (each error at once, with device, user and details; at most 20 an hour per user), statistics (one row per user and device per day, sent the next day: requests, resource units, data received and sent, throttling, errors, version) and devices (installs, updates and uninstalls). Set it as a computer policy to get install, update and uninstall reports.
+When set, VFS365 adds rows to three tables, which must exist: errors (each error at once, with device name, user name (UPN and Windows user), tenant and the message, which contains file and folder paths; at most 20 an hour per user; see "Detail in error reports" to leave paths out), statistics (one row per user and device per day, sent the next day: requests, resource units, data received and sent, throttling, errors, version) and devices (installs, updates and uninstalls). Set it as a computer policy to get install, update and uninstall reports.
 
 The SAS only needs the Add permission on objects of the Table service (ss=t, srt=o, sp=a): VFS365 never reads or changes rows. Reporting is best effort: nothing waits for it and nothing is retried; the first failure is written to the local log once. Renew the SAS before it expires. Instructions: https://jsolve.nl</string>
+
+      <string id="MonitoringDetail">Detail in error reports</string>
+      <string id="MonitoringDetail_Help">What error rows in the monitoring table contain (see "Report to Azure table storage").
+
+Full (the default): the message as written in the local log, with file and folder paths and the addresses of failed requests.
+
+No paths: every file and folder path becomes a short code ([path 1a2b3c4d], the same for the same path, so repeated errors still group) and request addresses keep only their host. Device and user names stay. For organisations whose works council or privacy rules don't allow file names in central reports. The local log always has the full text.</string>
+      <string id="MonitoringDetail_Full">Full</string>
+      <string id="MonitoringDetail_NoPaths">No paths</string>
 
       <string id="DatabaseFiles">Multi-user database files</string>
       <string id="DatabaseFiles_Help">What happens with Access, QuickBooks and SQLite files (.accdb, .mdb, .qbw, .sqlite and their lock files). Their locks only work on one PC, so when two people change the same database from two PCs, the second save becomes a conflict copy that someone has to merge by hand. Allow: like any file (default). Read-only: they open for reading only. Block: they are listed but don't open.</string>
@@ -110,7 +126,7 @@ Disabled: no entry. With a drive letter (see "Drive letter") the drive shows und
     <presentationTable>
       <presentation id="ClientId"><textBox refId="ClientId"><label>Client ID</label></textBox></presentation>
       <presentation id="TenantId"><textBox refId="TenantId"><label>Tenant ID</label></textBox></presentation>
-      <presentation id="DriveLetter"><textBox refId="DriveLetter"><label>Drive letter, * or None</label><defaultValue>M</defaultValue></textBox></presentation>
+      <presentation id="DriveLetter"><textBox refId="DriveLetter"><label>Drive letter, * or None</label><defaultValue>None</defaultValue></textBox></presentation>
       <presentation id="Label"><textBox refId="Label"><label>Name</label><defaultValue>VFS365</defaultValue></textBox></presentation>
       <presentation id="Scope"><dropdownList refId="Scope" defaultItem="0">Show</dropdownList></presentation>
       <presentation id="IncludedSites"><multiTextBox refId="IncludedSites">Site URL patterns, one per line</multiTextBox></presentation>
@@ -123,6 +139,7 @@ Disabled: no entry. With a drive letter (see "Drive letter") the drive shows und
       <presentation id="ReadAheadFiles"><decimalTextBox refId="ReadAheadFiles" defaultValue="8">Files (0: off)</decimalTextBox></presentation>
       <presentation id="RepeatSaveSeconds"><decimalTextBox refId="RepeatSaveSeconds" defaultValue="30">Seconds (0: upload on every close)</decimalTextBox></presentation>
       <presentation id="MonitoringUrl"><textBox refId="MonitoringUrl"><label>Table service SAS URL</label></textBox></presentation>
+      <presentation id="MonitoringDetail"><dropdownList refId="MonitoringDetail" defaultItem="0">Error rows contain</dropdownList></presentation>
       <presentation id="DatabaseFiles"><dropdownList refId="DatabaseFiles" defaultItem="0">Database files</dropdownList></presentation>
       <presentation id="HelpUrl"><textBox refId="HelpUrl"><label>Address</label><defaultValue>https://jsolve.nl</defaultValue></textBox></presentation>
       <presentation id="ExcludedSites"><multiTextBox refId="ExcludedSites">Site URL patterns, one per line</multiTextBox></presentation>

@@ -5,10 +5,16 @@ public interface ISharePointDiscoveryApi
 {
     Task<MyDrive> GetMyDriveAsync(CancellationToken ct);
 
-    /// <summary>One page of SharePoint Search for document libraries, security-trimmed to the user.</summary>
-    Task<SearchPage> SearchDocumentLibrariesAsync(string tenantRoot, int startRow, int rowLimit, CancellationToken ct);
+    /// <summary>
+    /// One page of SharePoint Search for document libraries, security-trimmed to the user, in DocId order: rows with a DocId above
+    /// <paramref name="afterDocId"/> (0: from the start), skipping the first <paramref name="startRow"/> of those.
+    /// </summary>
+    Task<SearchPage> SearchDocumentLibrariesAsync(string tenantRoot, long afterDocId, int startRow, int rowLimit, CancellationToken ct);
 
     Task<SiteMetadata> GetSiteAsync(string webUrl, CancellationToken ct);
+
+    /// <summary>A web's document libraries with their metadata, in one call. Null when the user can't list them (access to some libraries only) or the web isn't found.</summary>
+    Task<IReadOnlyList<PinnedLibrary>?> GetWebLibrariesAsync(string webUrl, CancellationToken ct);
 
     /// <summary>Null when the list isn't found under <paramref name="baseUrl"/>.</summary>
     Task<ListMetadata?> GetListAsync(string baseUrl, string listId, CancellationToken ct);

@@ -18,6 +18,6 @@ Guidance for coding agents and contributors. Maintainers: when `private/` exists
 - `./build.ps1 run <args>` builds and runs the console tool (without arguments it lists the commands). `./build.ps1 test` doesn't rebuild the console exe: run `build` before live tests. While mounted the exe is locked: only `unmount` works, rebuilds fail.
 - Settings come from policy, then `vfs365.local.json` in the working directory (same names as in docs/DEPLOYMENT.md), or `--config <file>`.
 - Running the drive needs WinFsp installed; building doesn't.
-- `src/Vfs365.Np` is C (the network provider), built by `./build.ps1 np` and `release` with a pinned portable Zig (fetched and hash-checked on first use). No C runtime: kernel32 only.
+- `src/Vfs365.Np` is C (the network provider), built by `./build.ps1 np` and `release` with a pinned portable Zig (fetched and hash-checked on first use). No C runtime: kernel32 and advapi32 only (advapi32 for the owner check).
 - Versions: `VERSION` is the only place to change it; assemblies, MSIs and setups take it from there. `./build.ps1 bump` raises the patch number. `./build.ps1 release` builds `release/<version>/` locally. Pushing a new version to `main` makes GitHub Actions publish a release (`.github/workflows/release.yml`).
 - Layout: src/ (Core, Graph, Drive.WinFsp, Agent library, Cli = vfs365.exe, Background = vfs365-agent.exe, Np = vfs365np.dll), installer/ (WiX 5), policy/ (ADMX), assets/ (icons from tools/), tests/, docs/.

@@ -6,6 +6,76 @@ using Vfs365.Core;
 namespace Vfs365.Graph;
 
 /// <summary>
+/// Turns one drive's push notifications into change reads. A notification waits <see cref="Settle"/> plus 0 to <see cref="MaxJitter"/>
+/// at random (every subscriber of a busy library gets it at the same moment), notifications meanwhile join it, and reads are at least
+/// <see cref="MinInterval"/> apart (SharePoint often sends two per change).
+/// </summary>
+public sealed class PushDebounce(Func<Task> read) : IDisposable
+{
+    readonly Lock gate = new();
+    readonly CancellationTokenSource stop = new();
+    bool pending;
+    DateTimeOffset lastRead = DateTimeOffset.MinValue;
+
+    public TimeSpan Settle { get; init; } = TimeSpan.FromSeconds(3);
+    public TimeSpan MaxJitter { get; init; } = TimeSpan.FromSeconds(10);
+    public TimeSpan MinInterval { get; init; } = TimeSpan.FromSeconds(30);
+
+    /// <summary>Time, randomness (0 to 1) and waiting; replaceable for tests.</summary>
+    public Func<DateTimeOffset> Clock { get; init; } = () => DateTimeOffset.UtcNow;
+    public Func<double> Random { get; init; } = System.Random.Shared.NextDouble;
+    public Func<TimeSpan, CancellationToken, Task> Delay { get; init; } = Task.Delay;
+
+    public void Notify()
+    {
+        TimeSpan wait;
+        lock (gate)
+        {
+            if (pending || stop.IsCancellationRequested)
+            {
+                return;
+            }
+            pending = true;
+            var now = Clock();
+            var due = now + Settle + MaxJitter * Random();
+            if (lastRead != DateTimeOffset.MinValue && lastRead + MinInterval > due)
+            {
+                due = lastRead + MinInterval;
+            }
+            wait = due - now;
+        }
+        _ = ReadAsync(wait);
+    }
+
+    async Task ReadAsync(TimeSpan wait)
+    {
+        try
+        {
+            await Delay(wait, stop.Token);
+        }
+        catch (OperationCanceledException)
+        {
+            return;
+        }
+        lock (gate)
+        {
+            pending = false;
+            lastRead = Clock();
+        }
+        try
+        {
+            await read();
+        }
+        catch (Exception)
+        {
+            // the reader reports its own failures
+        }
+    }
+
+    public void Dispose() => stop.Cancel();
+}
+
+/// <summary>
 /// Push notifications for a drive through Graph's socket.io endpoint (GET /drives/{id}/root/subscriptions/socketIo). A notification
 /// only says that something changed; the caller then reads the drive's delta feed. Engine.IO 3 / Socket.IO 2 over a WebSocket.
 /// </summary>

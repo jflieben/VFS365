@@ -1,5 +1,7 @@
 using System.Reflection;
 using System.Runtime.InteropServices;
+using System.Security.AccessControl;
+using System.Security.Principal;
 using System.Threading.Channels;
 using Fsp;
 using Fsp.Interop;
@@ -89,9 +91,11 @@ public sealed class DriveHost : IDisposable
         if (status < 0)
         {
             host.Dispose();
-            throw new IOException(status == FileExists
-                ? $@"\{uncPrefix} is already mounted on this machine, by another session or program (NTSTATUS 0x{status:X8})."
-                : $"WinFsp could not mount {mountPoint ?? "a free drive letter"} (NTSTATUS 0x{status:X8}). Is WinFsp installed and the drive letter free?");
+            if (status == FileExists)
+            {
+                throw MountConflictException.For(uncPrefix, VolumeOwner($@"\{uncPrefix}\"), WindowsIdentity.GetCurrent().User!, status);
+            }
+            throw new IOException($"WinFsp could not mount {mountPoint ?? "a free drive letter"} (NTSTATUS 0x{status:X8}). Is WinFsp installed and the drive letter free?");
         }
         if (keepDriveLetter)
         {
@@ -113,4 +117,57 @@ public sealed class DriveHost : IDisposable
     /// to it) while the volume and its UNC path stay. Network volumes can't be mounted on a folder instead (STATUS_NETWORK_ACCESS_DENIED).
     /// </summary>
     static unsafe void RemoveMountPoint(FileSystemHost host) => WinFspNative.RemoveMountPoint(WinFspNative.FileSystemOf(host));
+
+    /// <summary>
+    /// Owner of the root of the volume that holds a UNC path, or null when it can't be read (no access, or no answer within 5 s: the
+    /// volume's file system may be hostile).
+    /// </summary>
+    static SecurityIdentifier? VolumeOwner(string root)
+    {
+        var read = Task.Run(() => new DirectoryInfo(root).GetAccessControl(AccessControlSections.Owner).GetOwner(typeof(SecurityIdentifier)) as SecurityIdentifier);
+        try
+        {
+            return read.Wait(TimeSpan.FromSeconds(5)) ? read.Result : null;
+        }
+        catch (AggregateException)
+        {
+            return null;
+        }
+    }
+}
+
+/// <summary>
+/// The UNC prefix is held by another volume. <see cref="OwnedByAnotherUser"/>: its root isn't owned by the current user (or can't
+/// be read), so another user may have mounted it first to receive this user's files: raise a security alert. Otherwise the user's
+/// own volume holds it, for example from another session. A file system written to deceive can report any owner, so false is not proof.
+/// </summary>
+public sealed class MountConflictException(string message, bool ownedByAnotherUser, string? owner) : IOException(message)
+{
+    public bool OwnedByAnotherUser { get; } = ownedByAnotherUser;
+
+    /// <summary>The root's owner SID, or null when it couldn't be read.</summary>
+    public string? Owner { get; } = owner;
+
+    public static MountConflictException For(string uncPrefix, SecurityIdentifier? owner, SecurityIdentifier currentUser, int status)
+    {
+        if (owner == currentUser)
+        {
+            return new($@"\{uncPrefix} is already mounted by this user, in another session or program (NTSTATUS 0x{status:X8}).", false, owner.Value);
+        }
+        var who = owner is null ? "a volume whose owner can't be read" : $"a volume owned by {Account(owner)}";
+        return new($@"\{uncPrefix} is held by {who}, not by this user. Files saved to that path would go to it, so VFS365 doesn't " +
+            $"mount. Report this to your IT department (NTSTATUS 0x{status:X8}).", true, owner?.Value);
+    }
+
+    static string Account(SecurityIdentifier sid)
+    {
+        try
+        {
+            return $"{sid.Translate(typeof(NTAccount))} ({sid})";
+        }
+        catch (SystemException)
+        {
+            return sid.Value;
+        }
+    }
 }

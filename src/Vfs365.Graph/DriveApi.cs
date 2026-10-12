@@ -14,6 +14,9 @@ public sealed partial class DriveApi(M365Client client) : IDriveApi
     const string Select = "id,name,size,folder,file,fileSystemInfo,createdDateTime,lastModifiedDateTime,eTag,cTag";
     const string DeltaSelect = Select + ",parentReference,deleted,root";
 
+    /// <summary>A single item also brings its parent's ID (not asked for in listings: it is the folder listed, and big).</summary>
+    const string ItemSelect = Select + ",parentReference";
+
     /// <summary>
     /// The first page is small so a big folder starts showing quickly (Graph's time grows with the page); the rest come 1000 at a time
     /// by raising $top in the next links.
@@ -69,20 +72,79 @@ public sealed partial class DriveApi(M365Client client) : IDriveApi
 
     public async Task<DriveItemInfo?> GetItemAsync(string driveId, string path, CancellationToken ct)
     {
-        using var doc = await client.GetJsonAsync(new Uri($"{ItemUrl(driveId, path)}?$select={Select}"), ct, notFoundAsNull: true);
+        using var doc = await client.GetJsonAsync(new Uri($"{ItemUrl(driveId, path)}?$select={ItemSelect}"), ct, notFoundAsNull: true);
         return doc is null ? null : Parse(doc.RootElement);
     }
 
-    /// <summary>Asks for a fresh pre-authenticated download URL per stream; it is never kept.</summary>
-    public async Task<Stream> OpenReadAsync(string driveId, string itemId, long offset, long length, CancellationToken ct)
+    /// <summary>
+    /// Item fields for a download plus the pre-authenticated URL. Graph returns the URL under $select only when it is named; an answer
+    /// without it switches to reading the whole item.
+    /// </summary>
+    const string DownloadSelect = Select + ",@microsoft.graph.downloadUrl";
+
+    /// <summary>A download URL is reused this long for the same item version (it is valid for about an hour); never stored or logged.</summary>
+    static readonly TimeSpan DownloadUrlReuse = TimeSpan.FromMinutes(2);
+
+    readonly System.Collections.Concurrent.ConcurrentDictionary<string, (string Url, DriveItemInfo Item, DateTimeOffset At)> downloadUrls = new(StringComparer.Ordinal);
+    volatile bool selectDropsDownloadUrl;
+
+    /// <summary>
+    /// Streams the version <paramref name="contentTag"/> names. The item is read first (unless a download URL for that version was read
+    /// in the last minutes), so a changed file fails with <see cref="ContentChangedException"/> instead of mixing versions in one download.
+    /// </summary>
+    public async Task<Stream> OpenReadAsync(string driveId, string itemId, string? contentTag, long offset, long length, CancellationToken ct)
     {
-        string url;
-        DriveItemInfo current;
-        using (var doc = await client.GetJsonAsync(new Uri($"{DriveUrl(driveId)}/items/{itemId}"), ct))
+        var key = $"{driveId}|{itemId}";
+        if (contentTag is not null && downloadUrls.TryGetValue(key, out var known) && DateTimeOffset.UtcNow - known.At < DownloadUrlReuse
+            && (contentTag == known.Item.CTag || contentTag == known.Item.ETag))
         {
-            url = doc!.RootElement.GetProperty("@microsoft.graph.downloadUrl").GetString()!;
-            current = Parse(doc.RootElement)!;
+            try
+            {
+                return await DownloadAsync(known.Url, known.Item, offset, length, ct);
+            }
+            catch (Exception e) when (e is not OperationCanceledException)
+            {
+                downloadUrls.TryRemove(key, out _); // expired, or the file changed: read the item again
+            }
         }
+
+        var (url, current) = await DownloadUrlAsync(driveId, itemId, ct);
+        if (ContentTags.Differs(contentTag, current))
+        {
+            downloadUrls.TryRemove(key, out _);
+            throw new ContentChangedException(current, length, otherVersion: true);
+        }
+        if (downloadUrls.Count > 256)
+        {
+            foreach (var old in downloadUrls.Where(d => DateTimeOffset.UtcNow - d.Value.At >= DownloadUrlReuse).Select(d => d.Key).ToList())
+            {
+                downloadUrls.TryRemove(old, out _);
+            }
+        }
+        downloadUrls[key] = (url, current, DateTimeOffset.UtcNow);
+        return await DownloadAsync(url, current, offset, length, ct);
+    }
+
+    async Task<(string Url, DriveItemInfo Item)> DownloadUrlAsync(string driveId, string itemId, CancellationToken ct)
+    {
+        while (true)
+        {
+            var selected = !selectDropsDownloadUrl;
+            using var doc = (await client.GetJsonAsync(new Uri($"{DriveUrl(driveId)}/items/{itemId}{(selected ? $"?$select={DownloadSelect}" : "")}"), ct))!;
+            if (Str(doc.RootElement, "@microsoft.graph.downloadUrl") is { } url)
+            {
+                return (url, Parse(doc.RootElement) ?? throw new IOException($"Item {itemId} is no file"));
+            }
+            if (!selected)
+            {
+                throw new IOException($"No download URL for item {itemId}");
+            }
+            selectDropsDownloadUrl = true;
+        }
+    }
+
+    async Task<Stream> DownloadAsync(string url, DriveItemInfo current, long offset, long length, CancellationToken ct)
+    {
         (Stream Content, long? Total) download;
         try
         {
@@ -237,7 +299,8 @@ public sealed partial class DriveApi(M365Client client) : IDriveApi
             Time(fileSystem, "createdDateTime") ?? Time(item, "createdDateTime") ?? DateTimeOffset.UnixEpoch,
             Time(fileSystem, "lastModifiedDateTime") ?? Time(item, "lastModifiedDateTime") ?? DateTimeOffset.UnixEpoch,
             Str(item, "eTag"),
-            Str(item, "cTag"));
+            Str(item, "cTag"),
+            item.TryGetProperty("parentReference", out var parent) ? Str(parent, "id") : null);
     }
 
     static string? Str(JsonElement element, string name) =>

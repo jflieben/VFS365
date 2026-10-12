@@ -54,6 +54,26 @@ public sealed class AgentLogTests : IDisposable
     }
 
     [Fact]
+    public void Writers_in_several_processes_never_overwrite_each_other()
+    {
+        // The supervisor, the agent and an agent being replaced each have their own handle on agent.log
+        using (var supervisor = AgentLog.Open(folder, true, 1 << 20, () => now))
+        using (var agent = AgentLog.Open(folder, false, 1 << 20, () => now))
+        {
+            for (var i = 0; i < 50; i++)
+            {
+                supervisor.WriteLine($"supervisor {i}");
+                agent.WriteLine($"agent {i} {new string('x', i)}");
+            }
+        }
+
+        var lines = File.ReadAllLines(Current);
+        Assert.Equal(100, lines.Length);
+        Assert.Equal(Enumerable.Range(0, 50).Select(i => $"supervisor {i}"), lines.Where(l => l.StartsWith("supervisor", StringComparison.Ordinal)));
+        Assert.Equal("agent 49 " + new string('x', 49), lines[^1]);
+    }
+
+    [Fact]
     public void Logs_older_than_a_week_go()
     {
         var logs = Directory.CreateDirectory(Path.Combine(folder, "logs")).FullName;

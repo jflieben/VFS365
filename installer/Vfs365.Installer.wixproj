@@ -11,10 +11,20 @@
     <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
     <!-- The setup project in bundle\ leaves .wxl files in its obj folder; they must not be globbed into the MSI -->
     <DefaultItemExcludes>$(DefaultItemExcludes);bundle\**</DefaultItemExcludes>
+    <!-- These expect Start menu shortcuts in the user's profile with an HKCU key path; this per-machine package uses the all-users one -->
+    <SuppressIces>ICE38;ICE43;ICE57</SuppressIces>
   </PropertyGroup>
 
   <ItemGroup>
     <Compile Include="Package.wxs" />
   </ItemGroup>
+
+  <!-- Signing: build.ps1 passes SignOutput=true when signing is configured and signs through its sign task. The cab is embedded. -->
+  <PropertyGroup>
+    <SignOutputCabs>false</SignOutputCabs>
+  </PropertyGroup>
+  <Target Name="SignMsi">
+    <Exec Command="pwsh -NoProfile -File &quot;$(MSBuildThisFileDirectory)..\build.ps1&quot; sign &quot;%(SignMsi.FullPath)&quot;" />
+  </Target>
 
 </Project>

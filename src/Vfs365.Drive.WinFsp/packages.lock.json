@@ -1,0 +1,38 @@
+{
+  "version": 2,
+  "dependencies": {
+    "net10.0-windows7.0": {
+      "winfsp.net": {
+        "type": "Direct",
+        "requested": "[2.1.25156, )",
+        "resolved": "2.1.25156",
+        "contentHash": "i944/pi3wGPYabJ+42J2+txFchgJAHEoH6c9LgTkekCU/fKxUvdDEpxoGFE513X87pcSOPsEnU4BUOdsTHUttA==",
+        "dependencies": {
+          "System.IO.FileSystem.AccessControl": "5.0.0"
+        }
+      },
+      "System.IO.FileSystem.AccessControl": {
+        "type": "Transitive",
+        "resolved": "5.0.0",
+        "contentHash": "SxHB3nuNrpptVk+vZ/F+7OHEpoHUIKKMl02bUmYHQr1r+glbZQxs7pRtsf4ENO29TVm2TH3AEeep2fJcy92oYw=="
+      },
+      "vfs365.core": {
+        "type": "Project"
+      }
+    },
+    "net10.0-windows7.0/win-arm64": {
+      "System.IO.FileSystem.AccessControl": {
+        "type": "Transitive",
+        "resolved": "5.0.0",
+        "contentHash": "SxHB3nuNrpptVk+vZ/F+7OHEpoHUIKKMl02bUmYHQr1r+glbZQxs7pRtsf4ENO29TVm2TH3AEeep2fJcy92oYw=="
+      }
+    },
+    "net10.0-windows7.0/win-x64": {
+      "System.IO.FileSystem.AccessControl": {
+        "type": "Transitive",
+        "resolved": "5.0.0",
+        "contentHash": "SxHB3nuNrpptVk+vZ/F+7OHEpoHUIKKMl02bUmYHQr1r+glbZQxs7pRtsf4ENO29TVm2TH3AEeep2fJcy92oYw=="
+      }
+    }
+  }
+}

@@ -2,7 +2,7 @@
 // address bar, file dialogs and Run. WinFsp's own provider doesn't implement NPGetResourceInformation, which the shell
 // needs for that. File I/O doesn't pass through here: it goes through WinFsp's redirector.
 // MPR loads this DLL into every process that resolves network names, so anything not \\VFS365 is declined at once.
-// Built with Zig (zig cc) by build.ps1, without a C runtime: kernel32 only.
+// Built with Zig (zig cc) by build.ps1, without a C runtime: kernel32 and advapi32 only.
 
 #include <windows.h>
 #include <winnetwk.h>
@@ -44,6 +44,32 @@ static BOOL IsOurs(LPCWSTR name, int length)
     return length >= SERVER_LENGTH &&
         CompareStringOrdinal(name, SERVER_LENGTH, Server, SERVER_LENGTH, TRUE) == CSTR_EQUAL &&
         (length == SERVER_LENGTH || name[SERVER_LENGTH] == L'\\');
+}
+
+// True when the user the calling thread runs as (impersonated or not) owns the volume root. UNC prefixes are machine-wide, so
+// another user could mount \\VFS365\<share> before its user's agent does; that volume is not vouched for.
+static BOOL OwnedByCaller(LPCWSTR root)
+{
+    // Self-relative descriptor with only the owner, and TOKEN_USER: each at most a header plus one SID
+    ULONGLONG descriptor[(SECURITY_DESCRIPTOR_MIN_LENGTH + SECURITY_MAX_SID_SIZE) / sizeof(ULONGLONG) + 1];
+    ULONGLONG user[(sizeof(TOKEN_USER) + SECURITY_MAX_SID_SIZE) / sizeof(ULONGLONG) + 1];
+    DWORD length = 0;
+    if (!GetFileSecurityW(root, OWNER_SECURITY_INFORMATION, (PSECURITY_DESCRIPTOR)descriptor, sizeof(descriptor), &length))
+        return FALSE;
+    PSID owner = NULL;
+    BOOL defaulted = FALSE;
+    if (!GetSecurityDescriptorOwner((PSECURITY_DESCRIPTOR)descriptor, &owner, &defaulted) || !owner || !IsValidSid(owner))
+        return FALSE;
+
+    HANDLE token = NULL;
+    if (!OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, TRUE, &token))
+    {
+        if (GetLastError() != ERROR_NO_TOKEN || !OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token))
+            return FALSE;
+    }
+    BOOL ok = GetTokenInformation(token, TokenUser, user, sizeof(user), &length);
+    CloseHandle(token);
+    return ok && EqualSid(((TOKEN_USER *)user)->User.Sid, owner);
 }
 
 // A NETRESOURCEW followed by its strings. remote may be null (the network itself); system is the path below a share.
@@ -124,7 +150,7 @@ EXPORT DWORD WINAPI NPGetResourceInformation(LPNETRESOURCEW resource, LPVOID buf
         return Fill(buffer, size, Server, SERVER_LENGTH, RESOURCEDISPLAYTYPE_SERVER, RESOURCEUSAGE_CONTAINER, RESOURCETYPE_ANY,
             NULL, 0, system);
 
-    // The volume's root answers through WinFsp only while it is mounted and the caller may open it
+    // The volume's root answers through WinFsp only while it is mounted and the caller may open it; it must be the caller's own
     WCHAR root[MAX_PATH];
     if (shareEnd + 2 > MAX_PATH)
         return WN_BAD_NETNAME;
@@ -132,7 +158,7 @@ EXPORT DWORD WINAPI NPGetResourceInformation(LPNETRESOURCEW resource, LPVOID buf
     root[shareEnd] = L'\\';
     root[shareEnd + 1] = L'\0';
     DWORD attributes = GetFileAttributesW(root);
-    if (attributes == INVALID_FILE_ATTRIBUTES || !(attributes & FILE_ATTRIBUTE_DIRECTORY))
+    if (attributes == INVALID_FILE_ATTRIBUTES || !(attributes & FILE_ATTRIBUTE_DIRECTORY) || !OwnedByCaller(root))
         return WN_BAD_NETNAME;
 
     BOOL below = shareEnd + 1 < length;

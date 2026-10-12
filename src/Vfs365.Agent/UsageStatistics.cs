@@ -5,11 +5,14 @@ using Vfs365.Graph;
 namespace Vfs365.Agent;
 
 /// <summary>
-/// Usage per local day for monitoring, kept in %LOCALAPPDATA%\VFS365\statistics.json until the day is over and sent, so stops and
-/// sign-outs lose nothing. Days older than a week are dropped unsent.
+/// Usage per local day for monitoring, kept in %LOCALAPPDATA%\VFS365\statistics.json until the day is over and sent, so stops,
+/// sign-outs and failed sends lose nothing. Days older than a week are dropped unsent. Thread-safe.
 /// </summary>
 public sealed class UsageStatistics(string filePath)
 {
+    /// <summary>Folds come every minute; a longer gap is sleep or hibernation and counts as this much running time at most.</summary>
+    public static readonly TimeSpan MaxFoldGap = TimeSpan.FromMinutes(3);
+
     public sealed class Day
     {
         public long GraphRequests { get; set; }
@@ -27,6 +30,7 @@ public sealed class UsageStatistics(string filePath)
     }
 
     readonly string filePath = filePath;
+    readonly Lock gate = new(), saving = new();
     Dictionary<string, Day> days = new(StringComparer.Ordinal);
     ClientUsage seen;
     int seenErrors;
@@ -34,7 +38,16 @@ public sealed class UsageStatistics(string filePath)
 
     public static string DefaultPath => Path.Combine(DiscoveryStore.DataDirectory, "statistics.json");
 
-    public IReadOnlyDictionary<string, Day> Days => days;
+    public IReadOnlyDictionary<string, Day> Days
+    {
+        get
+        {
+            lock (gate)
+            {
+                return new Dictionary<string, Day>(days, StringComparer.Ordinal);
+            }
+        }
+    }
 
     public static UsageStatistics Load(string? path = null)
     {
@@ -57,35 +70,77 @@ public sealed class UsageStatistics(string filePath)
     /// <summary>Adds what the client and the error count did since the last call to the day of <paramref name="localNow"/>.</summary>
     public void Fold(ClientUsage usage, int errors, DateTime localNow)
     {
-        var delta = usage.Since(seen);
-        var day = days.TryGetValue(DayOf(localNow), out var known) ? known : days[DayOf(localNow)] = new Day();
-        day.GraphRequests += delta.GraphRequests;
-        day.SharePointRequests += delta.SharePointRequests;
-        day.ResourceUnits += delta.ResourceUnits;
-        day.BytesReceived += delta.BytesReceived;
-        day.BytesSent += delta.BytesSent;
-        day.Throttled += delta.Throttled;
-        day.ThrottledSeconds += delta.ThrottledSeconds;
-        day.BudgetWaitForegroundSeconds += delta.BudgetWaitForegroundSeconds;
-        day.BudgetWaitBackgroundSeconds += delta.BudgetWaitBackgroundSeconds;
-        day.BudgetWaitSeconds += delta.BudgetWaitForegroundSeconds + delta.BudgetWaitBackgroundSeconds;
-        day.Errors += errors - seenErrors;
-        if (lastFold is { } last)
+        lock (gate)
         {
-            day.MinutesRunning += Math.Max(0, (localNow - last).TotalMinutes);
-        }
-        (seen, seenErrors, lastFold) = (usage, errors, localNow);
-        foreach (var old in days.Keys.Where(d => string.CompareOrdinal(d, DayOf(localNow.AddDays(-7))) < 0).ToList())
-        {
-            days.Remove(old);
+            var delta = usage.Since(seen);
+            var day = days.TryGetValue(DayOf(localNow), out var known) ? known : days[DayOf(localNow)] = new Day();
+            day.GraphRequests += delta.GraphRequests;
+            day.SharePointRequests += delta.SharePointRequests;
+            day.ResourceUnits += delta.ResourceUnits;
+            day.BytesReceived += delta.BytesReceived;
+            day.BytesSent += delta.BytesSent;
+            day.Throttled += delta.Throttled;
+            day.ThrottledSeconds += delta.ThrottledSeconds;
+            day.BudgetWaitForegroundSeconds += delta.BudgetWaitForegroundSeconds;
+            day.BudgetWaitBackgroundSeconds += delta.BudgetWaitBackgroundSeconds;
+            day.BudgetWaitSeconds += delta.BudgetWaitForegroundSeconds + delta.BudgetWaitBackgroundSeconds;
+            day.Errors += errors - seenErrors;
+            if (lastFold is { } last)
+            {
+                day.MinutesRunning += Math.Clamp((localNow - last).TotalMinutes, 0, MaxFoldGap.TotalMinutes);
+            }
+            (seen, seenErrors, lastFold) = (usage, errors, localNow);
+            foreach (var old in days.Keys.Where(d => string.CompareOrdinal(d, DayOf(localNow.AddDays(-7))) < 0).ToList())
+            {
+                days.Remove(old);
+            }
         }
     }
 
     /// <summary>Days before the day of <paramref name="localNow"/>, ready to send.</summary>
-    public IReadOnlyList<string> Completed(DateTime localNow) =>
-        days.Keys.Where(d => string.CompareOrdinal(d, DayOf(localNow)) < 0).Order(StringComparer.Ordinal).ToList();
+    public IReadOnlyList<string> Completed(DateTime localNow)
+    {
+        lock (gate)
+        {
+            return days.Keys.Where(d => string.CompareOrdinal(d, DayOf(localNow)) < 0).Order(StringComparer.Ordinal).ToList();
+        }
+    }
 
-    public void Remove(string day) => days.Remove(day);
+    public void Remove(string day)
+    {
+        lock (gate)
+        {
+            days.Remove(day);
+        }
+    }
+
+    /// <summary>Sends the finished days; a day goes only when <paramref name="send"/> says it arrived. Returns how many did not.</summary>
+    public async Task<int> SendCompletedAsync(DateTime localNow, Func<string, Day, Task<bool>> send)
+    {
+        var failed = 0;
+        foreach (var day in Completed(localNow))
+        {
+            Day? usage;
+            lock (gate)
+            {
+                usage = days.GetValueOrDefault(day);
+            }
+            if (usage is null)
+            {
+                continue;
+            }
+            if (await send(day, usage))
+            {
+                Remove(day);
+            }
+            else
+            {
+                failed++;
+            }
+        }
+        Save();
+        return failed;
+    }
 
     public static IEnumerable<(string Name, object? Value)> Values(string day, Day usage) =>
     [
@@ -100,9 +155,17 @@ public sealed class UsageStatistics(string filePath)
     {
         try
         {
-            Directory.CreateDirectory(Path.GetDirectoryName(filePath)!);
-            File.WriteAllText(filePath + ".tmp", JsonSerializer.Serialize(days));
-            File.Move(filePath + ".tmp", filePath, overwrite: true);
+            string json;
+            lock (gate)
+            {
+                json = JsonSerializer.Serialize(days);
+            }
+            lock (saving)
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(filePath)!);
+                File.WriteAllText(filePath + ".tmp", json);
+                File.Move(filePath + ".tmp", filePath, overwrite: true);
+            }
         }
         catch (Exception e) when (e is IOException or UnauthorizedAccessException)
         {

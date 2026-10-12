@@ -14,7 +14,7 @@ Status: early releases, in use at the first organisations. Downloads: [Releases]
 - Libraries are discovered per user with SharePoint Search (M365AutoLink's method) and listed when opened; nothing is mirrored up front, so library size doesn't matter.
 - Reads stream; saves upload into the existing item, keeping version history and sharing links; large copies upload while they are written. Copies of many small files run at disk speed: new files upload right after they are closed, four at a time, and copies out of the drive download the next small files ahead.
 - Starts from the last session's libraries and folders, so the drive is there at logon; a change feed per library in use (delta plus push) brings in changes made elsewhere. Big folders show what has arrived while the rest loads.
-- File copies are cached encrypted per user, size-limited, and wiped on sign-out, account change or Intune unenrollment. A tray icon reports conflicts and waiting uploads.
+- File copies are cached encrypted per user, size-limited, and wiped by `vfs365 signout`, on an account change or at Intune unenrollment. A tray icon (English or Dutch) reports conflicts, waiting uploads with their cause, and sign-in problems, and offers Sign in; the drive never asks for a sign-in by itself once it runs.
 
 ## Limits no design removes
 

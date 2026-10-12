@@ -13,6 +13,13 @@
     np: compiles the network provider (src\Vfs365.Np) for x64, ARM64 and x86 into artifacts\np\. Uses Zig from $env:VFS365_ZIG, else a
     pinned portable copy in %LOCALAPPDATA%\zig-portable, downloaded and checked on first use. release does this too.
 
+    sign <files>: Authenticode-signs files in place with Azure Artifact Signing (Trusted Signing) when $env:VFS365_SIGN_DLIB (path to
+    Azure.CodeSigning.Dlib.dll from the Microsoft.ArtifactSigning.Client package) and $env:VFS365_SIGN_METADATA (its metadata.json:
+    Endpoint, CodeSigningAccountName, CertificateProfileName) are set; otherwise does nothing. Uses the newest Windows SDK signtool, or
+    $env:VFS365_SIGNTOOL. With them set, release signs vfs365np.dll, VFS365's own exes and DLLs, the MSIs and the setups.
+
+    -NoTest skips the tests in release (CI runs them in a job of their own).
+
     .EXAMPLE
     ./build.ps1 test
     ./build.ps1 run discover --drives
@@ -20,11 +27,30 @@
     ./build.ps1 release
 #>
 param(
-    [ValidateSet('build','test','run','np','bump','release')][String]$Task = 'test',
-    [Switch]$Release
+    [ValidateSet('build','test','run','np','bump','release','sign')][String]$Task = 'test',
+    [Switch]$Release,
+    [Switch]$NoTest
 )
 $ErrorActionPreference = 'Stop'
 $configuration = if($Release){ 'Release' }else{ 'Debug' }
+
+$signing = [Bool]($env:VFS365_SIGN_DLIB -and $env:VFS365_SIGN_METADATA)
+function Invoke-Sign([String[]]$files){
+    if(-not $signing -or -not $files){ return }
+    $signtool = if($env:VFS365_SIGNTOOL){ $env:VFS365_SIGNTOOL }else{
+        Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" -ErrorAction SilentlyContinue |
+            Sort-Object { [Version]$_.Directory.Parent.Name } -Descending | Select-Object -First 1 -ExpandProperty FullName
+    }
+    if(-not $signtool){ Throw "signtool.exe not found: install the Windows SDK or set VFS365_SIGNTOOL" }
+    & $signtool sign /v /fd SHA256 /tr 'http://timestamp.acs.microsoft.com' /td SHA256 /dlib $env:VFS365_SIGN_DLIB /dmdf $env:VFS365_SIGN_METADATA @files | Out-Host
+    if($LASTEXITCODE -ne 0){ Throw "signtool failed ($LASTEXITCODE)" }
+}
+
+#Called by the WiX projects for the MSI and the setup (SignOutput=true)
+if($Task -eq 'sign'){
+    Invoke-Sign $args
+    Exit 0
+}
 
 $candidates = @()
 if($env:VFS365_DOTNET){ $candidates += $env:VFS365_DOTNET }
@@ -77,7 +103,7 @@ function Get-Zig(){
     return $exe
 }
 
-#vfs365np.dll for x64, arm64 or x86 in artifacts\np\<arch>\: kernel32 only, exports named by vfs365np.def
+#vfs365np.dll for x64, arm64 or x86 in artifacts\np\<arch>\: kernel32 and advapi32 only, exports named by vfs365np.def
 function Build-NetworkProvider([String]$zigExe, [String]$arch){
     $target = @{ x64 = 'x86_64-windows-gnu'; arm64 = 'aarch64-windows-gnu'; x86 = 'x86-windows-gnu' }[$arch]
     $entry = if($arch -eq 'x86'){ 'DllMain@12' }else{ 'DllMain' }
@@ -86,7 +112,7 @@ function Build-NetworkProvider([String]$zigExe, [String]$arch){
     New-Item -ItemType Directory -Force -Path (Split-Path $dll) | Out-Null
     & $zigExe cc -target $target -shared -O2 -nostdlib -Wall -Wextra -Werror `
         -isystem (Join-Path (Split-Path $zigExe) 'lib\libc\include\any-windows-any') `
-        -o $dll (Join-Path $source 'vfs365np.c') (Join-Path $source 'vfs365np.def') -lkernel32 "-Wl,--entry=$entry" | Out-Host
+        -o $dll (Join-Path $source 'vfs365np.c') (Join-Path $source 'vfs365np.def') -lkernel32 -ladvapi32 "-Wl,--entry=$entry" | Out-Host
     if($LASTEXITCODE -ne 0){ Throw "zig cc for $arch failed ($LASTEXITCODE)" }
     return $dll
 }
@@ -130,8 +156,9 @@ if($Task -eq 'release'){
     New-Item -ItemType Directory -Force -Path (Join-Path $PSScriptRoot 'artifacts') | Out-Null
     Set-Content -LiteralPath (Join-Path $PSScriptRoot 'artifacts\release-notes.md') -Value $notes.Trim() -Encoding utf8
 
-    Write-Host "Releasing $version"
-    Invoke-Dotnet @('test', (Join-Path $PSScriptRoot 'Vfs365.slnx'), '-c', 'Release', '--nologo', '-v', 'q')
+    Write-Host "Releasing $version$(if($signing){ ', signed' })"
+    if(-not $NoTest){ Invoke-Dotnet @('test', (Join-Path $PSScriptRoot 'Vfs365.slnx'), '-c', 'Release', '--nologo', '-v', 'q') }
+    $signOutput = "-p:SignOutput=$($signing.ToString().ToLower())"
 
     $winFspMsi = Join-Path $PSScriptRoot "artifacts\winfsp\$($winFsp.Name)"
     if(-not (Test-Path -LiteralPath $winFspMsi)){
@@ -145,12 +172,14 @@ if($Task -eq 'release'){
 
     $zigExe = Get-Zig
     $npX86 = Build-NetworkProvider $zigExe 'x86'
+    Invoke-Sign $npX86
 
     $output = Join-Path $PSScriptRoot "release\$version"
     if(Test-Path -LiteralPath $output){ Remove-Item -LiteralPath $output -Recurse -Force }
     New-Item -ItemType Directory -Path $output | Out-Null
     foreach($arch in 'x64', 'arm64'){
         $np = Build-NetworkProvider $zigExe $arch
+        Invoke-Sign $np
         $publish = Join-Path $PSScriptRoot "artifacts\publish\win-$arch"
         $msiFolder = Join-Path $PSScriptRoot "artifacts\installer\$arch"
         $bundleFolder = Join-Path $PSScriptRoot "artifacts\bundle\$arch"
@@ -160,11 +189,13 @@ if($Task -eq 'release'){
         foreach($project in 'src\Vfs365.Cli\Vfs365.Cli.csproj', 'src\Vfs365.Background\Vfs365.Background.csproj'){
             Invoke-Dotnet @('publish', (Join-Path $PSScriptRoot $project), '-c', 'Release', '-r', "win-$arch", '--self-contained', "-p:Version=$version", '-o', $publish, '--nologo', '-v', 'q')
         }
+        #Only VFS365's own binaries; the .NET runtime files carry Microsoft's signatures
+        Invoke-Sign @(Get-ChildItem -LiteralPath $publish -File | Where-Object Name -match '^vfs365.*\.(exe|dll)$' | ForEach-Object FullName)
         foreach($file in 'LICENSE', 'THIRD-PARTY-NOTICES.md'){ Copy-Item -LiteralPath (Join-Path $PSScriptRoot $file) -Destination $publish }
-        Invoke-Dotnet @('build', (Join-Path $PSScriptRoot 'installer\Vfs365.Installer.wixproj'), '-c', 'Release', "-p:Platform=$arch", "-p:Version=$version", "-p:PublishDir=$publish", "-p:NpDll=$np", "-p:NpDllX86=$npX86", '-o', $msiFolder, '--nologo', '-v', 'q')
+        Invoke-Dotnet @('build', (Join-Path $PSScriptRoot 'installer\Vfs365.Installer.wixproj'), '-c', 'Release', "-p:Platform=$arch", "-p:Version=$version", "-p:PublishDir=$publish", "-p:NpDll=$np", "-p:NpDllX86=$npX86", $signOutput, '-o', $msiFolder, '--nologo', '-v', 'q')
         $msi = Get-ChildItem -LiteralPath $msiFolder -Filter '*.msi' -Recurse | Select-Object -First 1
         Copy-Item -LiteralPath $msi.FullName -Destination (Join-Path $output "VFS365-$version-$arch.msi")
-        Invoke-Dotnet @('build', (Join-Path $PSScriptRoot 'installer\bundle\Vfs365.Bundle.wixproj'), '-c', 'Release', "-p:Platform=$arch", "-p:Version=$version", "-p:VfsMsi=$($msi.FullName)", "-p:WinFspMsi=$winFspMsi", '-o', $bundleFolder, '--nologo', '-v', 'q')
+        Invoke-Dotnet @('build', (Join-Path $PSScriptRoot 'installer\bundle\Vfs365.Bundle.wixproj'), '-c', 'Release', "-p:Platform=$arch", "-p:Version=$version", "-p:VfsMsi=$($msi.FullName)", "-p:WinFspMsi=$winFspMsi", $signOutput, '-o', $bundleFolder, '--nologo', '-v', 'q')
         $setup = Get-ChildItem -LiteralPath $bundleFolder -Filter '*.exe' -Recurse | Select-Object -First 1
         Copy-Item -LiteralPath $setup.FullName -Destination (Join-Path $output "VFS365-$version-$arch-setup.exe")
     }

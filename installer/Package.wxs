@@ -5,6 +5,7 @@
     Also installs the network provider vfs365np.dll (System32 and SysWOW64) so typed \\VFS365 paths work in Explorer.
     Removal runs vfs365.exe machine-stop as SYSTEM before files go: agents stop cleanly (Explorer entry removed, pending changes
     uploaded), and on a real uninstall (not an upgrade) per-user caches and Explorer entries are removed; unsaved changes are kept.
+    An install or upgrade ends with vfs365.exe machine-start, which starts the agent in every signed-in session without one.
     With the MonitoringUrl device policy set, installs, updates and uninstalls are reported (vfs365.exe machine-report).
   -->
   <Package Name="VFS365" Manufacturer="JSolve B.V." Version="$(Version)" UpgradeCode="{9E0B7C21-3F64-4D3A-8B65-2D9A6F0C3651}" Scope="perMachine" Compressed="yes">
@@ -22,6 +23,14 @@
     </Property>
     <Launch Condition="Installed OR WINFSPDIR" Message="VFS365 needs WinFsp. Use the VFS365 setup, which installs it, or install WinFsp first (https://winfsp.dev)." />
 
+<?if $(sys.BUILDARCH) = x64 ?>
+    <!-- Windows runs x64 packages on ARM64, but the network provider would then be the wrong kind for System32 -->
+    <Property Id="NATIVEARCH">
+      <RegistrySearch Root="HKLM" Key="SYSTEM\CurrentControlSet\Control\Session Manager\Environment" Name="PROCESSOR_ARCHITECTURE" Type="raw" Bitness="always64" />
+    </Property>
+    <Launch Condition="Installed OR NOT NATIVEARCH~=&quot;ARM64&quot;" Message="This is the x64 package of VFS365. On ARM64 devices, install the arm64 package (VFS365-$(Version)-arm64.msi or VFS365-$(Version)-arm64-setup.exe)." />
+<?endif?>
+
     <StandardDirectory Id="ProgramFiles6432Folder">
       <Directory Id="INSTALLFOLDER" Name="VFS365" />
     </StandardDirectory>
@@ -32,7 +41,17 @@
 
     <Component Id="AutoStart" Directory="INSTALLFOLDER" Guid="{4B7E2D19-8C53-4A06-9F1E-6D2C3A5B0365}">
       <RegistryValue Root="HKLM" Key="Software\Microsoft\Windows\CurrentVersion\Run" Name="VFS365" Type="string" Value="&quot;[INSTALLFOLDER]vfs365-agent.exe&quot;" />
+      <!-- An earlier uninstall's Active Setup cleanup of Explorer entries (MachineCleanup.ActiveSetupKey) must not run once reinstalled -->
+      <RemoveRegistryKey Root="HKLM" Key="SOFTWARE\Microsoft\Active Setup\Installed Components\{76103053-0966-49F3-9EE8-923401C976B1}" Action="removeOnInstall" />
     </Component>
+
+    <!-- Start menu: starts the agent again after it was stopped (it runs once per session) -->
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Component Id="StartMenuShortcut" Guid="{1A021878-FCF8-4899-B01F-1FBEE5AA4288}">
+        <Shortcut Id="AgentShortcut" Name="VFS365" Description="Start VFS365 (Microsoft 365 files as a drive)" Target="[INSTALLFOLDER]vfs365-agent.exe" WorkingDirectory="INSTALLFOLDER" Icon="vfs365.ico" />
+        <RegistryValue Root="HKLM" Key="Software\JSolve\VFS365" Name="StartMenuShortcut" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </StandardDirectory>
 
     <!-- Network provider: lets the shell resolve typed \\VFS365 paths. MPR loads System32's copy in native processes and
          SysWOW64's in 32-bit ones. machine-setup puts it in the provider order. -->
@@ -63,6 +82,8 @@
     <CustomAction Id="ReportInstall" Directory="INSTALLFOLDER" ExeCommand="&quot;[INSTALLFOLDER]vfs365.exe&quot; machine-report install" Execute="deferred" Impersonate="no" Return="ignore" />
     <CustomAction Id="ReportUpdate" Directory="INSTALLFOLDER" ExeCommand="&quot;[INSTALLFOLDER]vfs365.exe&quot; machine-report update" Execute="deferred" Impersonate="no" Return="ignore" />
     <CustomAction Id="ReportUninstall" Directory="INSTALLFOLDER" ExeCommand="&quot;[INSTALLFOLDER]vfs365.exe&quot; machine-report uninstall" Execute="deferred" Impersonate="no" Return="ignore" />
+    <!-- Last: starts the agent as the user in every signed-in session without one (an upgrade stopped them) -->
+    <CustomAction Id="StartAgents" Directory="INSTALLFOLDER" ExeCommand="&quot;[INSTALLFOLDER]vfs365.exe&quot; machine-start" Execute="deferred" Impersonate="no" Return="ignore" />
     <InstallExecuteSequence>
       <Custom Action="ReportUninstall" Before="StopAgentsAndCleanUp" Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
       <Custom Action="StopAgents" Before="RemoveFiles" Condition="REMOVE~=&quot;ALL&quot; AND UPGRADINGPRODUCTCODE" />
@@ -70,11 +91,13 @@
       <Custom Action="AddNetworkProvider" After="WriteRegistryValues" Condition="NOT REMOVE~=&quot;ALL&quot;" />
       <Custom Action="ReportInstall" After="AddNetworkProvider" Condition="NOT Installed AND NOT WIX_UPGRADE_DETECTED" />
       <Custom Action="ReportUpdate" After="ReportInstall" Condition="NOT Installed AND WIX_UPGRADE_DETECTED" />
+      <Custom Action="StartAgents" Before="InstallFinalize" Condition="NOT REMOVE~=&quot;ALL&quot;" />
     </InstallExecuteSequence>
 
     <Feature Id="Main">
       <ComponentGroupRef Id="AppFiles" />
       <ComponentRef Id="AutoStart" />
+      <ComponentRef Id="StartMenuShortcut" />
       <ComponentRef Id="NetworkProvider" />
       <ComponentRef Id="NetworkProvider32" />
     </Feature>

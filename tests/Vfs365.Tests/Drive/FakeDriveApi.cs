@@ -21,13 +21,18 @@ sealed class FakeDriveApi : IDriveApi
     public List<(string? ItemId, string Name, string? IfMatch, bool Whole)> Uploads { get; } = [];
     public Func<UploadTarget, Exception?>? FailUpload { get; set; }
 
+    /// <summary>Refuses deletes, by item ID (locked, no permission to delete).</summary>
+    public Func<string, Exception?>? FailDelete { get; set; }
+
     public DriveItemInfo Add(string path, bool folder = false, string content = "abc") => Add(path, folder ? [] : Encoding.UTF8.GetBytes(content), folder);
 
     public DriveItemInfo Add(string path, byte[] bytes, bool folder = false)
     {
         lock (nodes)
         {
-            var node = new Node(Item($"id-{path}", Name(path), folder, bytes.Length, $"e{++version}"), path, bytes);
+            // A new item where another was (moved away) gets its own ID
+            var id = nodes.ContainsKey($"id-{path}") ? $"id-{path}-{version + 1}" : $"id-{path}";
+            var node = new Node(Item(id, Name(path), folder, bytes.Length, $"e{++version}"), path, bytes);
             nodes[node.Item.Id] = node;
             Changed(node);
             return node.Item;
@@ -88,6 +93,9 @@ sealed class FakeDriveApi : IDriveApi
 
     readonly List<DriveChange> changes = [];
 
+    /// <summary>Changes per delta page; the rest follow by next links.</summary>
+    public int DeltaPageSize { get; set; } = int.MaxValue;
+
     /// <summary>Every delta call fails (503), so listings rely on their TTL.</summary>
     public bool DeltaUnavailable { get; set; }
 
@@ -128,9 +136,11 @@ sealed class FakeDriveApi : IDriveApi
         }
         lock (nodes)
         {
-
             var from = int.Parse(link["delta:".Length..]);
-            return Task.FromResult(new DeltaPage(changes.Skip(from).ToList(), null, $"delta:{changes.Count}"));
+            var page = changes.Skip(from).Take(DeltaPageSize).ToList();
+            return Task.FromResult(from + page.Count < changes.Count
+                ? new DeltaPage(page, $"delta:{from + page.Count}", null)
+                : new DeltaPage(page, null, $"delta:{changes.Count}"));
         }
     }
 
@@ -161,12 +171,14 @@ sealed class FakeDriveApi : IDriveApi
     }
 
     /// <summary>A change made elsewhere: new content for an existing file.</summary>
-    public void RemoteEdit(string path, string content)
+    public void RemoteEdit(string path, string content) => RemoteEdit(path, Encoding.UTF8.GetBytes(content));
+
+    public void RemoteEdit(string path, byte[] content)
     {
         lock (nodes)
         {
             var node = Find(path)!;
-            node.Content = Encoding.UTF8.GetBytes(content);
+            node.Content = content;
             node.Item = node.Item with { Size = node.Content.Length, ETag = $"e{++version}", CTag = $"c{version}" };
             Changed(node);
         }
@@ -189,7 +201,7 @@ sealed class FakeDriveApi : IDriveApi
     public Task<DriveItemInfo?> GetItemAsync(string driveId, string path, CancellationToken ct)
     {
         Interlocked.Increment(ref GetCalls);
-        return Task.FromResult(Find(path)?.Item);
+        return Task.FromResult(Find(path) is { } node ? node.Item with { ParentId = path.Length == 0 ? null : ParentIdOf(path) } : null);
     }
 
     /// <summary>Bytes the engine actually pulled from download streams.</summary>
@@ -204,20 +216,37 @@ sealed class FakeDriveApi : IDriveApi
     /// <summary>Downloads that fail after starting, like a dropped connection.</summary>
     public int FailDownloads;
 
-    public async Task<Stream> OpenReadAsync(string driveId, string itemId, long offset, long length, CancellationToken ct)
+    /// <summary>Held at the start of each download, to test what happens meanwhile.</summary>
+    public Func<Task>? BeforeDownload { get; set; }
+
+    public async Task<Stream> OpenReadAsync(string driveId, string itemId, string? contentTag, long offset, long length, CancellationToken ct)
     {
         Interlocked.Increment(ref Downloads);
         await Task.Delay(20, ct);
-        var node = nodes[itemId];
+        if (BeforeDownload is { } hold)
+        {
+            await hold();
+        }
+        Node node;
+        byte[] content;
+        lock (nodes)
+        {
+            node = nodes[itemId];
+            content = node.Content;
+        }
         if (Interlocked.Decrement(ref FailDownloads) >= 0)
         {
             throw new IOException("The response ended prematurely.");
         }
-        if (node.Content.Length != length)
+        if (contentTag is not null && contentTag != node.Item.CTag && contentTag != node.Item.ETag)
         {
-            throw new ContentChangedException(node.Item with { Size = node.Content.Length }, length);
+            throw new ContentChangedException(node.Item with { Size = content.Length }, length, otherVersion: true);
         }
-        return new CountingStream(new MemoryStream(node.Content, (int)offset, node.Content.Length - (int)offset), this);
+        if (content.Length != length)
+        {
+            throw new ContentChangedException(node.Item with { Size = content.Length }, length);
+        }
+        return new CountingStream(new MemoryStream(content, (int)offset, content.Length - (int)offset), this);
     }
 
     /// <summary>New content that the item's size and the change feed don't show (a change not seen yet, or SharePoint rewriting it).</summary>
@@ -328,7 +357,7 @@ sealed class FakeDriveApi : IDriveApi
         }
         if (target.ItemId is { } id)
         {
-            var node = nodes[id];
+            var node = nodes.GetValueOrDefault(id) ?? throw new RemoteException(RemoteError.NotFound, "404 itemNotFound");
             if (target.IfMatch is not null && target.IfMatch != node.Item.ETag)
             {
                 throw new RemoteException(RemoteError.Conflict, "412 eTag mismatch");
@@ -379,8 +408,12 @@ sealed class FakeDriveApi : IDriveApi
 
     public Task DeleteAsync(string driveId, string itemId, CancellationToken ct)
     {
+        if (FailDelete?.Invoke(itemId) is { } refused)
+        {
+            throw refused;
+        }
         Interlocked.Increment(ref Deletes);
-        var node = nodes[itemId];
+        var node = nodes.GetValueOrDefault(itemId) ?? throw new RemoteException(RemoteError.NotFound, "404 itemNotFound");
         foreach (var key in nodes.Where(n => n.Value == node || n.Value.Path.StartsWith(node.Path + "/", StringComparison.OrdinalIgnoreCase)).Select(n => n.Key).ToList())
         {
             Changed(nodes[key], deleted: true);

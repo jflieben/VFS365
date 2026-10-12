@@ -153,8 +153,10 @@ public sealed partial class DriveEngine
         }
     }
 
+    /// <summary>The staged content an entry refers to while it is staged: the one it is bound to, else the one at its path.</summary>
     PendingFile? PendingOf(FsEntry file) =>
-        file.DriveId is not null ? overlay.GetValueOrDefault(Key(file.DriveId, file.DrivePath)) as PendingFile : null;
+        bindings.TryGetValue(file, out var bound) ? (bound.IsLive ? bound : null)
+        : file.DriveId is not null ? overlay.GetValueOrDefault(Key(file.DriveId, file.DrivePath)) as PendingFile : null;
 
     static UploadTarget TargetOf(PendingFile pending) =>
         pending.Base is { } baseItem ? UploadTarget.Existing(baseItem) : UploadTarget.New(ParentOf(pending.DrivePath), pending.Name);

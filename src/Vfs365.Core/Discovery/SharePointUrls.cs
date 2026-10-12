@@ -12,6 +12,14 @@ public static class SharePointUrls
         return $"{uri.Scheme}://{host}";
     }
 
+    /// <summary>The OneDrive host of a tenant root: https://contoso.sharepoint.com becomes https://contoso-my.sharepoint.com.</summary>
+    public static string OneDriveRoot(string tenantRoot)
+    {
+        var uri = new Uri(tenantRoot);
+        var dot = uri.Host.IndexOf('.');
+        return dot < 0 ? $"{uri.Scheme}://{uri.Host}" : $"{uri.Scheme}://{uri.Host[..dot]}-my{uri.Host[dot..]}";
+    }
+
     /// <summary>Web URL from a library path as search returns it: drops /Forms/*.aspx and the library folder.</summary>
     public static string? WebUrlFromListPath(string? listPath)
     {

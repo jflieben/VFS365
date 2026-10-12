@@ -1,11 +1,68 @@
 # Changelog
 
-## 0.3.2
+## 0.4.0 (unreleased)
+
+Result of a full review of the code (security, data safety, reliability, API use, user experience).
+
+Saving and data safety
+- A save that fails for any reason, sign-in problems included, is retried with back-off until it uploads; you are told once. Before, some failures (a file deleted in Microsoft 365 meanwhile, no access, sign-in needed) were never retried.
+- A file deleted in Microsoft 365 while you edited it is saved again under its own name, or as a conflict copy when the name is taken meanwhile. Conflict copies get unique names (seconds, and a number when needed).
+- A file that can't be deleted in Microsoft 365 (locked, or you may edit but not delete it) shows again with a notification. Before, it held up every other pending upload until the agent stopped.
+- A program that keeps a file open after a conflict copy keeps writing into the copy, never into the colleague's version; reads after a save show the saved content.
+- A file changed in Microsoft 365 while it was being read is no longer stored as a mix of two versions; the read fails once and opening it again gives the new version.
+- A folder renamed, moved or deleted elsewhere is noticed even when its parent folder was never opened, so saves and deletes can't land in the wrong folder. Changes made elsewhere while a large folder is being read are no longer missed.
+- Unsaved changes are flushed to disk before a close returns, and programs that flush a file get it written to disk. After a crash, files that had already uploaded are not uploaded again as conflict copies.
+- Saves and other changes are no longer repeated automatically after a server error, which could make false conflict copies.
+- Deleting a temp copy during a Word save can no longer delete the saved document.
+
+Security
+- Uninstall no longer follows links (junctions) in user profiles when it removes cached data as SYSTEM; links and folders owned by another account are skipped and named in the uninstall log. Before, a user could make the uninstall delete files elsewhere.
+- Multi-session hosts: other users' requests to someone's drive are refused before the drive looks anything up; VFS365 doesn't start, warns and reports when another user's drive holds `\\VFS365\<user>`, and typed `\\VFS365` paths only resolve to your own drive; other users can no longer block or stop someone's drive through its stop signal.
+- Sign-in tokens are only sent over https to Microsoft Graph and the tenant's own SharePoint addresses.
+- Cached content is encrypted and authenticated per block with a random key stream per file; a damaged cache file is downloaded again. The cache is emptied once after this update.
+- Releases carry build provenance attestations and can be code signed; build dependencies and GitHub Actions are pinned.
+
+The drive no longer disappears or hangs
+- VFS365 no longer opens a sign-in window by itself while it runs, and files no longer wait behind one. When a sign-in is needed the tray says so: click the notification or choose Sign in.
+- Without network or sign-in at the first start, VFS365 waits and tries again by itself, and the tray says what it waits for. Other start problems keep the tray icon with the cause, Retry and Show log.
+- A drive letter that is in use or not valid no longer stops the drive: it starts without a letter, and the tray says why. `M`, `m`, `M:` and `M:\` all work.
+- Restart from the tray waits for pending uploads, however long they take. A cancelled shutdown keeps the drive; while changes upload, Windows shows why VFS365 delays the shutdown.
+- Upgrades start VFS365 again right away for every signed-in user. New Start menu entry "VFS365" to start it again after it was closed.
+- Opening or saving a large file no longer holds up other files and folders on the drive.
+- Programs that read files in many places at once (databases, CAD, mail archives) no longer pause for 30 seconds or more. A download that failed is tried again by the next open.
+- Fixed a rare hang of the whole drive when opening an empty file while the cache was full.
+- The agent keeps memory in check when a backup or search tool walks a very large library, and the cache stays within `CacheSizeMB`.
+
+Fewer Microsoft 365 calls
+- Discovery reads all document libraries of a site with one request instead of one per library, and spreads the 48-hour re-checks over several days.
+- A library missing from one search run stays until it is missing twice in a row, so a hiccup in SharePoint Search no longer empties its cached files. Search pages through results in a stable order, no longer returns colleagues' OneDrive libraries, and covers every geo of a multi-geo tenant.
+- Libraries are discovered again daily while the PC stays signed in. Hidden libraries that are made visible again show up within two days. Pinned links that point to nothing are checked once every two days.
+- After Microsoft throttles, all background work (discovery, refreshes, change checks, loading ahead) waits `ThrottlePauseMinutes`; what you open and save goes on as soon as Microsoft allows. Waits vary a little per device and queued requests resume gradually, so a tenant's devices don't all come back at once.
+- Folders known from the last session are trusted for a day, change checks slow down while nothing changes, a library only glanced at in Explorer gets no change checks, push notifications are combined per library, opening many files of one folder lists the folder once, and downloads need one call less.
+
+Tray and notifications
+- Notifications are combined ("27 files are waiting to upload: offline") and give plain causes. New `NotifyUploads` policy mutes "Uploaded".
+- The tray shows offline and throttled states, has access keys, opens from the keyboard, opens one Explorer window per double-click, and shows when Refresh works again in the item itself. Refresh says when it failed, and a failed refresh doesn't use up the daily one.
+- The tray, its notifications and the Refresh hint are in Dutch on Dutch Windows.
+- OneDrive-only drives start without the network from the second start on.
+
+Monitoring and log
+- New `MonitoringDetail` policy: `NoPaths` keeps file and folder paths out of error reports.
+- Statistics that couldn't be sent are kept and sent later, and time asleep no longer counts as running. A device where VFS365 stopped restarting after repeated crashes reports it, and crash details are read correctly on non-English Windows. The dashboard warns about both and removes `#connect=` from the address bar.
+- The log no longer loses lines during a restart. It records sleep and resume, network changes, the signed-in account, and values outside their range. Policy changes are noticed and apply after Restart.
+- `vfs365 signout` waits until pending uploads finish before removing local data.
+
+Installer and policy
+- The x64 package refuses to install on ARM64 devices and points to the arm64 package.
+- Navigation pane entries of users who were signed out during an uninstall are removed at their next sign-in.
+- The `DriveLetter` policy template no longer suggests `M` (the default is `None`).
+
+## 0.3.2  (2026-10-09)
 
 - Sites by template: the new `IncludedSiteTemplates` and `ExcludedSiteTemplates` policies show or hide libraries by their site's template, for example only `GROUP` (team sites with a Microsoft 365 group, Teams) or everything but `TEAMCHANNEL` (private and shared channel sites). The template comes with the search results, so it costs no extra calls. `vfs365 discover` shows each library's template.
 - Fixed: excluding sites by policy now takes effect even when it hides more than 40% of the libraries. Before, discovery's safety check (nothing is hidden when the set shrinks that much, against search hiccups) kept them all visible.
 
-## 0.3.1
+## 0.3.1  (2026-10-08)
 
 - Downloads: a file that Microsoft 365 serves with another length than it lists (changed since the folder was listed, or an Office file SharePoint writes library properties into) no longer fails three times with "Unable to read beyond the end of the stream", and a longer one is no longer cut off without notice. The read fails once, the drive takes the length served, and opening the file again works; the log names the file.
 - Downloads that break off are tried again after 1 and 2 s. Only when all three attempts fail is the error logged, now with the file's path, and reported to monitoring.

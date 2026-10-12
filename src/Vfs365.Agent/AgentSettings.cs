@@ -6,9 +6,12 @@ namespace Vfs365.Agent;
 
 public sealed record Setting(string? Value, string? Source);
 
+public enum MonitoringDetail { Full, NoPaths }
+
 /// <summary>
-/// Agent settings. First match wins per setting: HKLM policy, HKCU policy, config file. The ADMX in policy\ writes the policy values.
-/// Lists are REG_MULTI_SZ in the registry and arrays in the config file.
+/// Agent settings. First match wins per setting: HKLM policy, HKCU policy, config file; lists are not merged (machine policy wins).
+/// The ADMX in policy\ writes the policy values. Lists are REG_MULTI_SZ in the registry and arrays in the config file. Each value is
+/// read once and kept: a running agent uses the settings it started with (ChangedFrom tells what changed since).
 /// </summary>
 public sealed class AgentSettings
 {
@@ -20,7 +23,17 @@ public sealed class AgentSettings
     /// <summary>JSolve's multi-tenant public client app; an admin consents to it once per tenant (docs/APP-REGISTRATION.md).</summary>
     public const string DefaultClientId = "08e570ea-9711-4dc6-b450-2e00fc550fca";
 
+    /// <summary>Every setting name, for change detection.</summary>
+    public static readonly IReadOnlyList<string> Names =
+    [
+        "ClientId", "TenantId", "DriveLetter", "Label", "Scope", "IncludedSites", "ExcludedSites", "IncludedSiteTemplates", "ExcludedSiteTemplates",
+        "PinnedLocations", "NavigationPane", "CacheSizeMB", "TrayIcon", "NotifyUploads", "HelpUrl", "ChangeCheckSeconds", "ApiBudgetPerMinute",
+        "ThrottlePauseMinutes", "WalkPrefetchFolders", "ReadAheadFiles", "BackgroundUploads", "RepeatSaveSeconds", "DatabaseFiles", "MonitoringUrl",
+        "MonitoringDetail",
+    ];
+
     readonly List<(string Source, Func<string, object?> Read)> sources = [];
+    readonly Dictionary<string, (object? Value, string? Source)> read = new(StringComparer.OrdinalIgnoreCase);
 
     AgentSettings()
     {
@@ -67,6 +80,9 @@ public sealed class AgentSettings
     /// <summary>Tray icon with status and notifications (conflict copies, sign-in problems, unsaved changes).</summary>
     public bool TrayIcon => Bool("TrayIcon") ?? true;
 
+    /// <summary>"Uploaded" notifications for files that had to wait; conflict copies and waiting uploads always notify.</summary>
+    public bool NotifyUploads => Bool("NotifyUploads") ?? true;
+
     public const int DefaultChangeCheckSeconds = 20;
 
     /// <summary>How often a library used in the last 2 minutes is checked for changes on top of push; 0 leaves it to push (5 to 300).</summary>
@@ -79,7 +95,7 @@ public sealed class AgentSettings
 
     public const int DefaultThrottlePauseMinutes = 15;
 
-    /// <summary>After Microsoft throttles, background work (loading ahead, frequent change checks) stops this long (0 to 240).</summary>
+    /// <summary>After Microsoft throttles, background work (loading ahead, change checks, discovery) waits this long (0 to 240).</summary>
     public int ThrottlePauseMinutes => Number("ThrottlePauseMinutes") is { } minutes ? Math.Clamp(minutes, 0, 240) : DefaultThrottlePauseMinutes;
 
     public const int DefaultWalkPrefetchFolders = 10;
@@ -102,6 +118,10 @@ public sealed class AgentSettings
 
     /// <summary>Table service SAS URL for reports (errors, daily statistics, installs); empty: no reporting.</summary>
     public string? MonitoringUrl => Text("MonitoringUrl").Value;
+
+    /// <summary>Full (default) or NoPaths: error rows carry a short hash instead of file and folder paths, and URLs only their host.</summary>
+    public MonitoringDetail MonitoringDetail =>
+        Enum.TryParse<MonitoringDetail>(Text("MonitoringDetail").Value, ignoreCase: true, out var detail) ? detail : MonitoringDetail.Full;
 
     /// <summary>Multi-user database files (Access, QuickBooks, SQLite): Allow, ReadOnly or Block.</summary>
     public DatabaseFilePolicy DatabaseFiles =>
@@ -145,6 +165,7 @@ public sealed class AgentSettings
             ("NavigationPane", OnOff(NavigationPane), From("NavigationPane")),
             ("CacheSizeMB", CacheSizeMB.ToString(), From("CacheSizeMB")),
             ("TrayIcon", OnOff(TrayIcon), From("TrayIcon")),
+            ("NotifyUploads", OnOff(NotifyUploads), From("NotifyUploads")),
             ("HelpUrl", HelpUrl, From("HelpUrl")),
             ("ChangeCheckSeconds", ChangeCheckSeconds == 0 ? "0 (push only)" : ChangeCheckSeconds.ToString(), From("ChangeCheckSeconds")),
             ("ApiBudgetPerMinute", ApiBudgetPerMinute == 0 ? "0 (no limit of its own)" : ApiBudgetPerMinute.ToString(), From("ApiBudgetPerMinute")),
@@ -157,8 +178,37 @@ public sealed class AgentSettings
             ("MonitoringUrl", monitoring is not null
                 ? $"{monitoring.Account}{(monitoring.Expires is { } expires ? $" (SAS valid until {expires.ToLocalTime():yyyy-MM-dd HH:mm})" : "")}"
                 : problem ?? "off", From("MonitoringUrl")),
+            ("MonitoringDetail", MonitoringDetail.ToString(), From("MonitoringDetail")),
         ];
     }
+
+    /// <summary>Numbers outside their range and the value used instead, for the log.</summary>
+    public IReadOnlyList<string> Adjusted()
+    {
+        var adjusted = new List<string>();
+        void Check(string name, int used, bool zeroAllowed = false)
+        {
+            if (Number(name) is { } set && set != used && !(zeroAllowed && set < 0 && used == 0))
+            {
+                adjusted.Add($"{name} {set} is outside its range; {used} is used");
+            }
+        }
+        Check("CacheSizeMB", CacheSizeMB);
+        Check("ChangeCheckSeconds", ChangeCheckSeconds, zeroAllowed: true);
+        Check("ApiBudgetPerMinute", ApiBudgetPerMinute, zeroAllowed: true);
+        Check("ThrottlePauseMinutes", ThrottlePauseMinutes);
+        Check("WalkPrefetchFolders", WalkPrefetchFolders);
+        Check("ReadAheadFiles", ReadAheadFiles);
+        Check("RepeatSaveSeconds", RepeatSaveSeconds);
+        return adjusted;
+    }
+
+    /// <summary>Names of the settings whose value or source differs from <paramref name="earlier"/>.</summary>
+    public IReadOnlyList<string> ChangedFrom(AgentSettings earlier) =>
+        Names.Where(name => Fingerprint(Raw(name, out var source), source) != Fingerprint(earlier.Raw(name, out var was), was)).ToList();
+
+    static string Fingerprint(object? value, string? source) =>
+        $"{source}|{(value is string[] items ? string.Join("\n", items) : Convert.ToString(value, System.Globalization.CultureInfo.InvariantCulture))}";
 
     /// <summary>Config file: <paramref name="configPath"/>, else vfs365.local.json in the working directory, else vfs365.json next to the exe.</summary>
     public static AgentSettings Load(string? configPath, bool policies = true)
@@ -186,18 +236,27 @@ public sealed class AgentSettings
         return settings;
     }
 
+    /// <summary>The first source's value, read once.</summary>
     object? Raw(string name, out string? source)
     {
-        foreach (var (from, read) in sources)
+        lock (read)
         {
-            if (read(name) is { } value && value is not (string { Length: 0 } or string[] { Length: 0 }))
+            if (!read.TryGetValue(name, out var known))
             {
-                source = from;
-                return value;
+                known = (null, null);
+                foreach (var (from, reader) in sources)
+                {
+                    if (reader(name) is { } value && value is not (string { Length: 0 } or string[] { Length: 0 }))
+                    {
+                        known = (value, from);
+                        break;
+                    }
+                }
+                read[name] = known;
             }
+            source = known.Source;
+            return known.Value;
         }
-        source = null;
-        return null;
     }
 
     Setting Text(string name) => Raw(name, out var source) is string text && !string.IsNullOrWhiteSpace(text) ? new(text.Trim(), source) : new(null, null);

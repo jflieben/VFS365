@@ -5,7 +5,7 @@ namespace Vfs365.Core.Drive;
 /// <summary>
 /// A journal record next to each staging file with unsaved changes, so a crash or reboot loses no save: the next start
 /// re-queues them for upload (into the original item, with If-Match, so a server-side change since then ends in a conflict copy).
-/// Temp and lock files are not journaled.
+/// One that already uploaded before the crash (same content on the server) isn't sent again. Temp and lock files are not journaled.
 /// </summary>
 public sealed partial class DriveEngine
 {
@@ -13,7 +13,10 @@ public sealed partial class DriveEngine
 
     static string JournalOf(string stagingPath) => stagingPath + ".json";
 
-    /// <summary>Writes, rewrites or (for temp names) removes the pending file's journal record.</summary>
+    /// <summary>
+    /// Writes, rewrites (call it when Base or the path changes) or, for temp names, removes the pending file's journal record. The record
+    /// is on disk when this returns.
+    /// </summary>
     void Journal(PendingFile pending)
     {
         var path = JournalOf(pending.StagingPath);
@@ -23,7 +26,15 @@ public sealed partial class DriveEngine
             pending.Journaled = false;
             return;
         }
-        File.WriteAllText(path + ".tmp", JsonSerializer.Serialize(new JournalRecord(pending.DriveId, pending.DrivePath, pending.Base, pending.Modified)));
+        if (!pending.IsLive)
+        {
+            return;
+        }
+        using (var file = new FileStream(path + ".tmp", FileMode.Create, FileAccess.Write, FileShare.None))
+        {
+            JsonSerializer.Serialize(file, new JournalRecord(pending.DriveId, pending.DrivePath, pending.Base, pending.Modified));
+            file.Flush(flushToDisk: true);
+        }
         File.Move(path + ".tmp", path, overwrite: true);
         pending.Journaled = true;
     }
@@ -49,6 +60,8 @@ public sealed partial class DriveEngine
                         HasWrites = true,
                         Journaled = true,
                         RetryAt = Now,
+                        Queued = true,
+                        Recovered = true,
                     };
                     overlay[pending.Key] = pending;
                     recovered++;

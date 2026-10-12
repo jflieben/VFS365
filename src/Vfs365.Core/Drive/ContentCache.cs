@@ -1,5 +1,6 @@
 using System.Security.Cryptography;
 using System.Text;
+using Microsoft.Win32.SafeHandles;
 
 namespace Vfs365.Core.Drive;
 
@@ -13,19 +14,30 @@ public sealed record ContentCacheOptions
 }
 
 /// <summary>
-/// File content on local disk: one file per item version, in a folder per drive (cache\&lt;drive&gt;\&lt;item&gt;-&lt;version&gt;), encrypted when a
-/// cipher is set and kept under MaxBytes. Content not here yet streams in as it is read. Content written under another key, or by
-/// a version that didn't encrypt, is dropped at start.
+/// File content on local disk: one file per item version, in a folder per drive (cache\&lt;drive&gt;\&lt;item&gt;-&lt;version&gt;), encrypted and
+/// authenticated when a cipher is set and kept under MaxBytes. Content not here yet streams in as it is read. Content written under
+/// another key or format, or by a version that didn't encrypt, is dropped at start; a file that fails its check is dropped when read.
 /// </summary>
 public sealed class ContentCache
 {
     const string KeyMarker = "key";
 
+    /// <summary>A complete cache file: size on disk, when this run completed it (earlier runs: MinValue) and when it was last used.</summary>
+    sealed class Entry(long length, DateTime completedAt, DateTime usedAt)
+    {
+        public long Length { get; } = length;
+        public DateTime CompletedAt { get; } = completedAt;
+        public DateTime UsedAt { get; set; } = usedAt;
+    }
+
     readonly string directory;
     readonly IDriveApi api;
     readonly ContentCacheOptions options;
     readonly Dictionary<string, StreamingContent> streaming = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>Lock order: streaming before sizeGate, never the other way round.</summary>
     readonly Lock sizeGate = new();
+    readonly Dictionary<string, Entry> files = new(StringComparer.OrdinalIgnoreCase);
     long total;
 
     public ContentCache(string directory, IDriveApi api, ContentCacheOptions? options = null)
@@ -33,7 +45,7 @@ public sealed class ContentCache
         (this.directory, this.api, this.options) = (directory, api, options ?? new ContentCacheOptions());
         Directory.CreateDirectory(directory);
         var marker = Path.Combine(directory, KeyMarker);
-        var expected = this.options.Cipher?.KeyId ?? "plain";
+        var expected = this.options.Cipher is { } cipher ? $"{cipher.KeyId} {CacheCipher.Format}" : "plain";
         if (!File.Exists(marker) || File.ReadAllText(marker).Trim() != expected)
         {
             Clear();
@@ -47,10 +59,9 @@ public sealed class ContentCache
         {
             TryDelete(leftover);
         }
-        total = CompleteFiles().Sum(f => f.Length);
+        Rescan();
         Evict(null);
     }
-
 
     /// <summary>Bytes and files of complete content on disk.</summary>
     public (long Bytes, int Files) Usage
@@ -59,14 +70,14 @@ public sealed class ContentCache
         {
             lock (sizeGate)
             {
-                return (total, CompleteFiles().Count());
+                return (total, files.Count);
             }
         }
     }
 
     /// <summary>
     /// Content for reading: the cached file, else a download that serves each read as soon as its blocks arrive. Dispose when done.
-    /// <paramref name="changed"/> gets the item as served when the download isn't <paramref name="length"/> bytes.
+    /// <paramref name="changed"/> gets the item as served when the download isn't that version or isn't <paramref name="length"/> bytes.
     /// </summary>
     public IContentSource Open(string driveId, string itemId, string? contentTag, long length, Action<DriveItemInfo>? changed = null)
     {
@@ -75,16 +86,36 @@ public sealed class ContentCache
         {
             if (!streaming.TryGetValue(path, out var download))
             {
-                if (File.Exists(path))
+                if (File.Exists(path) && OpenCached(path) is { } cached)
                 {
-                    Touch(path);
-                    return new CachedFile(path, options.Cipher);
+                    return cached;
                 }
-                download = new StreamingContent(api, driveId, itemId, length, path, options.Cipher, finished => Completed(path, finished), changed);
+                download = new StreamingContent(api, driveId, itemId, contentTag, length, path, NameOf(path), options.Cipher,
+                    finished => Completed(path, finished), gaveUp => Failed(path, gaveUp), changed);
                 streaming[path] = download;
             }
             download.References++;
             return new Reference(this, path, download);
+        }
+    }
+
+    /// <summary>The complete cache file, or null when it is gone or damaged (then it is removed).</summary>
+    CachedFile? OpenCached(string path)
+    {
+        try
+        {
+            var cached = new CachedFile(path, options.Cipher, () => Remove(path));
+            Touch(path);
+            return cached;
+        }
+        catch (CacheDamagedException)
+        {
+            Remove(path);
+            return null;
+        }
+        catch (FileNotFoundException)
+        {
+            return null;
         }
     }
 
@@ -112,15 +143,23 @@ public sealed class ContentCache
     public async Task CopyToAsync(string driveId, string itemId, string? contentTag, long length, string destination, CancellationToken ct,
         Action<DriveItemInfo>? changed = null)
     {
-        var path = PathFor(driveId, itemId, contentTag);
         using var source = Open(driveId, itemId, contentTag, length, changed);
         if (source is Reference reference)
         {
             await reference.Download.CompleteAsync(ct);
         }
-        using var input = File.OpenHandle(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
         using var output = File.OpenHandle(destination, FileMode.Create, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete);
-        Transform(input, output, Nonce(path));
+        var buffer = new byte[StreamingContent.BlockSize];
+        for (long offset = 0; offset < source.Length;)
+        {
+            var read = await source.ReadAsync(offset, buffer, ct);
+            if (read == 0)
+            {
+                throw new IOException($"Cached content ended at {offset} of {source.Length} bytes");
+            }
+            RandomAccess.Write(output, buffer.AsSpan(0, read), offset);
+            offset += read;
+        }
     }
 
     /// <summary>
@@ -172,7 +211,7 @@ public sealed class ContentCache
         {
             foreach (var file in new DirectoryInfo(folder).EnumerateFiles($"{Hash(itemId)}-*").Where(f => f.Extension != ".part"))
             {
-                Remove(file);
+                Remove(file.FullName);
             }
         }
     }
@@ -185,7 +224,7 @@ public sealed class ContentCache
         {
             foreach (var file in folder.EnumerateFiles().Where(f => f.Extension != ".part"))
             {
-                Remove(file);
+                Remove(file.FullName);
             }
             try
             {
@@ -213,9 +252,20 @@ public sealed class ContentCache
             {
             }
         }
+        Rescan();
+    }
+
+    /// <summary>Counts what is on disk again.</summary>
+    void Rescan()
+    {
         lock (sizeGate)
         {
-            total = CompleteFiles().Sum(f => f.Length);
+            files.Clear();
+            foreach (var file in new DirectoryInfo(directory).EnumerateDirectories().SelectMany(d => d.EnumerateFiles()).Where(f => f.Extension != ".part"))
+            {
+                files[file.FullName] = new Entry(file.Length, DateTime.MinValue, file.LastAccessTimeUtc);
+            }
+            total = files.Values.Sum(f => f.Length);
         }
     }
 
@@ -224,23 +274,37 @@ public sealed class ContentCache
 
     static string Hash(string text) => Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(text)))[..16];
 
-    static byte[] Nonce(string path) => CacheCipher.NonceFor(Path.GetFileName(path));
+    /// <summary>A cache file's name with its drive folder: what its encrypted chunks are bound to.</summary>
+    static string NameOf(string path) => $"{Path.GetFileName(Path.GetDirectoryName(path))}/{Path.GetFileName(path)}";
 
-    IEnumerable<FileInfo> CompleteFiles() => new DirectoryInfo(directory).EnumerateDirectories().SelectMany(d => d.EnumerateFiles()).Where(f => f.Extension != ".part");
+    /// <summary>What ties a cache file's content to its path: the name its chunks are authenticated with (the nonce itself is random per file).</summary>
+    static byte[] Nonce(string path) => Encoding.UTF8.GetBytes(NameOf(path));
 
-    /// <summary>Copies a file through the cipher (encrypting or decrypting; plain copy without one).</summary>
-    void Transform(Microsoft.Win32.SafeHandles.SafeFileHandle input, Microsoft.Win32.SafeHandles.SafeFileHandle output, byte[] nonce)
+    /// <summary>Writes a plain file in the cache format: encrypted and authenticated, or a plain copy without a cipher.</summary>
+    void Transform(SafeFileHandle input, SafeFileHandle output, byte[] name)
     {
+        var length = RandomAccess.GetLength(input);
+        var sealedFile = options.Cipher?.Create(output, length, Encoding.UTF8.GetString(name));
         var buffer = new byte[StreamingContent.BlockSize];
-        for (long offset = 0; ;)
+        for (long offset = 0; offset < length;)
         {
-            var read = RandomAccess.Read(input, buffer, offset);
+            var read = 0;
+            while (read < buffer.Length && offset + read < length && RandomAccess.Read(input, buffer.AsSpan(read), offset + read) is var n and > 0)
+            {
+                read += n;
+            }
             if (read == 0)
             {
-                return;
+                throw new IOException("The file shrank while it was cached");
             }
-            options.Cipher?.Apply(buffer.AsSpan(0, read), offset, nonce);
-            RandomAccess.Write(output, buffer.AsSpan(0, read), offset);
+            if (sealedFile is not null)
+            {
+                sealedFile.Write(offset, buffer.AsSpan(0, read));
+            }
+            else
+            {
+                RandomAccess.Write(output, buffer.AsSpan(0, read), offset);
+            }
             offset += read;
         }
     }
@@ -254,25 +318,58 @@ public sealed class ContentCache
                 streaming.Remove(path);
             }
         }
-        if (File.Exists(path))
+        Added(path, finished.StartedAt);
+    }
+
+    /// <summary>A download gave up: new readers start a fresh one, readers holding this one keep it.</summary>
+    void Failed(string path, StreamingContent download)
+    {
+        lock (streaming)
         {
-            Added(path, new FileInfo(path).Length);
+            if (streaming.TryGetValue(path, out var current) && current == download)
+            {
+                streaming.Remove(path);
+            }
         }
     }
 
-    /// <summary>A new complete file: older versions of the item go, then the cache is trimmed (keeping this file).</summary>
-    void Added(string path, long length)
+    /// <summary>A file adopted now: it is the newest version.</summary>
+    void Added(string path, long length) => Added(path, DateTime.UtcNow);
+
+    /// <summary>
+    /// A new complete file, asked for at <paramref name="requestedAt"/>. Versions of the item completed before then are older and go;
+    /// one completed later may be newer and stays. Then the cache is trimmed, keeping this file.
+    /// </summary>
+    void Added(string path, DateTime requestedAt)
     {
-        Touch(path);
+        var info = new FileInfo(path);
+        if (!info.Exists)
+        {
+            return;
+        }
+        var now = DateTime.UtcNow;
         lock (sizeGate)
         {
-            total += length;
+            if (files.TryGetValue(path, out var replaced))
+            {
+                total -= replaced.Length;
+            }
+            files[path] = new Entry(info.Length, now, now);
+            total += info.Length;
         }
-        var name = Path.GetFileName(path);
-        var item = name[..name.IndexOf('-')];
-        foreach (var older in new DirectoryInfo(Path.GetDirectoryName(path)!).EnumerateFiles($"{item}-*").Where(f => f.Name != name && f.Extension != ".part"))
+        Touch(path);
+        var item = info.Name[..info.Name.IndexOf('-')];
+        foreach (var other in info.Directory!.EnumerateFiles($"{item}-*").Where(f => f.Name != info.Name && f.Extension != ".part").Select(f => f.FullName).ToList())
         {
-            Remove(older);
+            bool newer;
+            lock (sizeGate)
+            {
+                newer = files.TryGetValue(other, out var entry) && entry.CompletedAt >= requestedAt;
+            }
+            if (!newer)
+            {
+                Remove(other);
+            }
         }
         Evict(path);
     }
@@ -285,46 +382,59 @@ public sealed class ContentCache
             {
                 return;
             }
+        }
+        HashSet<string> busy;
+        lock (streaming)
+        {
+            busy = new HashSet<string>(streaming.Keys, StringComparer.OrdinalIgnoreCase);
+        }
+        lock (sizeGate)
+        {
             var target = options.MaxBytes / 10 * 9;
-            foreach (var file in CompleteFiles().OrderBy(f => f.LastAccessTimeUtc).ToList())
+            foreach (var path in files.OrderBy(f => f.Value.UsedAt).Select(f => f.Key).ToList())
             {
                 if (total <= target)
                 {
                     return;
                 }
-                if (!file.FullName.Equals(keep, StringComparison.OrdinalIgnoreCase) && !IsStreaming(file.FullName))
+                if (!path.Equals(keep, StringComparison.OrdinalIgnoreCase) && !busy.Contains(path))
                 {
-                    Remove(file);
+                    Remove(path);
                 }
             }
         }
     }
 
-    bool IsStreaming(string path)
+    /// <summary>Deletes a complete file; the total drops only when this call removed it.</summary>
+    void Remove(string path)
     {
-        lock (streaming)
+        lock (sizeGate)
         {
-            return streaming.ContainsKey(path);
-        }
-    }
-
-    void Remove(FileInfo file)
-    {
-        if (TryDelete(file.FullName))
-        {
-            lock (sizeGate)
+            if (File.Exists(path) && !TryDelete(path))
             {
-                total -= file.Length;
+                return;
+            }
+            if (files.Remove(path, out var entry))
+            {
+                total -= entry.Length;
             }
         }
     }
 
-    /// <summary>Recency for eviction, set explicitly (Windows may not update last-access times).</summary>
-    static void Touch(string path)
+    /// <summary>Recency for eviction, also set on the file so it lasts to the next start (Windows may not update last-access times).</summary>
+    void Touch(string path)
     {
+        var now = DateTime.UtcNow;
+        lock (sizeGate)
+        {
+            if (files.TryGetValue(path, out var entry))
+            {
+                entry.UsedAt = now;
+            }
+        }
         try
         {
-            File.SetLastAccessTimeUtc(path, DateTime.UtcNow);
+            File.SetLastAccessTimeUtc(path, now);
         }
         catch (IOException)
         {
@@ -367,23 +477,47 @@ public sealed class ContentCache
         download.Dispose();
     }
 
-    /// <summary>A complete cache file, decrypted as it is read.</summary>
-    sealed class CachedFile(string path, CacheCipher? cipher) : IContentSource
+    /// <summary>A complete cache file, decrypted and checked as it is read. A file that fails the check is removed.</summary>
+    sealed class CachedFile : IContentSource
     {
-        readonly Microsoft.Win32.SafeHandles.SafeFileHandle file = File.OpenHandle(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
-        readonly byte[] nonce = Nonce(path);
+        readonly SafeFileHandle file;
+        readonly CacheCipher.SealedFile? sealedFile;
+        readonly Action damaged;
 
-        public long Length => RandomAccess.GetLength(file);
+        public CachedFile(string path, CacheCipher? cipher, Action damaged)
+        {
+            file = File.OpenHandle(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            try
+            {
+                sealedFile = cipher?.Open(file, NameOf(path));
+            }
+            catch
+            {
+                file.Dispose();
+                throw;
+            }
+            this.damaged = damaged;
+            Length = sealedFile?.Length ?? RandomAccess.GetLength(file);
+        }
+
+        public long Length { get; }
 
         public ValueTask<int> ReadAsync(long offset, Memory<byte> buffer, CancellationToken ct)
         {
-            if (offset >= Length)
+            if (offset >= Length || buffer.Length == 0)
             {
                 return ValueTask.FromResult(0);
             }
-            var read = RandomAccess.Read(file, buffer.Span, offset);
-            cipher?.Apply(buffer.Span[..read], offset, nonce);
-            return ValueTask.FromResult(read);
+            var span = buffer.Span[..(int)Math.Min(buffer.Length, Length - offset)];
+            try
+            {
+                return ValueTask.FromResult(sealedFile?.Read(offset, span) ?? RandomAccess.Read(file, span, offset));
+            }
+            catch (CacheDamagedException)
+            {
+                damaged();
+                throw;
+            }
         }
 
         public void Dispose() => file.Dispose();

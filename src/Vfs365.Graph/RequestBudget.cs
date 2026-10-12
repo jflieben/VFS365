@@ -9,15 +9,17 @@ public sealed class RequestBudget
 {
     readonly Lock gate = new();
     readonly Func<DateTimeOffset> clock;
+    readonly Func<TimeSpan, CancellationToken, Task> delay;
     double tokens;
     DateTimeOffset last;
     long foregroundTicks;
     long backgroundTicks;
 
-    public RequestBudget(int perMinute, Func<DateTimeOffset>? clock = null)
+    public RequestBudget(int perMinute, Func<DateTimeOffset>? clock = null, Func<TimeSpan, CancellationToken, Task>? delay = null)
     {
         PerMinute = Math.Max(0, perMinute);
         this.clock = clock ?? (() => DateTimeOffset.UtcNow);
+        this.delay = delay ?? Task.Delay;
         tokens = PerMinute;
         last = this.clock();
     }
@@ -38,9 +40,7 @@ public sealed class RequestBudget
         }
         lock (gate)
         {
-            var now = clock();
-            tokens = Math.Min(PerMinute, tokens + (now - last).TotalMinutes * PerMinute);
-            last = now;
+            Refill();
             var floor = background ? PerMinute / 2.0 : 0;
             if (tokens - cost >= floor || (tokens >= PerMinute && !background))
             {
@@ -52,12 +52,49 @@ public sealed class RequestBudget
         }
     }
 
-    public async Task TakeAsync(int cost, bool background, CancellationToken ct)
+    /// <summary>
+    /// Corrects what a request took once its real cost is known (x-ms-resource-unit): more is taken at once, so the balance can go
+    /// below zero and later requests wait; less is given back.
+    /// </summary>
+    public void Adjust(int delta)
     {
-        while (!TryTake(cost, background, out var wait))
+        if (PerMinute == 0 || delta == 0)
         {
-            Interlocked.Add(ref background ? ref backgroundTicks : ref foregroundTicks, wait.Ticks);
-            await Task.Delay(wait, ct);
+            return;
         }
+        lock (gate)
+        {
+            Refill();
+            tokens = Math.Min(PerMinute, tokens - delta);
+        }
+    }
+
+    public Task TakeAsync(int cost, bool background, CancellationToken ct) => TakeAsync(cost, () => background, ct);
+
+    /// <summary>
+    /// Waits until <paramref name="cost"/> units are taken. <paramref name="isBackground"/> is read before every try, so work promoted
+    /// while it waits takes from the whole budget; <paramref name="wake"/> (a promotion) ends a wait early.
+    /// </summary>
+    public async Task TakeAsync(int cost, Func<bool> isBackground, CancellationToken ct, Task? wake = null)
+    {
+        while (true)
+        {
+            var background = isBackground();
+            if (TryTake(cost, background, out var wait))
+            {
+                return;
+            }
+            Interlocked.Add(ref background ? ref backgroundTicks : ref foregroundTicks, wait.Ticks);
+            var waiting = delay(wait, ct);
+            await (background && wake is not null ? Task.WhenAny(waiting, wake) : waiting);
+            ct.ThrowIfCancellationRequested();
+        }
+    }
+
+    void Refill()
+    {
+        var now = clock();
+        tokens = Math.Min(PerMinute, tokens + (now - last).TotalMinutes * PerMinute);
+        last = now;
     }
 }

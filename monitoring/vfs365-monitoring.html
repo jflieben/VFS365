@@ -407,7 +407,7 @@ async function loadAll(c, days, refresh, progress) {
 const upnOf = new Map();
 const userOf = r => r.User || upnOf.get(r.WindowsUser) || r.WindowsUser || "(unknown)";
 /* Sources the agent reports, each with a fixed color; anything else is "other" */
-const SOURCE_COLOR = { upload: "--s1", "conflict copy": "--s2", "sign-in": "--s3", "file system": "--s4", discovery: "--s5", start: "--s6", "drive letter": "--s7", crash: "--s8" };
+const SOURCE_COLOR = { upload: "--s1", "conflict copy": "--s2", "sign-in": "--s3", "file system": "--s4", discovery: "--s5", start: "--s6", "drive letter": "--s7", crash: "--s8", security: "--s8" };
 const KNOWN_SOURCES = Object.keys(SOURCE_COLOR);
 const clip = (text, n) => { const t = String(text || ""); return t.length > n ? t.slice(0, n - 1) + "…" : t; };
 function errorPattern(message) {
@@ -522,6 +522,14 @@ function insights(m, c) {
     const latest = m.errors.find(r => r.Source === "crash");
     out.push({ level: "critical", label: "Crashes", text: `The agent stopped unexpectedly ${m.totals.crashes} time(s) on ${crashDevices.size} device(s); it restarts by itself. Latest: ${latest.DeviceName}, ${dateTime(latest.at)}.`, action: () => openGroupBySource("crash") });
   }
+  // Rows from vfs365-agent.exe itself when it stopped restarting the agent: those users have no drive until they sign in again
+  const gaveUp = m.errors.filter(r => r.Source === "crash" && /not started again/.test(r.Message || ""));
+  if (gaveUp.length) {
+    const users = new Set(gaveUp.map(r => `${r.DeviceId}|${r.WindowsUser || r.User || ""}`));
+    out.push({ level: "critical", label: "Gave up restarting", text: `On ${new Set(gaveUp.map(r => r.DeviceId)).size} device(s) the agent crashed 4 times within 15 minutes and was not started again, for ${users.size} user(s); they have no drive until they sign in again. Latest: ${gaveUp[0].DeviceName}, ${dateTime(gaveUp[0].at)}.`, action: () => openGroupBySource("crash") });
+  }
+  const security = m.errors.filter(r => r.Source === "security");
+  if (security.length) out.push({ level: "critical", label: "Security", text: `On ${new Set(security.map(r => r.DeviceId)).size} device(s) another user held a user's \\\\VFS365\\<user> path, so that user's drive didn't start. Check who runs what on those PCs. Latest: ${clip(security[0].Message, 160)}`, action: () => openGroupBySource("security") });
   const dayAgo = Date.now() - 86400000;
   const recent = m.errors.filter(r => r.at.getTime() >= dayAgo);
   if (recent.length) {
@@ -1101,6 +1109,8 @@ let resizeTimer; addEventListener("resize", () => { clearTimeout(resizeTimer); r
 (function start() {
   const hash = new URLSearchParams(location.hash.slice(1));
   const initial = hash.get("connect") || store.get("connection");
+  // The SAS leaves the address bar (and this history entry) once read
+  if (hash.has("connect")) history.replaceState(null, "", location.pathname + location.search);
   if (hash.has("sample")) { makeSample(); startWith({ base: "", sas: "", params: {}, account: "sample", host: "sample" }); return; }
   if (initial) { try { startWith(parseConnection(initial)); return; } catch { } }
   connectionPanel();

@@ -207,6 +207,37 @@ public sealed class WalkTests : IDisposable
         Assert.Equal(calls + 1, api.DeltaCalls);
     }
 
+    [Fact]
+    public async Task With_push_up_hot_checks_slow_down_while_nothing_changes()
+    {
+        var api = new FakeDriveApi();
+        api.Add("docs", folder: true);
+        var engine = Create(api, walkThreshold: 0);
+        engine.SetPush("b!me", true);
+        await engine.PollAsync("b!me");
+        await Names(engine, "\\docs");
+
+        async Task<int> ReadsAfter(int seconds)
+        {
+            var before = api.DeltaCalls;
+            now += TimeSpan.FromSeconds(seconds);
+            await engine.PollActiveAsync();
+            var reads = api.DeltaCalls - before;
+            await Names(engine, "\\docs"); // still in use (no read is due right after one)
+            return reads;
+        }
+
+        Assert.Equal(1, await ReadsAfter(20)); // empty: next in 40 s
+        Assert.Equal(0, await ReadsAfter(1));
+        Assert.Equal(0, await ReadsAfter(30));
+        Assert.Equal(1, await ReadsAfter(11)); // empty again: next in 80 s
+        Assert.Equal(0, await ReadsAfter(60));
+
+        api.Add("docs/new.txt");
+        Assert.Equal(1, await ReadsAfter(21)); // a change: back to 20 s
+        Assert.Equal(1, await ReadsAfter(21));
+    }
+
     public void Dispose()
     {
         try

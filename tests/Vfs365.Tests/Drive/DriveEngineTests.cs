@@ -111,6 +111,32 @@ public sealed class DriveEngineTests : IDisposable
     }
 
     [Fact]
+    public async Task Many_files_opened_by_path_in_an_unlisted_folder_get_the_folder_listed()
+    {
+        var (engine, api, _) = Create();
+        api.Add("scans", folder: true);
+        for (var i = 0; i < 10; i++)
+        {
+            api.Add($"scans/{i:D3}.pdf");
+        }
+
+        for (var i = 0; i < 5; i++)
+        {
+            Assert.NotNull(await engine.GetEntryAsync($"\\OneDrive\\scans\\{i:D3}.pdf", default));
+        }
+        // The fifth started loading the folder; listing it joins that load
+        await engine.ListAsync((await engine.GetEntryAsync("\\OneDrive\\scans", default))!, default);
+        var gets = api.GetCalls;
+        for (var i = 5; i < 10; i++)
+        {
+            Assert.NotNull(await engine.GetEntryAsync($"\\OneDrive\\scans\\{i:D3}.pdf", default));
+        }
+
+        Assert.Equal(1, api.ListCalls);
+        Assert.Equal(gets, api.GetCalls);
+    }
+
+    [Fact]
     public async Task Missing_path_is_remembered()
     {
         var (engine, api, _) = Create();

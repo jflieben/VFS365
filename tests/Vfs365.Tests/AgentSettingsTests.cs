@@ -89,7 +89,47 @@ public sealed class AgentSettingsTests : IDisposable
         Assert.Equal("0 (off)", effective["ReadAheadFiles"].Value);
         Assert.StartsWith("contoso.table.core.windows.net", effective["MonitoringUrl"].Value);
         Assert.DoesNotContain(settings.Effective(), s => s.Value.Contains("secret123") || s.Value.Contains("sig="));
-        Assert.Equal(23, effective.Count);
+        Assert.Equal(25, effective.Count);
+        Assert.Equal(AgentSettings.Names.Order(), effective.Keys.Order());
+    }
+
+    [Fact]
+    public void Upload_notices_and_monitoring_detail()
+    {
+        var defaults = Load("{}");
+        Assert.True(defaults.NotifyUploads);
+        Assert.Equal(MonitoringDetail.Full, defaults.MonitoringDetail);
+
+        var set = Load("""{ "NotifyUploads": 0, "MonitoringDetail": "nopaths" }""");
+        Assert.False(set.NotifyUploads);
+        Assert.Equal(MonitoringDetail.NoPaths, set.MonitoringDetail);
+        Assert.Equal(MonitoringDetail.Full, Load("""{ "MonitoringDetail": "some" }""").MonitoringDetail);
+    }
+
+    [Fact]
+    public void Values_outside_their_range_are_named_for_the_log()
+    {
+        var adjusted = Load("""{ "ChangeCheckSeconds": 3, "ApiBudgetPerMinute": 10, "CacheSizeMB": 50, "ReadAheadFiles": 8 }""").Adjusted();
+
+        Assert.Equal(3, adjusted.Count);
+        Assert.Contains("ChangeCheckSeconds 3 is outside its range; 5 is used", adjusted);
+        Assert.Contains("ApiBudgetPerMinute 10 is outside its range; 60 is used", adjusted);
+        Assert.Contains("CacheSizeMB 50 is outside its range; 100 is used", adjusted);
+        Assert.Empty(Load("""{ "ChangeCheckSeconds": 0, "ApiBudgetPerMinute": 0 }""").Adjusted());
+    }
+
+    [Fact]
+    public void Settings_are_read_once_and_changes_are_named()
+    {
+        var started = Load("""{ "Label": "Files", "ReadAheadFiles": 8 }""");
+        Assert.Equal("Files", started.Label);
+        Assert.Equal(8, started.ReadAheadFiles);
+
+        var now = Load("""{ "Label": "Files", "ReadAheadFiles": 4, "NotifyUploads": false }""");
+
+        Assert.Equal(8, started.ReadAheadFiles); // the running agent keeps what it started with
+        Assert.Equal(["NotifyUploads", "ReadAheadFiles"], now.ChangedFrom(started).Order(StringComparer.Ordinal));
+        Assert.Empty(now.ChangedFrom(now));
     }
 
     public void Dispose() => File.Delete(file);

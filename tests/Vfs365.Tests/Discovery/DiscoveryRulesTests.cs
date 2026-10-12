@@ -70,10 +70,26 @@ public class DiscoveryRulesTests
         Assert.True(LibraryRules.Evaluate(List("Site Assets", internalName: "Gedeelde documenten")).Include);
     }
 
-    [Fact]
-    public void Hidden_wiki_and_other_templates_are_excluded_for_good()
+    [Theory]
+    [InlineData("https://contoso.sharepoint.com", "https://contoso-my.sharepoint.com")]
+    [InlineData("https://contosoeur.sharepoint.com", "https://contosoeur-my.sharepoint.com")]
+    public void OneDriveRoot_adds_my_to_the_tenant_host(string root, string expected)
     {
-        Assert.True(LibraryRules.Evaluate(List(hidden: true)).Static);
+        Assert.Equal(expected, SharePointUrls.OneDriveRoot(root));
+    }
+
+    [Fact]
+    public void Hidden_libraries_are_excluded_but_checked_again()
+    {
+        var verdict = LibraryRules.Evaluate(List(hidden: true));
+        Assert.False(verdict.Include);
+        Assert.False(verdict.Static);
+        Assert.True(LibraryRules.NoLongerStatic(verdict.Reason!));
+    }
+
+    [Fact]
+    public void Wiki_and_other_templates_are_excluded_for_good()
+    {
         Assert.True(LibraryRules.Evaluate(List(template: 700)).Static);
         Assert.True(LibraryRules.Evaluate(List(feature: "{00BFEA71-C796-4402-9F2F-0EB9A6E71B18}")).Static);
     }

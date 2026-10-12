@@ -1,4 +1,5 @@
 using System.Buffers;
+using System.Runtime.InteropServices;
 using System.Security.AccessControl;
 using System.Security.Principal;
 using Fsp;
@@ -10,7 +11,10 @@ using VolumeInfo = Fsp.Interop.VolumeInfo;
 
 namespace Vfs365.Drive.WinFsp;
 
-/// <summary>WinFsp callbacks over the engine. Content lives in local files (downloaded or staged); the engine decides what reaches SharePoint.</summary>
+/// <summary>
+/// WinFsp callbacks over the engine. Content lives in local files (downloaded or staged); the engine decides what reaches SharePoint.
+/// A handle keeps the entry it was given and follows it (<see cref="DriveEngine.Follow"/>), so it reads and writes the content it saw.
+/// </summary>
 sealed class Vfs365FileSystem(DriveEngine engine, string label, Action<string>? log, Action<string>? trace = null) : FileSystemBase
 {
     const uint AttributeReadOnly = 0x1, AttributeDirectory = 0x10, AttributeNormal = 0x80;
@@ -23,7 +27,9 @@ sealed class Vfs365FileSystem(DriveEngine engine, string label, Action<string>? 
         public SafeFileHandle? Content { get; set; }
         public string? ContentPath { get; set; }
         public IContentSource? Source { get; set; }
-        public string? SourceStaging { get; set; }
+
+        /// <summary>The staging file or item version Source reads.</summary>
+        public string? SourceVersion { get; set; }
         public bool Wrote { get; set; }
         public Lock Gate { get; } = new();
     }
@@ -68,6 +74,11 @@ sealed class Vfs365FileSystem(DriveEngine engine, string label, Action<string>? 
 
     public override int GetSecurityByName(string fileName, out uint fileAttributes, ref byte[] securityDescriptor)
     {
+        if (!FromOwner(fileName))
+        {
+            fileAttributes = 0;
+            return STATUS_ACCESS_DENIED;
+        }
         var entry = Run(engine.GetEntryAsync(fileName, default));
         if (entry is null)
         {
@@ -96,6 +107,12 @@ sealed class Vfs365FileSystem(DriveEngine engine, string label, Action<string>? 
     {
         fileNode = null;
         normalizedName = null;
+        if (!FromOwner(fileName))
+        {
+            fileDesc = null;
+            fileInfo = default;
+            return STATUS_ACCESS_DENIED;
+        }
         var isDirectory = (createOptions & FILE_DIRECTORY_FILE) != 0;
         trace?.Invoke($"create {fileName} dir={isDirectory} allocation={allocationSize}");
         var handle = new Handle(Run(engine.CreateAsync(fileName, isDirectory, default))) { Wrote = !isDirectory };
@@ -114,6 +131,12 @@ sealed class Vfs365FileSystem(DriveEngine engine, string label, Action<string>? 
     {
         fileNode = null;
         normalizedName = null;
+        if (!FromOwner(fileName))
+        {
+            fileDesc = null;
+            fileInfo = default;
+            return STATUS_ACCESS_DENIED;
+        }
         var entry = Run(engine.GetEntryAsync(fileName, default));
         if (entry is null || entry.Blocked)
         {
@@ -133,29 +156,40 @@ sealed class Vfs365FileSystem(DriveEngine engine, string label, Action<string>? 
     {
         var handle = (Handle)fileDesc;
         trace?.Invoke($"overwrite {handle.Entry.Path} allocation={allocationSize}");
+        handle.Entry = engine.Follow(handle.Entry);
         Stage(handle, truncate: true);
         fileInfo = Info(handle);
         return STATUS_SUCCESS;
     }
 
+    /// <summary>
+    /// Acts on the file's name now, not the one it was opened with: another handle may have renamed it since. WinFsp sends that name
+    /// with a delete; a commit takes it from the content the handle follows.
+    /// </summary>
     public override void Cleanup(object fileNode, object fileDesc, string fileName, uint flags)
     {
         var handle = (Handle)fileDesc;
-        trace?.Invoke($"cleanup {handle.Entry.Path} flags=0x{flags:X} wrote={handle.Wrote}");
+        var path = fileName ?? handle.Entry.Path;
+        trace?.Invoke($"cleanup {path} flags=0x{flags:X} wrote={handle.Wrote}");
         try
         {
             if ((flags & CleanupDelete) != 0)
             {
-                Run(engine.DeleteAsync(handle.Entry.Path, default));
+                Run(engine.DeleteAsync(path, default));
             }
             else if (handle.Wrote)
             {
-                Run(engine.CommitAsync(handle.Entry.Path, default));
+                path = (handle.Entry = engine.Follow(handle.Entry)).Path;
+                Run(engine.CommitAsync(path, default));
             }
+        }
+        catch (FsException e) when (e.Error == FsError.Invalid)
+        {
+            // Its content was deleted or replaced meanwhile: nothing to commit
         }
         catch (Exception e)
         {
-            log?.Invoke($"error: closing {handle.Entry.Path}: {e.Message}");
+            log?.Invoke($"error: closing {path}: {e.Message}");
         }
     }
 
@@ -210,27 +244,31 @@ sealed class Vfs365FileSystem(DriveEngine engine, string label, Action<string>? 
     {
         var handle = (Handle)fileDesc;
         trace?.Invoke($"write {handle.Entry.Path} offset={offset} length={length} eof={writeToEndOfFile} constrained={constrainedIo}");
-        var content = Writable(handle);
-        var size = RandomAccess.GetLength(content);
-        if (constrainedIo)
+        var (content, entry, lease) = BeginWrite(handle);
+        long position;
+        using (lease)
         {
-            if ((long)offset >= size)
+            var size = RandomAccess.GetLength(content);
+            if (constrainedIo)
             {
-                bytesTransferred = 0;
-                fileInfo = Info(handle);
-                return STATUS_SUCCESS;
+                if ((long)offset >= size)
+                {
+                    bytesTransferred = 0;
+                    fileInfo = Info(handle);
+                    return STATUS_SUCCESS;
+                }
+                length = (uint)Math.Min(length, size - (long)offset);
             }
-            length = (uint)Math.Min(length, size - (long)offset);
+            position = writeToEndOfFile ? size : (long)offset;
+            RandomAccess.Write(content, new ReadOnlySpan<byte>((void*)buffer, (int)length), position);
+            engine.MarkDirty(entry);
         }
-        var position = writeToEndOfFile ? size : (long)offset;
-        RandomAccess.Write(content, new ReadOnlySpan<byte>((void*)buffer, (int)length), position);
-        engine.MarkDirty(handle.Entry);
         if (constrainedIo)
         {
             // Paging I/O: no cleanup may follow
-            engine.CommitLater(handle.Entry);
+            engine.CommitLater(entry);
         }
-        Run(engine.WrittenAsync(handle.Entry, position, length, default));
+        Run(engine.WrittenAsync(entry, position, length, default));
         bytesTransferred = length;
         fileInfo = Info(handle);
         return STATUS_SUCCESS;
@@ -243,11 +281,15 @@ sealed class Vfs365FileSystem(DriveEngine engine, string label, Action<string>? 
         var current = handle.Content is null ? handle.Entry.Size : RandomAccess.GetLength(handle.Content);
         if (!setAllocationSize || (long)newSize < current)
         {
-            RandomAccess.SetLength(Writable(handle), (long)newSize);
-            engine.MarkDirty(handle.Entry);
+            var (content, entry, lease) = BeginWrite(handle);
+            using (lease)
+            {
+                RandomAccess.SetLength(content, (long)newSize);
+                engine.MarkDirty(entry);
+            }
             if (!setAllocationSize)
             {
-                engine.SizeSet(handle.Entry, (long)newSize);
+                engine.SizeSet(entry, (long)newSize);
             }
         }
         fileInfo = Info(handle);
@@ -261,9 +303,23 @@ sealed class Vfs365FileSystem(DriveEngine engine, string label, Action<string>? 
         return STATUS_SUCCESS;
     }
 
+    /// <summary>Forces what the handle wrote to disk (its staging file). A volume flush (no handle) has nothing to do.</summary>
     public override int Flush(object fileNode, object fileDesc, out FileInfo fileInfo)
     {
-        fileInfo = fileDesc is Handle handle ? Info(handle) : default;
+        if (fileDesc is not Handle handle)
+        {
+            fileInfo = default;
+            return STATUS_SUCCESS;
+        }
+        lock (handle.Gate)
+        {
+            if (handle.Content is { IsClosed: false } content && !FlushFileBuffers(content))
+            {
+                fileInfo = default;
+                return NtStatusFromWin32((uint)Marshal.GetLastPInvokeError());
+            }
+        }
+        fileInfo = Info(handle);
         return STATUS_SUCCESS;
     }
 
@@ -448,6 +504,7 @@ sealed class Vfs365FileSystem(DriveEngine engine, string label, Action<string>? 
             FsException { Error: FsError.AccessDenied } => STATUS_ACCESS_DENIED,
             FsException { Error: FsError.DirectoryNotEmpty } => STATUS_DIRECTORY_NOT_EMPTY,
             FsException { Error: FsError.ReadOnly } => STATUS_MEDIA_WRITE_PROTECTED,
+            FsException { Error: FsError.Invalid } => STATUS_FILE_INVALID,
             RemoteException { Error: RemoteError.NotFound } => STATUS_OBJECT_NAME_NOT_FOUND,
             RemoteException { Error: RemoteError.AccessDenied } => STATUS_ACCESS_DENIED,
             RemoteException { Error: RemoteError.Locked or RemoteError.Conflict } => STATUS_SHARING_VIOLATION,
@@ -459,49 +516,78 @@ sealed class Vfs365FileSystem(DriveEngine engine, string label, Action<string>? 
             _ => STATUS_UNEXPECTED_IO_ERROR,
         };
 
-    /// <summary>The handle's current content: the staging file while the file is being changed, else the cached or streaming download.</summary>
+    /// <summary>
+    /// The handle's current content: the staging file while the file is being changed, else the cached or streaming download of the
+    /// version it follows. A file deleted while open keeps serving what the handle already had.
+    /// </summary>
     IContentSource Readable(Handle handle)
     {
-        var staging = engine.StagingPathOf(handle.Entry);
+        FsEntry entry;
+        try
+        {
+            entry = handle.Entry = engine.Follow(handle.Entry);
+        }
+        catch (FsException)
+        {
+            lock (handle.Gate)
+            {
+                if (handle.Source is { } kept)
+                {
+                    return kept;
+                }
+            }
+            throw;
+        }
+        var version = entry.StagingPath ?? $"{entry.ItemId}|{entry.ContentTag}";
         lock (handle.Gate)
         {
-            if (handle.Source is not null && handle.SourceStaging == staging)
+            if (handle.Source is not null && handle.SourceVersion == version)
             {
                 return handle.Source;
             }
         }
-        var source = Run(engine.OpenContentAsync(handle.Entry, default));
+        var source = Run(engine.OpenContentAsync(entry, default));
         lock (handle.Gate)
         {
             handle.Source?.Dispose();
             handle.Source = source;
-            handle.SourceStaging = staging;
+            handle.SourceVersion = version;
             return source;
         }
     }
 
-    SafeFileHandle Writable(Handle handle)
+    /// <summary>
+    /// The staging file a write goes to, with the engine's write lease taken: dispose it after the write and MarkDirty. A handle whose
+    /// content was uploaded stages again from the item it went into (a conflict copy included), never from a version it didn't write;
+    /// once its content was deleted or replaced, writes fail (STATUS_FILE_INVALID).
+    /// </summary>
+    (SafeFileHandle Content, FsEntry Entry, IDisposable Lease) BeginWrite(Handle handle)
     {
-        lock (handle.Gate)
+        while (true)
         {
-            if (handle.Wrote && handle.Content is not null && handle.ContentPath == engine.StagingPathOf(handle.Entry))
+            var entry = handle.Entry = engine.Follow(handle.Entry);
+            lock (handle.Gate)
             {
-                return handle.Content;
+                if (handle.Wrote && handle.Content is { } content && handle.ContentPath == entry.StagingPath && engine.BeginWrite(entry) is { } lease)
+                {
+                    return (content, entry, lease);
+                }
             }
+            Stage(handle, truncate: false);
         }
-        return Stage(handle, truncate: false);
     }
 
     SafeFileHandle Stage(Handle handle, bool truncate)
     {
-        var staging = Run(engine.OpenForWriteAsync(handle.Entry, truncate, default));
+        var staged = Run(engine.StageAsync(handle.Entry, truncate, default));
         lock (handle.Gate)
         {
-            if (handle.ContentPath != staging || handle.Content is null)
+            handle.Entry = staged;
+            if (handle.ContentPath != staged.StagingPath || handle.Content is null)
             {
                 handle.Content?.Dispose();
-                handle.Content = OpenStaging(staging);
-                handle.ContentPath = staging;
+                handle.Content = OpenStaging(staged.StagingPath!);
+                handle.ContentPath = staged.StagingPath;
             }
             handle.Wrote = true;
             return handle.Content;
@@ -560,4 +646,87 @@ sealed class Vfs365FileSystem(DriveEngine engine, string label, Action<string>? 
         descriptor.GetBinaryForm(bytes, 0);
         return bytes;
     }
+
+    static readonly SecurityIdentifier Owner = WindowsIdentity.GetCurrent().User!;
+    static readonly SecurityIdentifier LocalSystem = new(WellKnownSidType.LocalSystemSid, null);
+    int tokenUnreadable;
+
+    /// <summary>
+    /// False when the open being served comes from someone other than the volume's user or SYSTEM (elevated processes of the user have
+    /// the same SID). Checked before the engine sees the name, so another user's open costs no lookup and can't probe names; WinFsp's
+    /// access check against the volume's descriptor follows anyway. Reads the requester's token, which WinFsp passes with each create for
+    /// that check: it covers impersonating callers and needs no rights on another user's process. Undecidable cases are allowed (logged once).
+    /// </summary>
+    bool FromOwner(string fileName)
+    {
+        SecurityIdentifier? user;
+        string? problem = null;
+        try
+        {
+            user = Requester.User();
+        }
+        catch (Exception e)
+        {
+            (user, problem) = (null, e.Message);
+        }
+        if (user is not null)
+        {
+            if (user == Owner || user == LocalSystem)
+            {
+                return true;
+            }
+            trace?.Invoke($"refused {fileName}: requested by {user.Value}");
+            return false;
+        }
+        if (Interlocked.Exchange(ref tokenUnreadable, 1) == 0)
+        {
+            log?.Invoke($"error: the requester of an open could not be read, opens are left to WinFsp's own access check{(problem is null ? "" : $": {problem}")}");
+        }
+        return true;
+    }
+
+    /// <summary>The user of the create request being served, from WinFsp's request (FSP_FSCTL_TRANSACT_REQ); null when unreadable.</summary>
+    static unsafe class Requester
+    {
+        const uint CreateKind = 1; // FspFsctlTransactCreateKind
+        const int KindOffset = 4, AccessTokenOffset = 40, TokenUser = 1;
+
+        static readonly delegate* unmanaged<IntPtr> OperationContext = (delegate* unmanaged<IntPtr>)NativeLibrary.GetExport(
+            GetModuleHandle(RuntimeInformation.ProcessArchitecture switch
+            {
+                Architecture.Arm64 => "winfsp-a64.dll",
+                Architecture.X86 => "winfsp-x86.dll",
+                _ => "winfsp-x64.dll",
+            }), "FspFileSystemGetOperationContext");
+
+        /// <summary>
+        /// Only creates carry a token. Other requests act on handles that passed this check, and creates without a token come from
+        /// kernel mode; both count as the owner's.
+        /// </summary>
+        public static SecurityIdentifier? User()
+        {
+            var context = (byte**)OperationContext();
+            if (context is null || *context is null)
+            {
+                return null;
+            }
+            var request = *context;
+            var token = (IntPtr)(long)(*(ulong*)(request + AccessTokenOffset) & 0xffffffff); // low half: a handle in this process
+            if (*(uint*)(request + KindOffset) != CreateKind || token == IntPtr.Zero)
+            {
+                return Owner;
+            }
+            var info = stackalloc byte[256];
+            return GetTokenInformation(token, TokenUser, info, 256, out _) ? new SecurityIdentifier(*(IntPtr*)info) : null;
+        }
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        static extern bool GetTokenInformation(IntPtr token, int infoClass, byte* info, int length, out int returned);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        static extern IntPtr GetModuleHandle(string moduleName);
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool FlushFileBuffers(SafeFileHandle file);
 }

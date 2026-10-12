@@ -72,6 +72,24 @@ public sealed class StreamingTests : IDisposable
         Assert.Equal(data.Length, cached.Length);
     }
 
+    [Fact]
+    public async Task Random_reads_in_more_regions_than_streams_do_not_wait_for_an_idle_stream()
+    {
+        // Databases and CAD files read all over the place; at most 3 streams are open, the one idle longest makes room
+        var data = Data(48 * MiB);
+        api.Add("model.db", data);
+        var file = (await engine.GetEntryAsync("\\OneDrive\\model.db", default))!;
+
+        using var source = await engine.OpenContentAsync(file, default);
+        foreach (var region in new[] { 0, 12, 24, 36, 6 })
+        {
+            var buffer = new byte[4096];
+            var read = source.ReadAsync((long)region * MiB, buffer, default).AsTask();
+            Assert.Same(read, await Task.WhenAny(read, Task.Delay(TimeSpan.FromSeconds(20)))); // an idle stream stops only after 30 s
+            Assert.Equal(data.AsSpan(region * MiB, 4096).ToArray(), buffer);
+        }
+    }
+
     async Task<FsEntry> CopyInAsync(string name, byte[] data, bool presize, int chunk = MiB, bool outOfOrder = false, bool patchHeader = false)
     {
         var path = "\\OneDrive\\" + name;

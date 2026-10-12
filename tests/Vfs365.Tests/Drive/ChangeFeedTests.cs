@@ -9,7 +9,9 @@ public sealed class ChangeFeedTests : IDisposable
     readonly List<EngineChange> changes = [];
     DateTimeOffset now = new(2026, 10, 6, 12, 0, 0, TimeSpan.Zero);
 
-    DriveEngine Create(FakeDriveApi api) =>
+    readonly List<string> log = [];
+
+    DriveEngine Create(FakeDriveApi api, int maxCachedItems = 250_000) =>
         new(DriveNamespace.Build(new MyDrive("b!me", "https://x-my.sharepoint.com/personal/u"), [], (_, _) => Task.FromResult("unused"), DriveScope.OneDrive),
             api,
             new ContentCache(Path.Combine(directory, "cache"), api),
@@ -17,7 +19,9 @@ public sealed class ChangeFeedTests : IDisposable
             {
                 StagingDirectory = Path.Combine(directory, "staging"),
                 Clock = () => now,
+                MaxCachedItems = maxCachedItems,
                 Changed = change => { lock (changes) { changes.Add(change); } },
+                Log = line => { lock (log) { log.Add(line); } },
             });
 
     static async Task<string[]> Names(DriveEngine engine, string path) =>
@@ -235,6 +239,185 @@ public sealed class ChangeFeedTests : IDisposable
         Assert.Equal(1, resolves);
         Assert.True(Saw("\\Sites", ChangeKind.Modified));
         Assert.Equal("\\Sites\\Finance\\Documents", ns.VolumePathOf("b!finance"));
+    }
+
+    [Fact]
+    public async Task A_remote_folder_rename_is_seen_when_its_parent_is_not_cached()
+    {
+        var api = new FakeDriveApi();
+        api.Add("docs", folder: true);
+        api.Add("docs/sub", folder: true);
+        api.Add("docs/sub/x.txt");
+        var engine = Create(api);
+        await engine.PollAsync("b!me");
+        Assert.Equal(["x.txt"], await Names(engine, "\\docs\\sub")); // \docs itself is never listed
+
+        // A colleague renames the folder and makes a new one with the old name
+        api.RemoteMove("docs/sub", "docs/renamed");
+        api.Add("docs/sub", folder: true);
+        await engine.PollAsync("b!me");
+
+        Assert.Null(await engine.GetEntryAsync("\\docs\\sub\\x.txt", default));
+        Assert.Empty(await Names(engine, "\\docs\\sub"));
+        Assert.True(Saw("\\docs\\sub", ChangeKind.Removed));
+    }
+
+    [Fact]
+    public async Task A_folder_moved_elsewhere_under_its_own_name_is_seen()
+    {
+        var api = new FakeDriveApi();
+        api.Add("a", folder: true);
+        api.Add("b", folder: true);
+        api.Add("a/sub", folder: true);
+        api.Add("a/sub/x.txt");
+        var engine = Create(api);
+        await engine.PollAsync("b!me");
+        Assert.Equal(["x.txt"], await Names(engine, "\\a\\sub"));
+
+        api.RemoteMove("a/sub", "b/sub");
+        await engine.PollAsync("b!me");
+
+        Assert.Null(await engine.GetEntryAsync("\\a\\sub\\x.txt", default));
+        Assert.Equal(["x.txt"], await Names(engine, "\\b\\sub"));
+    }
+
+    [Fact]
+    public async Task A_change_while_a_folder_loads_is_not_lost()
+    {
+        var api = new FakeDriveApi { PageSize = 2 };
+        api.Add("docs", folder: true);
+        for (var i = 1; i <= 5; i++)
+        {
+            api.Add($"docs/f{i}.txt");
+        }
+        var engine = Create(api);
+        await engine.PollAsync("b!me");
+        var rest = new TaskCompletionSource();
+        api.BeforeNextPage = () => rest.Task;
+        var loading = engine.ListAsync((await engine.GetEntryAsync("\\docs", default))!, default);
+
+        api.Add("docs/new.txt"); // after the listing was read, before it finished
+        await engine.PollAsync("b!me");
+        rest.SetResult();
+        await loading;
+        var lists = api.ListCalls;
+
+        Assert.Contains("new.txt", await Names(engine, "\\docs"));
+        Assert.Equal(lists, api.ListCalls);
+    }
+
+    [Fact]
+    public async Task Restored_listings_answer_for_a_day_and_are_then_read_again_without_lookups()
+    {
+        var api = new FakeDriveApi();
+        api.Add("docs", folder: true);
+        api.Add("docs/a.txt");
+        var first = Create(api);
+        await first.PollAsync("b!me");
+        await Names(first, "\\");
+        await Names(first, "\\docs");
+        var snapshots = first.ExportSnapshots(100);
+
+        now += TimeSpan.FromHours(5); // the next morning
+        var second = Create(api);
+        second.ImportSnapshots(snapshots);
+        var (lists, gets) = (api.ListCalls, api.GetCalls);
+        Assert.Equal(["a.txt"], await Names(second, "\\docs"));
+        Assert.NotNull(await second.GetEntryAsync("\\docs\\a.txt", default));
+        await second.PollAsync("b!me");
+        Assert.Equal((lists, gets), (api.ListCalls, api.GetCalls));
+
+        now += TimeSpan.FromHours(20); // older than a day: read again in the background when opened
+        Assert.Equal(["a.txt"], await Names(second, "\\docs"));
+        await Eventually(() => api.ListCalls == lists + 1);
+        Assert.Equal(gets, api.GetCalls); // the folder's ID was known
+    }
+
+    [Fact]
+    public async Task A_long_catch_up_on_a_drive_with_few_cached_folders_starts_over()
+    {
+        var api = new FakeDriveApi { DeltaPageSize = 1 };
+        api.Add("docs", folder: true);
+        api.Add("docs/a.txt");
+        var engine = Create(api);
+        await engine.PollAsync("b!me");
+        Assert.Equal(["a.txt"], await Names(engine, "\\docs"));
+        for (var i = 0; i < 30; i++)
+        {
+            api.Add($"other{i}.txt");
+        }
+        var (lists, deltas) = (api.ListCalls, api.DeltaCalls);
+
+        await engine.PollAsync("b!me");
+
+        Assert.Equal(deltas + 10 + 1, api.DeltaCalls); // 10 pages, then a new start
+        Assert.Contains(log, line => line.Contains("starting over"));
+        Assert.Equal(["a.txt"], await Names(engine, "\\docs"));
+        Assert.Equal(lists + 1, api.ListCalls);
+    }
+
+    [Fact]
+    public async Task A_library_glanced_at_once_gets_no_change_feed_until_it_is_used()
+    {
+        var api = new FakeDriveApi();
+        api.Add("docs", folder: true);
+        api.Add("docs/a.txt");
+        var engine = Create(api);
+
+        Assert.Equal(["docs"], await Names(engine, "\\"));
+        Assert.Empty(engine.ActiveDrives());
+        Assert.Equal(0, api.DeltaCalls);
+
+        Assert.Equal(["a.txt"], await Names(engine, "\\docs"));
+        Assert.Equal(["b!me"], engine.ActiveDrives());
+        await Eventually(() => api.DeltaCalls > 0);
+    }
+
+    [Fact]
+    public async Task Least_recently_used_listings_leave_memory_beyond_the_budget()
+    {
+        var api = new FakeDriveApi();
+        for (var i = 0; i < 10; i++)
+        {
+            api.Add($"f{i}", folder: true);
+            api.Add($"f{i}/a.txt");
+        }
+        var engine = Create(api, maxCachedItems: 10);
+        await engine.PollAsync("b!me");
+        for (var i = 0; i < 10; i++)
+        {
+            await Names(engine, $"\\f{i}");
+        }
+
+        now += TimeSpan.FromMinutes(3);
+        await Names(engine, "\\f9"); // in use: stays
+        await engine.PollActiveAsync();
+        var lists = api.ListCalls;
+        await Names(engine, "\\f9");
+        Assert.Equal(lists, api.ListCalls);
+        await Names(engine, "\\f0");
+
+        Assert.Equal(lists + 1, api.ListCalls);
+        Assert.Contains(log, line => line.Contains("left memory"));
+    }
+
+    [Fact]
+    public async Task The_metadata_version_changes_only_when_listings_do()
+    {
+        var api = new FakeDriveApi();
+        api.Add("docs", folder: true);
+        api.Add("docs/a.txt");
+        var engine = Create(api);
+        await engine.PollAsync("b!me");
+        await Names(engine, "\\docs");
+        var version = engine.MetadataVersion;
+
+        await engine.PollAsync("b!me");
+        Assert.Equal(version, engine.MetadataVersion);
+
+        api.Add("docs/b.txt");
+        await engine.PollAsync("b!me");
+        Assert.NotEqual(version, engine.MetadataVersion);
     }
 
     public void Dispose()

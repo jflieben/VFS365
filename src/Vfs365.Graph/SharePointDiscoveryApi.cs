@@ -7,22 +7,40 @@ namespace Vfs365.Graph;
 /// <summary>Discovery calls: Graph for the user's OneDrive and library drives, SharePoint REST for search and metadata.</summary>
 public sealed class SharePointDiscoveryApi(M365Client client) : ISharePointDiscoveryApi
 {
-    const string SelectProperties = "Title,Path,ListId,SiteId,WebId,SPWebUrl,SPSiteUrl,SiteTitle,SiteTemplate";
+    const string SelectProperties = "Title,Path,ListId,SiteId,WebId,SPWebUrl,SPSiteUrl,SiteTitle,SiteTemplate,DocId";
     const string ListSelect = "Title,Hidden,BaseTemplate,IsCatalog,IsSystemList,TemplateFeatureId,ForceCheckout,ExcludeFromOfflineClient,ItemCount,EntityTypeName";
+    const string ClientType = "VFS365";
 
+    /// <summary>Also gives the client the tenant's SharePoint host when it has none yet, so tokens go only to the tenant's hosts.</summary>
     public async Task<MyDrive> GetMyDriveAsync(CancellationToken ct)
     {
         using var doc = await RequiredAsync(new Uri($"{M365Client.GraphResource}/v1.0/me/drive?$select=id,webUrl"), ct);
-        return new(Str(doc.RootElement, "id")!, Str(doc.RootElement, "webUrl")!);
+        var drive = new MyDrive(Str(doc.RootElement, "id")!, Str(doc.RootElement, "webUrl")!);
+        client.TenantRootHost ??= new Uri(SharePointUrls.TenantRootFromOneDriveUrl(drive.WebUrl)).Host;
+        return drive;
     }
 
-    public async Task<SearchPage> SearchDocumentLibrariesAsync(string tenantRoot, int startRow, int rowLimit, CancellationToken ct)
+    public async Task<SearchPage> SearchDocumentLibrariesAsync(string tenantRoot, long afterDocId, int startRow, int rowLimit, CancellationToken ct)
     {
-        var query = Uri.EscapeDataString("contentclass:STS_List_DocumentLibrary");
-        var select = Uri.EscapeDataString(SelectProperties);
-        var uri = new Uri($"{tenantRoot}/_api/search/query?querytext='{query}'&trimduplicates=false&rowlimit={rowLimit}&startrow={startRow}&selectproperties='{select}'");
-        using var doc = await RequiredAsync(uri, ct);
+        using var doc = await RequiredAsync(SearchUri(tenantRoot, afterDocId, startRow, rowLimit), ct);
         return ParseSearchPage(doc.RootElement);
+    }
+
+    /// <summary>
+    /// Document libraries without other users' OneDrives (the tenant's -my host; the user's own comes from /me/drive), sorted by DocId
+    /// and, after the first page, restricted to DocIds above <paramref name="afterDocId"/>. Multi-geo tenants: fanned out to every geo
+    /// (that needs a ClientType).
+    /// </summary>
+    public static Uri SearchUri(string tenantRoot, long afterDocId, int startRow, int rowLimit)
+    {
+        var kql = $"contentclass:STS_List_DocumentLibrary -Path:\"{SharePointUrls.OneDriveRoot(tenantRoot)}*\"";
+        if (afterDocId > 0)
+        {
+            kql = $"IndexDocId>{afterDocId} AND ({kql})";
+        }
+        return new Uri($"{tenantRoot}/_api/search/query?querytext='{Uri.EscapeDataString(kql.Replace("'", "''"))}'&sortlist='docid:ascending'&trimduplicates=false" +
+            $"&rowlimit={rowLimit}&startrow={startRow}&selectproperties='{Uri.EscapeDataString(SelectProperties)}'" +
+            $"&Properties='{Uri.EscapeDataString("EnableMultiGeoSearch:true")}'&ClientType='{ClientType}'");
     }
 
     public async Task<SiteMetadata> GetSiteAsync(string webUrl, CancellationToken ct)
@@ -30,6 +48,23 @@ public sealed class SharePointDiscoveryApi(M365Client client) : ISharePointDisco
         using var doc = await RequiredAsync(new Uri($"{webUrl}/_api/site?$select=ReadOnly,WriteLocked"), ct);
         return new(Bool(doc.RootElement, "ReadOnly"), Bool(doc.RootElement, "WriteLocked"));
     }
+
+    public async Task<IReadOnlyList<PinnedLibrary>?> GetWebLibrariesAsync(string webUrl, CancellationToken ct)
+    {
+        try
+        {
+            // BaseType 1: every kind of document library, so each search hit of this web is answered here
+            using var doc = await client.GetJsonAsync(new Uri($"{webUrl.TrimEnd('/')}/_api/web/lists?$select=Id,{ListSelect}&$filter=BaseType eq 1&$top=5000"), ct, notFoundAsNull: true);
+            return doc is null ? null : ParseLists(doc.RootElement);
+        }
+        catch (M365RequestException e) when (e.Error == Core.RemoteError.AccessDenied)
+        {
+            return null;
+        }
+    }
+
+    public static IReadOnlyList<PinnedLibrary> ParseLists(JsonElement root) =>
+        root.GetProperty("value").EnumerateArray().Where(l => Str(l, "Id") is not null).Select(l => new PinnedLibrary(Str(l, "Id")!, ParseList(l))).ToList();
 
     public async Task<ListMetadata?> GetListAsync(string baseUrl, string listId, CancellationToken ct)
     {
@@ -79,7 +114,7 @@ public sealed class SharePointDiscoveryApi(M365Client client) : ISharePointDisco
             if (segments.Length <= webSegments)
             {
                 using var lists = await RequiredAsync(new Uri($"{webUrl}/_api/web/lists?$select=Id,{ListSelect}&$filter=BaseTemplate eq 101"), ct);
-                libraries.AddRange(lists.RootElement.GetProperty("value").EnumerateArray().Select(l => new PinnedLibrary(Str(l, "Id")!, ParseList(l))));
+                libraries.AddRange(ParseLists(lists.RootElement));
             }
             else
             {
@@ -102,11 +137,16 @@ public sealed class SharePointDiscoveryApi(M365Client client) : ISharePointDisco
     static string PathOf(string[] segments, int count) =>
         count <= 0 ? "" : "/" + string.Join('/', segments.Take(count).Select(Uri.EscapeDataString));
 
-    /// <summary>Parses a search response (odata=nometadata). Rows without IDs are dropped; RowCount still counts them for paging.</summary>
+    /// <summary>
+    /// Parses a search response (odata=nometadata). Rows without IDs are dropped; RowCount still counts them for paging. The web URL is
+    /// SPWebUrl when the library's path lies under it, else derived from the path (a default view outside Forms, or a library deeper
+    /// than web/library, would give a wrong web).
+    /// </summary>
     public static SearchPage ParseSearchPage(JsonElement root)
     {
         var rows = root.GetProperty("PrimaryQueryResult").GetProperty("RelevantResults").GetProperty("Table").GetProperty("Rows");
         var libraries = new List<DiscoveredLibrary>();
+        long? lastDocId = null;
         foreach (var row in rows.EnumerateArray())
         {
             var cells = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
@@ -119,7 +159,9 @@ public sealed class SharePointDiscoveryApi(M365Client client) : ISharePointDisco
             }
             string? Get(string key) => cells.TryGetValue(key, out var value) && !string.IsNullOrWhiteSpace(value) ? value : null;
 
-            var webUrl = (SharePointUrls.WebUrlFromListPath(Get("Path")) ?? Get("SPWebUrl") ?? Get("SPSiteUrl") ?? Get("Path"))?.TrimEnd('/');
+            lastDocId = long.TryParse(Get("DocId"), out var docId) ? docId : null;
+
+            var webUrl = WebUrl(Get("SPWebUrl"), Get("Path")) ?? Get("SPSiteUrl")?.TrimEnd('/');
             if (Get("ListId") is not { } listId || Get("SiteId") is not { } siteId || Get("WebId") is not { } webId || webUrl is null)
             {
                 continue;
@@ -135,7 +177,17 @@ public sealed class SharePointDiscoveryApi(M365Client client) : ISharePointDisco
                 Get("Title") ?? "",
                 Get("SiteTemplate")));
         }
-        return new SearchPage(libraries, rows.GetArrayLength());
+        return new SearchPage(libraries, rows.GetArrayLength(), lastDocId);
+    }
+
+    static string? WebUrl(string? spWebUrl, string? path)
+    {
+        var web = spWebUrl?.TrimEnd('/');
+        if (web is not null && (path is null || Uri.UnescapeDataString(path).StartsWith(Uri.UnescapeDataString(web) + "/", StringComparison.OrdinalIgnoreCase)))
+        {
+            return web;
+        }
+        return (SharePointUrls.WebUrlFromListPath(path) ?? web ?? path)?.TrimEnd('/');
     }
 
     public static ListMetadata ParseList(JsonElement list) => new(

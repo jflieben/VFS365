@@ -28,6 +28,20 @@ public sealed record DiscoveryOptions
     /// <summary>A library's site and library metadata is reused this long after it was read; older and new ones are looked up.</summary>
     public TimeSpan MetadataMaxAge { get; init; } = TimeSpan.FromHours(48);
 
+    /// <summary>
+    /// A library read for the first time counts as read up to this much earlier (a fixed share per library key), so the libraries of
+    /// a first run don't all expire at the same moment.
+    /// </summary>
+    public TimeSpan FirstReadJitter { get; init; } = TimeSpan.FromHours(24);
+
+    /// <summary>
+    /// Per run, at most this share of the sites (at least <see cref="MinSiteRechecks"/>) has expired metadata read again, oldest
+    /// first; the others keep theirs until a later run. New libraries and a refresh (MetadataMaxAge zero) are never held back.
+    /// </summary>
+    public double SiteRecheckShare { get; init; } = 0.5;
+
+    public int MinSiteRechecks { get; init; } = 10;
+
     public Func<DateTimeOffset> Clock { get; init; } = () => DateTimeOffset.UtcNow;
 
     /// <summary>Why a site's template keeps its libraries hidden, or null. A template search didn't report is never held against a site.</summary>

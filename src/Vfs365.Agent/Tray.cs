@@ -6,24 +6,42 @@ namespace Vfs365.Agent;
 
 public enum TrayState { Normal, Waiting, Error }
 
-/// <summary>What the tray menu opens and does. RefreshBlocked: null when Refresh is allowed now, else why not (its tooltip).</summary>
-public sealed record TrayActions(string ShowFiles, string HelpUrl, Action Restart, Action Refresh, Func<string?> RefreshBlocked);
+/// <summary>
+/// What the tray menu offers; an item shows only when its action is set. ShowFiles: what Show files opens. RefreshBlocked: null when
+/// Refresh is allowed now, else why not (the hint); RefreshLabel: the item's text. SignIn shows while SignInNeeded says so.
+/// SessionEnded runs when Windows ends the session (it may block until pending changes are uploaded).
+/// </summary>
+public sealed record TrayActions(string HelpUrl)
+{
+    public string? ShowFiles { get; init; }
+    public Action? Restart { get; init; }
+    public Action? Refresh { get; init; }
+    public Func<string?>? RefreshBlocked { get; init; }
+    public Func<string>? RefreshLabel { get; init; }
+    public Action? Retry { get; init; }
+    public Action? SignIn { get; init; }
+    public Func<bool>? SignInNeeded { get; init; }
+    public Action? SessionEnded { get; init; }
+}
 
 /// <summary>
 /// Tray icon of the background agent: a single-colour glyph that follows the taskbar theme (assets\tray, tools/New-TrayIcons.ps1)
 /// with a badge for uploads waiting or a sign-in problem, a status tooltip, a menu, and notifications (shown as toasts on Windows 10
 /// and 11 with the VFS365 icon). Plain Win32 on its own DPI-aware thread, no UI framework. Survives an Explorer restart.
+/// NOTIFYICON_VERSION_4: a click opens the files, the context menu (mouse or keyboard) opens at the icon, Enter on the focused icon
+/// opens the menu too. Texts follow the display language (UiText).
 /// </summary>
 sealed class Tray : IDisposable
 {
-    const uint CallbackMessage = 0x0400 + 1, WmLButtonUp = 0x0202, WmRButtonUp = 0x0205, WmClose = 0x0010, WmDestroy = 0x0002, WmSettingChange = 0x001A;
-    const uint NimAdd = 0, NimModify = 1, NimDelete = 2, NifMessage = 1, NifIcon = 2, NifTip = 4, NifInfo = 0x10;
+    const uint CallbackMessage = 0x0400 + 1, WmClose = 0x0010, WmDestroy = 0x0002, WmSettingChange = 0x001A, WmContextMenu = 0x007B, WmEndSession = 0x0016;
+    const uint NinSelect = 0x0400, NinKeySelect = 0x0401, NinBalloonUserClick = 0x0405, WmLButtonDblClk = 0x0203;
+    const uint NimAdd = 0, NimModify = 1, NimDelete = 2, NimSetVersion = 4, NifMessage = 1, NifIcon = 2, NifTip = 4, NifInfo = 0x10, NifShowTip = 0x80;
     const uint NiifUser = 4, NiifLargeIcon = 0x20, MfString = 0, MfGrayed = 1, MfSeparator = 0x800, TpmReturnCmd = 0x100, TpmRightButton = 2;
-    const int ShowFiles = 1, ShowLog = 2, Restart = 3, Help = 4, Website = 5, Refresh = 6;
+    const int ShowFiles = 1, ShowLog = 2, Restart = 3, Help = 4, Website = 5, Refresh = 6, SignIn = 7, Retry = 8;
     public const string JSolveUrl = "https://jsolve.nl";
 
     readonly string label;
-    readonly TrayActions actions;
+    volatile TrayActions actions;
     readonly Action<string> log;
     readonly WndProc procedure;
     readonly Thread thread;
@@ -39,10 +57,14 @@ sealed class Tray : IDisposable
     int refreshPosition = -1;
     string? refreshBlocked;
 
+    /// <summary>What a click on the last notification does (sign in), if anything; and when the files were last opened by a click.</summary>
+    volatile Action? notificationClicked;
+    long lastSelect;
+
     public Tray(string label, TrayActions actions, Action<string> log)
     {
         (this.label, this.actions, this.log) = (label, actions, log);
-        status = "starting";
+        status = UiText.Get("Status.Starting");
         procedure = WindowProcedure;
         thread = new Thread(Run) { IsBackground = true, Name = "VFS365 tray" };
         thread.SetApartmentState(ApartmentState.STA);
@@ -63,12 +85,21 @@ sealed class Tray : IDisposable
             state = newState;
             PostMessage(window, ReloadIconMessage, IntPtr.Zero, IntPtr.Zero);
         }
-        var data = Data(NifTip);
+        var data = Data(NifTip | NifShowTip);
         Shell_NotifyIcon(NimModify, ref data);
     }
 
-    public void Notify(string title, string text)
+    /// <summary>What the menu offers from now on (a start that waits offers Retry, a mounted drive Show files and Refresh).</summary>
+    public TrayActions Actions
     {
+        get => actions;
+        set => actions = value;
+    }
+
+    /// <summary>A notification; a click on it runs <paramref name="clicked"/>.</summary>
+    public void Notify(string title, string text, Action? clicked = null)
+    {
+        notificationClicked = clicked;
         var data = Data(NifInfo);
         data.szInfoTitle = Trim(title, 63);
         data.szInfo = Trim(text, 255);
@@ -77,7 +108,23 @@ sealed class Tray : IDisposable
         Shell_NotifyIcon(NimModify, ref data);
     }
 
-    const uint ReloadIconMessage = 0x0400 + 2, WmMenuSelect = 0x011F, WmExitMenuLoop = 0x0212;
+    /// <summary>
+    /// The reason Windows shows when the session ends while changes still upload (ShutdownBlockReasonCreate), or null to remove it. Set
+    /// on the tray's thread, which owns the window.
+    /// </summary>
+    public void BlockShutdown(string? reason)
+    {
+        if (reason == blockReason)
+        {
+            return;
+        }
+        blockReason = reason;
+        PostMessage(window, BlockShutdownMessage, IntPtr.Zero, IntPtr.Zero);
+    }
+
+    volatile string? blockReason;
+
+    const uint ReloadIconMessage = 0x0400 + 2, BlockShutdownMessage = 0x0400 + 3, WmMenuSelect = 0x011F, WmExitMenuLoop = 0x0212;
 
     void Run()
     {
@@ -154,13 +201,35 @@ sealed class Tray : IDisposable
             }
             if (message == CallbackMessage)
             {
+                // Version 4: the event in lParam's low word, the anchor point (icon or pointer) in wParam
+                var x = (short)(wParam.ToInt64() & 0xFFFF);
+                var y = (short)((wParam.ToInt64() >> 16) & 0xFFFF);
                 switch ((uint)lParam.ToInt64() & 0xFFFF)
                 {
-                    case WmLButtonUp:
-                        Open(actions.ShowFiles);
+                    case NinSelect:
+                        // A double click also sends a second select: one Explorer window per double-click time
+                        var now = Environment.TickCount64;
+                        if (now - Interlocked.Exchange(ref lastSelect, now) <= GetDoubleClickTime())
+                        {
+                            break;
+                        }
+                        if (actions.ShowFiles is { } files)
+                        {
+                            Open(files);
+                        }
+                        else
+                        {
+                            ShowMenu(x, y); // no drive yet: the menu says why and offers Retry
+                        }
                         break;
-                    case WmRButtonUp:
-                        ShowMenu();
+                    case WmLButtonDblClk:
+                        break;
+                    case NinKeySelect:
+                    case WmContextMenu:
+                        ShowMenu(x, y);
+                        break;
+                    case NinBalloonUserClick:
+                        notificationClicked?.Invoke();
                         break;
                 }
                 return IntPtr.Zero;
@@ -168,6 +237,24 @@ sealed class Tray : IDisposable
             if (message == ReloadIconMessage)
             {
                 LoadIcon();
+                return IntPtr.Zero;
+            }
+            if (message == BlockShutdownMessage)
+            {
+                if (blockReason is { } reason)
+                {
+                    ShutdownBlockReasonCreate(window, reason);
+                }
+                else
+                {
+                    ShutdownBlockReasonDestroy(window);
+                }
+                return IntPtr.Zero;
+            }
+            if (message == WmEndSession && wParam != IntPtr.Zero)
+            {
+                // The session ends (not a cancelled shutdown): this window waits with the block reason while pending changes upload
+                actions.SessionEnded?.Invoke();
                 return IntPtr.Zero;
             }
             if (message == WmMenuSelect)
@@ -222,52 +309,88 @@ sealed class Tray : IDisposable
 
     void Add()
     {
-        var data = Data(NifMessage | NifIcon | NifTip);
+        var data = Data(NifMessage | NifIcon | NifTip | NifShowTip);
         if (!Shell_NotifyIcon(NimAdd, ref data))
         {
             log("tray: Windows did not add the icon");
         }
+        data.uTimeoutOrVersion = 4; // NOTIFYICON_VERSION_4
+        Shell_NotifyIcon(NimSetVersion, ref data);
     }
 
-    void ShowMenu()
+    void ShowMenu(int x, int y)
     {
-        refreshBlocked = actions.RefreshBlocked();
+        var current = actions;
+        refreshBlocked = current.Refresh is null ? null : current.RefreshBlocked?.Invoke();
         var menu = CreatePopupMenu();
-        AppendMenu(menu, MfString | MfGrayed, 0, $"Status: {status}");
-        AppendMenu(menu, MfSeparator, 0, null);
-        AppendMenu(menu, MfString, ShowFiles, "Show files");
-        AppendMenu(menu, MfString, ShowLog, "Show log");
-        refreshPosition = 4; // status, separator, Show files, Show log
-        AppendMenu(menu, MfString | (refreshBlocked is null ? 0 : MfGrayed), Refresh, "Refresh");
-        AppendMenu(menu, MfString, Restart, "Restart");
-        AppendMenu(menu, MfSeparator, 0, null);
-        AppendMenu(menu, MfString, Help, "Help");
-        AppendMenu(menu, MfSeparator, 0, null);
-        AppendMenu(menu, MfString, Website, $"VFS365 {typeof(Tray).Assembly.GetName().Version!.ToString(3)} by JSolve B.V.");
-        SetMenuDefaultItem(menu, ShowFiles, 0);
-        GetCursorPos(out var point);
+        var position = 0;
+        void Item(uint flags, int id, string? text)
+        {
+            AppendMenu(menu, flags, id, text);
+            position++;
+        }
+        Item(MfString | MfGrayed, 0, UiText.Get("Menu.Status", status.Replace("&", "&&")));
+        Item(MfSeparator, 0, null);
+        if (current.SignIn is not null && current.SignInNeeded?.Invoke() == true)
+        {
+            Item(MfString, SignIn, UiText.Get("Menu.SignIn"));
+        }
+        if (current.Retry is not null)
+        {
+            Item(MfString, Retry, UiText.Get("Menu.Retry"));
+        }
+        if (current.ShowFiles is not null)
+        {
+            Item(MfString, ShowFiles, UiText.Get("Menu.ShowFiles"));
+        }
+        Item(MfString, ShowLog, UiText.Get("Menu.ShowLog"));
+        refreshPosition = -1;
+        if (current.Refresh is not null)
+        {
+            refreshPosition = position;
+            Item(MfString | (refreshBlocked is null ? 0 : MfGrayed), Refresh, current.RefreshLabel?.Invoke() ?? UiText.Get("Menu.Refresh"));
+        }
+        if (current.Restart is not null)
+        {
+            Item(MfString, Restart, UiText.Get("Menu.Restart"));
+        }
+        Item(MfSeparator, 0, null);
+        Item(MfString, Help, UiText.Get("Menu.Help"));
+        Item(MfSeparator, 0, null);
+        Item(MfString, Website, UiText.Get("Menu.Version", typeof(Tray).Assembly.GetName().Version!.ToString(3)));
+        SetMenuDefaultItem(menu, current.SignIn is not null && current.SignInNeeded?.Invoke() == true ? SignIn : current.ShowFiles is not null ? ShowFiles : ShowLog, 0);
+        if (x == 0 && y == 0 && GetCursorPos(out var pointer))
+        {
+            (x, y) = (pointer.X, pointer.Y);
+        }
         SetForegroundWindow(window);
         openMenu = menu;
-        var command = TrackPopupMenu(menu, TpmReturnCmd | TpmRightButton, point.X, point.Y, 0, window, IntPtr.Zero);
+        var command = TrackPopupMenu(menu, TpmReturnCmd | TpmRightButton, x, y, 0, window, IntPtr.Zero);
         openMenu = IntPtr.Zero;
         HideTooltip();
         DestroyMenu(menu);
         switch (command)
         {
-            case ShowFiles:
-                Open(actions.ShowFiles);
+            case ShowFiles when current.ShowFiles is not null:
+                Open(current.ShowFiles);
                 break;
             case ShowLog:
                 Start("notepad.exe", $"\"{AgentLog.FilePath}\"");
                 break;
             case Refresh:
-                actions.Refresh();
+                current.Refresh?.Invoke();
                 break;
             case Restart:
-                actions.Restart();
+                current.Restart?.Invoke();
+                break;
+            case SignIn:
+                current.SignIn?.Invoke();
+                break;
+            case Retry:
+                current.Retry?.Invoke();
                 break;
             case Help:
-                Open(actions.HelpUrl);
+                Open(current.HelpUrl);
                 break;
             case Website:
                 Open(JSolveUrl);
@@ -649,4 +772,13 @@ sealed class Tray : IDisposable
 
     [DllImport("user32.dll")]
     static extern bool DestroyIcon(IntPtr icon);
+
+    [DllImport("user32.dll")]
+    static extern uint GetDoubleClickTime();
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    static extern bool ShutdownBlockReasonCreate(IntPtr hwnd, string reason);
+
+    [DllImport("user32.dll")]
+    static extern bool ShutdownBlockReasonDestroy(IntPtr hwnd);
 }

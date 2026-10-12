@@ -13,7 +13,11 @@ updates:
     groups:
       nuget:
         patterns: ["*"]
+  # Workflows pin actions by commit with the version in a comment; Dependabot updates both
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: monthly
+    groups:
+      actions:
+        patterns: ["*"]

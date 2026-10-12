@@ -36,16 +36,30 @@ public readonly record struct ClientUsage(long GraphRequests, long SharePointReq
 }
 
 /// <summary>
-/// HTTP for Graph and SharePoint REST: token per resource, User-Agent, retries, one shared pause when throttled, this user's request
-/// budget (<see cref="RequestBudget"/>), usage counts.
+/// HTTP for Graph and SharePoint REST: token per resource (https Graph and the tenant's SharePoint hosts only), User-Agent, retries,
+/// one shared pause when throttled plus a longer one for background work, this user's request budget (<see cref="RequestBudget"/>),
+/// usage counts.
 /// </summary>
+/// <remarks>
+/// Retries: reads (GET, HEAD) on 429, 503, 500, 502 and 504; writes only on 429 and 503 with Retry-After (the request wasn't run),
+/// since a write that failed with a 5xx may have been committed. Pauses and backoff get 0 to 50% random extra, so a tenant's agents
+/// don't come back at the same moment.
+/// </remarks>
 public sealed class M365Client(HttpClient http, ITokenSource tokens, RequestBudget? budget = null)
 {
     public const string GraphResource = "https://graph.microsoft.com";
     const int MaxAttempts = 5;
+    static readonly TimeSpan MaxRetryAfter = TimeSpan.FromMinutes(5);
+    static readonly TimeSpan ForegroundRelease = TimeSpan.FromMilliseconds(100), BackgroundRelease = TimeSpan.FromMilliseconds(500);
+
+    /// <summary>RateLimit-Remaining at or below this share of RateLimit-Limit holds background work until RateLimit-Reset.</summary>
+    const double LowRemaining = 0.2;
 
     readonly Lock pauseLock = new();
     DateTimeOffset pausedUntil = DateTimeOffset.MinValue;
+    DateTimeOffset backgroundUntil = DateTimeOffset.MinValue;
+    DateTimeOffset foregroundNext = DateTimeOffset.MinValue;
+    DateTimeOffset backgroundNext = DateTimeOffset.MinValue;
     long graphRequests;
     long sharePointRequests;
     long resourceUnits;
@@ -54,12 +68,46 @@ public sealed class M365Client(HttpClient http, ITokenSource tokens, RequestBudg
     long throttledResponses;
     long throttledTicks;
 
+    /// <summary>Time, randomness (0 to 1) and waiting; replaceable for tests.</summary>
+    public Func<DateTimeOffset> Clock { get; init; } = () => DateTimeOffset.UtcNow;
+    public Func<double> Random { get; init; } = System.Random.Shared.NextDouble;
+    public Func<TimeSpan, CancellationToken, Task> Delay { get; init; } = Task.Delay;
+
+    /// <summary>
+    /// The tenant's SharePoint root host (contoso.sharepoint.com), when known: tokens then go only to its hosts (-my and multi-geo
+    /// included). <see cref="SharePointDiscoveryApi.GetMyDriveAsync"/> sets it when it is still empty.
+    /// </summary>
+    public string? TenantRootHost { get; set; }
+
+    /// <summary>After a 429 or 503, background requests (<see cref="RequestPriority"/>) wait this long; foreground ones only for Retry-After.</summary>
+    public TimeSpan ThrottlePause { get; set; } = TimeSpan.FromMinutes(15);
+
     public long GraphRequests => Interlocked.Read(ref graphRequests);
 
     /// <summary>When Graph or SharePoint last answered 429 or 503.</summary>
     public DateTimeOffset LastThrottled { get; private set; } = DateTimeOffset.MinValue;
+
+    /// <summary>Until when background requests wait: <see cref="ThrottlePause"/> after throttling, or the reset of a nearly used app limit.</summary>
+    public DateTimeOffset BackgroundPausedUntil
+    {
+        get
+        {
+            lock (pauseLock)
+            {
+                return backgroundUntil > pausedUntil ? backgroundUntil : pausedUntil;
+            }
+        }
+    }
+
+    /// <summary>Whether background requests wait now; the engine skips starting background work meanwhile.</summary>
+    public bool BackgroundPaused => BackgroundPausedUntil > Clock();
+
     public long SharePointRequests => Interlocked.Read(ref sharePointRequests);
 
+    /// <summary>
+    /// ResourceUnits counts every attempt sent, retries and throttled ones included (Microsoft counts those too): the estimate
+    /// (<see cref="ResourceUnits.Estimate"/>), or the x-ms-resource-unit header when the response has one.
+    /// </summary>
     public ClientUsage Usage => new(GraphRequests, SharePointRequests, Interlocked.Read(ref resourceUnits), Interlocked.Read(ref bytesReceived),
         Interlocked.Read(ref bytesSent), Interlocked.Read(ref throttledResponses), (long)TimeSpan.FromTicks(Interlocked.Read(ref throttledTicks)).TotalSeconds,
         (long)(budget?.WaitedForeground.TotalSeconds ?? 0), (long)(budget?.WaitedBackground.TotalSeconds ?? 0));
@@ -131,16 +179,23 @@ public sealed class M365Client(HttpClient http, ITokenSource tokens, RequestBudg
         bool notFoundAsNull, CancellationToken ct, long? rangeFrom = null)
     {
         var isGraph = uri.Host.Equals("graph.microsoft.com", StringComparison.OrdinalIgnoreCase);
+        if (authenticate && !MayAuthenticate(uri, TenantRootHost))
+        {
+            throw new InvalidOperationException($"Refused to send a sign-in token to {uri.Scheme}://{uri.Host}: only https Microsoft Graph and the tenant's SharePoint hosts get one.");
+        }
         var resource = isGraph ? GraphResource : $"{uri.Scheme}://{uri.Host}";
         var cost = ResourceUnits.Estimate(method, uri, authenticate);
+        var readOnly = method == HttpMethod.Get || method == HttpMethod.Head;
+        var priority = RequestPriority.Current;
 
         string? claims = null;
         for (var attempt = 1; ; attempt++)
         {
-            await WaitWhilePausedAsync(ct);
+            await WaitWhilePausedAsync(priority, ct);
             if (budget is not null)
             {
-                await budget.TakeAsync(cost, RequestPriority.IsBackground, ct);
+                await budget.TakeAsync(cost, () => priority?.IsBackground ?? false, ct, priority?.Promoted);
+                await WaitWhilePausedAsync(priority, ct); // a pause that began while this waited for the budget
             }
             Interlocked.Add(ref resourceUnits, cost);
             using var request = new HttpRequestMessage(method, uri) { Content = content?.Invoke() };
@@ -172,6 +227,12 @@ public sealed class M365Client(HttpClient http, ITokenSource tokens, RequestBudg
             var stopwatch = Stopwatch.StartNew();
             var response = await http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, ct);
             Log?.Invoke($"{(int)response.StatusCode} {method.Method} {uri.Host}{uri.AbsolutePath} {stopwatch.ElapsedMilliseconds} ms");
+            if (authenticate && HeaderNumber(response, "x-ms-resource-unit") is { } charged && charged != cost)
+            {
+                Interlocked.Add(ref resourceUnits, charged - cost);
+                budget?.Adjust((int)charged - cost);
+            }
+            ReadRateLimit(response);
             if (response.IsSuccessStatusCode)
             {
                 return response;
@@ -193,65 +254,151 @@ public sealed class M365Client(HttpClient http, ITokenSource tokens, RequestBudg
 
                 var status = (int)response.StatusCode;
                 var throttled = status is 429 or 503;
+                var retryAfter = RetryAfter(response, Clock());
                 if (throttled)
                 {
-                    LastThrottled = DateTimeOffset.UtcNow;
+                    // Every request waits for the pause; background work longer
+                    var pause = Jitter(retryAfter ?? Backoff(attempt));
+                    LastThrottled = Clock();
+                    Interlocked.Increment(ref throttledResponses);
+                    Interlocked.Add(ref throttledTicks, pause.Ticks);
+                    Pause(pause, ThrottlePause > pause ? Jitter(ThrottlePause) : pause);
                 }
-                if (!(throttled || status is 500 or 502 or 504) || attempt == MaxAttempts)
+                var retry = attempt < MaxAttempts && (throttled ? readOnly || retryAfter is not null : readOnly && status is 500 or 502 or 504);
+                if (!retry)
                 {
                     throw new M365RequestException(response.StatusCode, uri, await ReadDetailAsync(response, ct));
                 }
-
-                var delay = RetryAfter(response) ?? TimeSpan.FromSeconds(Math.Pow(2, attempt));
-                if (throttled)
+                if (!throttled)
                 {
-                    Interlocked.Increment(ref throttledResponses);
-                    Interlocked.Add(ref throttledTicks, delay.Ticks);
-                    Pause(delay);
-                }
-                else
-                {
-                    await Task.Delay(delay, ct);
+                    await Delay(Jitter(Backoff(attempt)), ct);
                 }
             }
         }
     }
 
-    void Pause(TimeSpan delay)
+    static TimeSpan Backoff(int attempt) => TimeSpan.FromSeconds(Math.Pow(2, attempt));
+
+    /// <summary>Plus 0 to 50%.</summary>
+    TimeSpan Jitter(TimeSpan delay) => delay * (1 + Random() * 0.5);
+
+    void Pause(TimeSpan all, TimeSpan background)
     {
         lock (pauseLock)
         {
-            var until = DateTimeOffset.UtcNow + delay;
-            if (until > pausedUntil)
+            var now = Clock();
+            if (now + all > pausedUntil)
             {
-                pausedUntil = until;
+                pausedUntil = now + all;
+            }
+            if (now + background > backgroundUntil)
+            {
+                backgroundUntil = now + background;
             }
         }
     }
 
-    async Task WaitWhilePausedAsync(CancellationToken ct)
+    /// <summary>
+    /// Waits while requests are paused (background ones also while <see cref="BackgroundPausedUntil"/>). Requests that waited are let
+    /// go one by one, foreground ones 100 ms apart and background ones 500 ms, so a queue doesn't return all at once. Promoted work
+    /// stops waiting for the background pause.
+    /// </summary>
+    async Task WaitWhilePausedAsync(PriorityHolder? priority, CancellationToken ct)
     {
+        var held = false;
         while (true)
         {
-            TimeSpan remaining;
+            var background = priority?.IsBackground ?? false;
+            TimeSpan wait;
             lock (pauseLock)
             {
-                remaining = pausedUntil - DateTimeOffset.UtcNow;
+                var now = Clock();
+                var until = background && backgroundUntil > pausedUntil ? backgroundUntil : pausedUntil;
+                if (until > now)
+                {
+                    wait = until - now;
+                    held = true;
+                }
+                else if (held)
+                {
+                    ref var next = ref background ? ref backgroundNext : ref foregroundNext;
+                    var slot = next > now ? next : now;
+                    next = slot + (background ? BackgroundRelease : ForegroundRelease);
+                    wait = slot - now;
+                    held = false;
+                }
+                else
+                {
+                    return;
+                }
             }
-            if (remaining <= TimeSpan.Zero)
+            if (wait > TimeSpan.Zero)
             {
-                return;
+                var waiting = Delay(wait, ct);
+                await (background && priority is not null ? Task.WhenAny(waiting, priority.Promoted) : waiting);
+                ct.ThrowIfCancellationRequested();
             }
-            await Task.Delay(remaining, ct);
         }
     }
 
-    static TimeSpan? RetryAfter(HttpResponseMessage response) => response.Headers.RetryAfter switch
+    /// <summary>
+    /// RateLimit-Limit, -Remaining and -Reset (seconds), when SharePoint sends them (near the app's limit; Microsoft doesn't promise
+    /// them): with little left, background requests wait for the reset.
+    /// </summary>
+    void ReadRateLimit(HttpResponseMessage response)
     {
-        { Delta: { } delta } => delta,
-        { Date: { } date } => date - DateTimeOffset.UtcNow,
-        _ => null,
-    };
+        if (HeaderNumber(response, "RateLimit-Limit") is not { } limit || HeaderNumber(response, "RateLimit-Remaining") is not { } remaining
+            || limit <= 0 || remaining > limit * LowRemaining)
+        {
+            return;
+        }
+        var reset = TimeSpan.FromSeconds(Math.Clamp(HeaderNumber(response, "RateLimit-Reset") ?? 60, 1, MaxRetryAfter.TotalSeconds));
+        Pause(TimeSpan.Zero, Jitter(reset));
+    }
+
+    /// <summary>The leading whole number of a response header, or null.</summary>
+    static long? HeaderNumber(HttpResponseMessage response, string name) =>
+        response.Headers.TryGetValues(name, out var values) && values.FirstOrDefault() is { } value
+            && System.Text.RegularExpressions.Regex.Match(value, @"^\s*(\d+)") is { Success: true } match && long.TryParse(match.Groups[1].Value, out var number)
+            ? number : null;
+
+    /// <summary>Retry-After as a delay from <paramref name="now"/>, between 0 and 5 minutes; null when the response has none.</summary>
+    public static TimeSpan? RetryAfter(HttpResponseMessage response, DateTimeOffset now)
+    {
+        var delay = response.Headers.RetryAfter switch
+        {
+            { Delta: { } delta } => delta,
+            { Date: { } date } => date - now,
+            _ => (TimeSpan?)null,
+        };
+        return delay is { } value ? TimeSpan.FromTicks(Math.Clamp(value.Ticks, 0, MaxRetryAfter.Ticks)) : null;
+    }
+
+    /// <summary>
+    /// Whether a request may carry a token: <see cref="TrustedHosts"/> once the tenant is known; before that (the first /me/drive
+    /// call) https to graph.microsoft.com or a single-label *.sharepoint.com host.
+    /// </summary>
+    public static bool MayAuthenticate(Uri uri, string? tenantRootHost) =>
+        tenantRootHost is not null ? TrustedHosts.IsTrusted(uri, tenantRootHost)
+        : uri.Scheme == Uri.UriSchemeHttps && uri.IsDefaultPort && uri.UserInfo.Length == 0
+            && (uri.IdnHost.Equals("graph.microsoft.com", StringComparison.OrdinalIgnoreCase) || TenantLabel(uri.IdnHost.ToLowerInvariant()) is not null);
+
+    const string SharePointSuffix = ".sharepoint.com";
+
+    /// <summary>"contoso" for contoso.sharepoint.com and contoso-my.sharepoint.com; null for anything else.</summary>
+    static string? TenantLabel(string host)
+    {
+        if (!host.EndsWith(SharePointSuffix, StringComparison.Ordinal) || host.Length == SharePointSuffix.Length)
+        {
+            return null;
+        }
+        var label = host[..^SharePointSuffix.Length];
+        if (label.Contains('.'))
+        {
+            return null;
+        }
+        return label.EndsWith("-my", StringComparison.Ordinal) ? label[..^3] : label;
+    }
 
     /// <summary>The decoded claims of a 'WWW-Authenticate: Bearer ... error="insufficient_claims", claims="base64"' challenge; null for any other 401.</summary>
     public static string? ClaimsChallenge(HttpResponseMessage response)

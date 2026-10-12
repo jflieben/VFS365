@@ -137,7 +137,7 @@ public sealed class MonitoringTests : IDisposable
     {
         var statistics = UsageStatistics.Load(statisticsFile);
         statistics.Fold(new ClientUsage(10, 2, 30, 1000, 500, 0, 0, 0, 0), 1, new DateTime(2026, 10, 6, 23, 0, 0));
-        statistics.Fold(new ClientUsage(15, 2, 40, 1500, 500, 1, 5, 3, 4), 1, new DateTime(2026, 10, 6, 23, 30, 0));
+        statistics.Fold(new ClientUsage(15, 2, 40, 1500, 500, 1, 5, 3, 4), 1, new DateTime(2026, 10, 6, 23, 2, 0));
         statistics.Fold(new ClientUsage(20, 3, 50, 2000, 600, 1, 5, 3, 6), 3, new DateTime(2026, 10, 7, 0, 10, 0));
         statistics.Save();
 
@@ -149,13 +149,88 @@ public sealed class MonitoringTests : IDisposable
         Assert.Equal(1500, day.BytesReceived);
         Assert.Equal(1, day.Throttled);
         Assert.Equal(1, day.Errors);
-        Assert.Equal(30, day.MinutesRunning);
+        Assert.Equal(2, day.MinutesRunning);
         Assert.Equal(3, day.BudgetWaitForegroundSeconds);
         Assert.Equal(4, day.BudgetWaitBackgroundSeconds);
         Assert.Equal(7, day.BudgetWaitSeconds);
         Assert.Equal(2, reloaded.Days["2026-10-07"].BudgetWaitBackgroundSeconds);
         Assert.Equal(5, reloaded.Days["2026-10-07"].GraphRequests);
         Assert.Equal(2, reloaded.Days["2026-10-07"].Errors);
+    }
+
+    [Fact]
+    public void Sleep_does_not_count_as_minutes_running()
+    {
+        var statistics = UsageStatistics.Load(statisticsFile);
+        var usage = new ClientUsage(0, 0, 0, 0, 0, 0, 0, 0, 0);
+        statistics.Fold(usage, 0, new DateTime(2026, 10, 6, 9, 0, 0));
+        statistics.Fold(usage, 0, new DateTime(2026, 10, 6, 9, 1, 0));
+        statistics.Fold(usage, 0, new DateTime(2026, 10, 6, 17, 0, 0)); // woke up after a day in sleep
+
+        Assert.Equal(1 + UsageStatistics.MaxFoldGap.TotalMinutes, statistics.Days["2026-10-06"].MinutesRunning);
+    }
+
+    [Fact]
+    public async Task A_day_that_was_not_sent_is_kept_for_the_next_try()
+    {
+        var statistics = UsageStatistics.Load(statisticsFile);
+        statistics.Fold(new ClientUsage(1, 0, 1, 0, 0, 0, 0, 0, 0), 0, new DateTime(2026, 10, 5, 12, 0, 0));
+        statistics.Fold(new ClientUsage(2, 0, 2, 0, 0, 0, 0, 0, 0), 0, new DateTime(2026, 10, 6, 12, 0, 0));
+        statistics.Fold(new ClientUsage(3, 0, 3, 0, 0, 0, 0, 0, 0), 0, new DateTime(2026, 10, 7, 9, 0, 0));
+        var now = new DateTime(2026, 10, 7, 9, 5, 0);
+
+        var failed = await statistics.SendCompletedAsync(now, (day, _) => Task.FromResult(day == "2026-10-05"));
+
+        Assert.Equal(1, failed);
+        Assert.Equal(["2026-10-06"], UsageStatistics.Load(statisticsFile).Completed(now));
+        Assert.Equal(0, await statistics.SendCompletedAsync(now, (_, _) => Task.FromResult(true)));
+        Assert.Empty(statistics.Completed(now));
+        Assert.True(statistics.Days.ContainsKey("2026-10-07"));
+    }
+
+    [Fact]
+    public async Task Statistics_say_whether_they_arrived()
+    {
+        Assert.True(await Create().StatisticsAsync("2026-10-06", [("Day", "2026-10-06")]));
+        server.Status = 404;
+        server.ResponseBody = """{"odata.error":{"code":"TableNotFound"}}""";
+        Assert.False(await Create().StatisticsAsync("2026-10-06", [("Day", "2026-10-06")]));
+    }
+
+    [Fact]
+    public void No_paths_hashes_paths_and_shortens_urls()
+    {
+        var message = Monitoring.Scrub(
+            @"\Sites\Finance\Documents\Budget 2027.xlsx was changed or locked in Microsoft 365; saved as Budget 2027 (conflict).xlsx",
+            [@"\Sites\Finance\Documents\Budget 2027.xlsx", "Budget 2027.xlsx", "Budget 2027 (conflict).xlsx"]);
+        Assert.DoesNotContain("Budget", message);
+        Assert.DoesNotContain("Finance", message);
+        Assert.Contains("was changed or locked in Microsoft 365; saved as [path ", message);
+
+        var fileSystem = Monitoring.Scrub(@"reading \Sites\HR\Salaries\2026.xlsx: IOException: The network name was not found", []);
+        Assert.StartsWith("reading [path ", fileSystem);
+        Assert.EndsWith(": IOException: The network name was not found", fileSystem);
+
+        var url = Monitoring.Scrub("404 NotFound from https://graph.microsoft.com/v1.0/drives/b!x/root:/Secret%20plans.docx: itemNotFound", []);
+        Assert.Equal("404 NotFound from https://graph.microsoft.com/...: itemNotFound", url);
+
+        Assert.Equal(@"Files stay reachable at \\VFS365\ann; Restart assigns T: again.",
+            Monitoring.Scrub(@"Files stay reachable at \\VFS365\ann; Restart assigns T: again.", []));
+        Assert.Equal(Monitoring.Scrub(@"closing \OneDrive\a.docx: x", []), Monitoring.Scrub(@"closing \ONEDRIVE\A.DOCX: x", []));
+    }
+
+    [Fact]
+    public async Task No_paths_applies_to_error_rows()
+    {
+        var monitoring = new Monitoring(MonitoringTarget.Parse($"http://127.0.0.1:{server.Port}/devstoreaccount1?sv=1&sig=abc", out _)!,
+            new DeviceInfo("PC1", "device-1", null), _ => { }) { Detail = MonitoringDetail.NoPaths };
+        monitoring.Error("upload", @"\OneDrive\Plans\takeover.docx: 503 ServiceUnavailable", @"\OneDrive\Plans\takeover.docx", "takeover.docx");
+        await monitoring.FlushAsync(TimeSpan.FromSeconds(10));
+
+        using var body = JsonDocument.Parse(Assert.Single(server.Requests).Body);
+        var message = body.RootElement.GetProperty("Message").GetString()!;
+        Assert.DoesNotContain("takeover", message);
+        Assert.EndsWith(": 503 ServiceUnavailable", message);
     }
 
     public void Dispose()

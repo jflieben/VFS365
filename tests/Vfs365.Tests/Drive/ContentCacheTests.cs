@@ -152,6 +152,118 @@ public sealed class ContentCacheTests : IDisposable
         Assert.Equal((0L, 0), cache.Usage);
     }
 
+    [Fact]
+    public async Task A_slow_download_of_an_older_version_keeps_the_newer_one()
+    {
+        var api = new FakeDriveApi();
+        var old = api.Add("a.txt", content: "old content");
+        var cache = new ContentCache(Cache, api, new ContentCacheOptions { Cipher = KeyA });
+        var hold = new TaskCompletionSource();
+        api.BeforeDownload = () => hold.Task;
+        var slow = cache.FetchAsync("d", old.Id, old.CTag, old.Size, default);
+
+        Directory.CreateDirectory(directory);
+        var staging = Path.Combine(directory, "saved");
+        await File.WriteAllTextAsync(staging, "newer content");
+        var newer = old with { Size = new FileInfo(staging).Length, ETag = "e-new", CTag = "c-new" };
+        cache.Adopt("d", newer, staging);
+        hold.SetResult();
+        await slow;
+
+        using var source = cache.Open("d", newer.Id, newer.CTag, newer.Size);
+        Assert.Equal("newer content", Encoding.UTF8.GetString(await ReadAll(source)));
+        Assert.Equal(1, api.Downloads);
+    }
+
+    [Fact]
+    public async Task A_cache_file_changed_on_disk_fails_its_check_and_is_downloaded_again()
+    {
+        var api = new FakeDriveApi();
+        var text = RandomNumberGenerator.GetBytes(200_000);
+        var item = api.Add("a.bin", text);
+        var cache = new ContentCache(Cache, api, new ContentCacheOptions { Cipher = KeyA });
+        await cache.FetchAsync("d", item.Id, item.CTag, item.Size, default);
+        var stored = CacheFiles().Single();
+        var bytes = await File.ReadAllBytesAsync(stored);
+        bytes[100_000] ^= 1;
+        await File.WriteAllBytesAsync(stored, bytes);
+
+        using (var damaged = cache.Open("d", item.Id, item.CTag, item.Size))
+        {
+            var head = new byte[1000];
+            await damaged.ReadAsync(0, head, default);
+            Assert.Equal(text.AsSpan(0, 1000).ToArray(), head); // other chunks still verify
+        }
+        await Assert.ThrowsAsync<CacheDamagedException>(async () =>
+        {
+            using var again = cache.Open("d", item.Id, item.CTag, item.Size);
+            await again.ReadAsync(100_000, new byte[10], default);
+        });
+        using var fresh = cache.Open("d", item.Id, item.CTag, item.Size);
+
+        Assert.Equal(text, await ReadAll(fresh));
+        Assert.Equal(2, api.Downloads);
+    }
+
+    [Fact]
+    public async Task The_same_content_is_encrypted_differently_in_each_file()
+    {
+        var api = new FakeDriveApi();
+        var item = api.Add("a.txt", Encoding.UTF8.GetBytes(new string('x', 5000)));
+        var cache = new ContentCache(Cache, api, new ContentCacheOptions { Cipher = KeyA });
+        await cache.FetchAsync("d1", item.Id, item.CTag, item.Size, default);
+        await cache.FetchAsync("d2", item.Id, item.CTag, item.Size, default);
+
+        var files = CacheFiles().Select(f => File.ReadAllBytes(f)[..5000]).ToList();
+        Assert.Equal(2, files.Count);
+        Assert.NotEqual(files[0], files[1]);
+    }
+
+    [Fact]
+    public async Task A_cache_in_the_older_format_is_dropped()
+    {
+        var api = new FakeDriveApi();
+        var item = api.Add("a.txt", content: "abc");
+        var cache = new ContentCache(Cache, api, new ContentCacheOptions { Cipher = KeyA });
+        await cache.FetchAsync("d", item.Id, item.CTag, item.Size, default);
+        await File.WriteAllTextAsync(Path.Combine(Cache, "key"), KeyA.KeyId); // what 0.3 wrote
+
+        var reopened = new ContentCache(Cache, api, new ContentCacheOptions { Cipher = KeyA });
+
+        Assert.Equal((0L, 0), reopened.Usage);
+        Assert.Empty(CacheFiles());
+    }
+
+    [Fact]
+    public async Task Removing_the_same_file_twice_at_once_counts_it_once()
+    {
+        var api = new FakeDriveApi();
+        var a = api.Add("a.bin", new byte[3000]);
+        var b = api.Add("b.bin", new byte[5000]);
+        var cache = new ContentCache(Cache, api);
+        await cache.FetchAsync("d", a.Id, a.CTag, a.Size, default);
+        await cache.FetchAsync("d", b.Id, b.CTag, b.Size, default);
+
+        Parallel.For(0, 16, _ => cache.ForgetItem("d", a.Id));
+
+        Assert.Equal((5000L, 1), cache.Usage);
+    }
+
+    [Fact]
+    public async Task An_empty_file_needs_no_download()
+    {
+        var api = new FakeDriveApi();
+        var item = api.Add("empty.txt", []);
+        var cache = new ContentCache(Cache, api, new ContentCacheOptions { Cipher = KeyA, MaxBytes = 1 });
+
+        await cache.CopyToAsync("d", item.Id, item.CTag, 0, Path.Combine(directory, "copy"), default);
+        using var source = cache.Open("d", item.Id, item.CTag, 0);
+
+        Assert.Equal(0, source.Length);
+        Assert.Equal(0, await source.ReadAsync(0, new byte[10], default));
+        Assert.Equal(0, api.Downloads);
+    }
+
     public void Dispose()
     {
         try

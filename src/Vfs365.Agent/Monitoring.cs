@@ -5,6 +5,7 @@ using System.Runtime.InteropServices;
 using System.Security.Principal;
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using Microsoft.Win32;
 
 namespace Vfs365.Agent;
@@ -103,8 +104,16 @@ public sealed class Monitoring(MonitoringTarget target, DeviceInfo device, Actio
     public string Started => $"Monitoring: errors and daily statistics to {target.Account}" +
         (target.Expires is { } expires ? $" (SAS valid until {expires.ToLocalTime():yyyy-MM-dd HH:mm})" : "");
 
-    public void Error(string source, string message)
+    /// <summary>Full, or NoPaths: file and folder paths become a short hash and URLs keep only their host (Scrub).</summary>
+    public MonitoringDetail Detail { get; init; } = MonitoringDetail.Full;
+
+    /// <summary>An error row. <paramref name="paths"/> are the volume paths and file names in <paramref name="message"/>, hashed with NoPaths.</summary>
+    public void Error(string source, string message, params string?[] paths)
     {
+        if (Detail == MonitoringDetail.NoPaths)
+        {
+            message = Scrub(message, paths);
+        }
         Interlocked.Increment(ref errors);
         var now = DateTimeOffset.UtcNow;
         lock (gate)
@@ -130,9 +139,30 @@ public sealed class Monitoring(MonitoringTarget target, DeviceInfo device, Actio
             [.. Common(), ("Source", source), ("Message", message.Length > 8000 ? message[..8000] : message), ("OccurredAt", now)]));
     }
 
-    /// <summary>One row per day, device and Windows user.</summary>
-    public void Statistics(string day, IEnumerable<(string Name, object? Value)> values) =>
-        Track(SendAsync(StatisticsTable, day, $"{device.Id}_{WindowsIdentity.GetCurrent().User?.Value ?? Environment.UserName}", [.. Common(), .. values]));
+    /// <summary>
+    /// Message text without names: the given paths and any other volume path (a word starting with a single backslash, up to the next
+    /// colon or the end, as in file system log lines) become "[path 1a2b3c4d]", the first 8 hex digits of the SHA-256 of the lower-cased
+    /// path, so repeats still group. URLs keep only their host; UNC paths (\\VFS365\user) stay.
+    /// </summary>
+    public static string Scrub(string message, IEnumerable<string?> paths)
+    {
+        static string Hash(string path) =>
+            $"[path {Convert.ToHexStringLower(System.Security.Cryptography.SHA256.HashData(Encoding.UTF8.GetBytes(path.ToLowerInvariant())))[..8]}]";
+        foreach (var path in paths.Where(p => !string.IsNullOrEmpty(p)).OrderByDescending(p => p!.Length))
+        {
+            message = message.Replace(path!, Hash(path!), StringComparison.OrdinalIgnoreCase);
+        }
+        message = Regex.Replace(message, @"(https?://[^/\s]+)/\S*?(?=:?(\s|$))", "$1/...");
+        return Regex.Replace(message, @"(?<=^|\s)\\(?!\\)[^\r\n:*?""<>|]+", m => Hash(m.Value.TrimEnd()));
+    }
+
+    /// <summary>One row per day, device and Windows user. True when it was added (or was there already).</summary>
+    public Task<bool> StatisticsAsync(string day, IEnumerable<(string Name, object? Value)> values)
+    {
+        var sending = SendAsync(StatisticsTable, day, $"{device.Id}_{WindowsIdentity.GetCurrent().User?.Value ?? Environment.UserName}", [.. Common(), .. values]);
+        Track(sending);
+        return sending;
+    }
 
     /// <summary>An install, update or uninstall; <paramref name="users"/> are the users signed in at the time. True when it was added.</summary>
     public Task<bool> DeviceAsync(string action, string? users)

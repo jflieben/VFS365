@@ -86,7 +86,8 @@ public sealed class DiscoveryAudit(M365Client client)
         for (var startRow = 0; ; startRow += 500)
         {
             var query = Uri.EscapeDataString("contentclass:STS_Site OR contentclass:STS_Web");
-            using var doc = (await client.GetJsonAsync(new Uri($"{tenantRoot}/_api/search/query?querytext='{query}'&trimduplicates=false&rowlimit=500&startrow={startRow}&selectproperties='Path'"), ct))!;
+            using var doc = (await client.GetJsonAsync(new Uri($"{tenantRoot}/_api/search/query?querytext='{query}'&trimduplicates=false&rowlimit=500&startrow={startRow}&selectproperties='Path'" +
+                $"&Properties='{Uri.EscapeDataString("EnableMultiGeoSearch:true")}'&ClientType='VFS365'"), ct))!;
             var rows = doc.RootElement.GetProperty("PrimaryQueryResult").GetProperty("RelevantResults").GetProperty("Table").GetProperty("Rows");
             foreach (var row in rows.EnumerateArray())
             {

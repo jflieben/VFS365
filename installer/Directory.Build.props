@@ -1,3 +1,8 @@
 <Project>
   <!-- Stops the repo's .NET settings (target framework, central package versions) from applying to the WiX project -->
+  <PropertyGroup>
+    <!-- NuGet lock files as in the repo's Directory.Build.props -->
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+    <RestoreLockedMode Condition="'$(CI)' == 'true'">true</RestoreLockedMode>
+  </PropertyGroup>
 </Project>

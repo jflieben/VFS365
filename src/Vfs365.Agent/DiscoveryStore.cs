@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Text.Json;
 using Vfs365.Core.Discovery;
 
@@ -42,8 +43,8 @@ static class DiscoveryStore
         {
             try
             {
-                return File.Exists(RefreshedPath) && DateTimeOffset.TryParse(File.ReadAllText(RefreshedPath).Trim(), System.Globalization.CultureInfo.InvariantCulture,
-                    System.Globalization.DateTimeStyles.AssumeUniversal, out var at) ? at : null;
+                return File.Exists(RefreshedPath) && DateTimeOffset.TryParse(File.ReadAllText(RefreshedPath).Trim(), CultureInfo.InvariantCulture,
+                    DateTimeStyles.AssumeUniversal, out var at) ? at : null;
             }
             catch (IOException)
             {
@@ -60,31 +61,43 @@ static class DiscoveryStore
 
 /// <summary>
 /// Whether a refresh from the tray is allowed now: once a day, and only when the libraries were read more than an hour ago.
-/// Null when it is; otherwise why not, for the menu's tooltip.
+/// Null when it is; otherwise why not, for the menu's hint, in the display language (or <c>culture</c>).
 /// </summary>
 public static class RefreshRule
 {
     public static readonly TimeSpan Once = TimeSpan.FromDays(1), MinimumAge = TimeSpan.FromHours(1);
 
-    public static string? Blocked(DateTimeOffset now, DateTimeOffset librariesReadAt, DateTimeOffset? lastRefresh, bool running)
+    public static string? Blocked(DateTimeOffset now, DateTimeOffset librariesReadAt, DateTimeOffset? lastRefresh, bool running, CultureInfo? culture = null)
     {
         if (running)
         {
-            return "Refreshing now.";
+            return UiText.Get(culture, "Refresh.Running");
         }
         if (lastRefresh is { } refreshed && now - refreshed < Once)
         {
-            var again = (refreshed + Once).ToLocalTime();
-            return $"Refresh works once a day. You refreshed at {refreshed.ToLocalTime():HH:mm}{(refreshed.ToLocalTime().Date == now.ToLocalTime().Date ? "" : " yesterday")}; " +
-                $"you can again from {(again.Date == now.ToLocalTime().Date ? "" : "tomorrow ")}{again:HH:mm}.";
+            return UiText.Get(culture, "Refresh.Daily", $"{refreshed.ToLocalTime():HH:mm}",
+                refreshed.ToLocalTime().Date == now.ToLocalTime().Date ? "" : UiText.Get(culture, "Refresh.Yesterday"), At(now, refreshed + Once, culture));
         }
         if (now - librariesReadAt < MinimumAge)
         {
-            return $"Your libraries were read {(int)Math.Max(1, (now - librariesReadAt).TotalMinutes)} minute(s) ago. " +
-                $"Refresh works when that is more than an hour ago: from {(librariesReadAt + MinimumAge).ToLocalTime():HH:mm}.";
+            return UiText.Get(culture, "Refresh.Recent", (int)Math.Max(1, (now - librariesReadAt).TotalMinutes), At(now, librariesReadAt + MinimumAge, culture));
         }
         return null;
     }
+
+    /// <summary>The menu item's text: "Refresh", or with when it works again or that it runs, so the reason doesn't depend on the hint.</summary>
+    public static string Label(DateTimeOffset now, DateTimeOffset librariesReadAt, DateTimeOffset? lastRefresh, bool running, CultureInfo? culture = null)
+    {
+        if (running)
+        {
+            return UiText.Get(culture, "Menu.RefreshRunning");
+        }
+        var from = new[] { lastRefresh is { } refreshed && now - refreshed < Once ? refreshed + Once : now, now - librariesReadAt < MinimumAge ? librariesReadAt + MinimumAge : now }.Max();
+        return from > now ? UiText.Get(culture, "Menu.RefreshFrom", At(now, from, culture)) : UiText.Get(culture, "Menu.Refresh");
+    }
+
+    static string At(DateTimeOffset now, DateTimeOffset at, CultureInfo? culture) =>
+        at.ToLocalTime().Date == now.ToLocalTime().Date ? $"{at.ToLocalTime():HH:mm}" : UiText.Get(culture, "Tomorrow", $"{at.ToLocalTime():HH:mm}");
 }
 
 /// <summary>The mounted session's discovery state: replaced by background discovery, amended with drive IDs looked up on first use, saved when changed.</summary>
@@ -121,6 +134,15 @@ sealed class DiscoveryStateKeeper(DiscoveryState initial)
         lock (gate)
         {
             current = current with { Libraries = current.Libraries.Select(l => l.Key == libraryKey ? l with { DriveId = driveId } : l).ToList() };
+            dirty = true;
+        }
+    }
+
+    /// <summary>Saves the current state at the next SaveIfChanged (a first start: the OneDrive is known before any discovery).</summary>
+    public void Touch()
+    {
+        lock (gate)
+        {
             dirty = true;
         }
     }

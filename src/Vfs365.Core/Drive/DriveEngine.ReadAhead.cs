@@ -62,11 +62,7 @@ public sealed partial class DriveEngine
         {
             return;
         }
-        var next = listing.Items.Values
-            .Where(i => !i.IsFolder && i.Size > 0 && i.Size <= options.ReadAheadMaxSize && StringComparer.OrdinalIgnoreCase.Compare(i.Name, file.Name) > 0)
-            .OrderBy(i => i.Name, StringComparer.OrdinalIgnoreCase)
-            .Take(options.ReadAheadFiles * 2);
-        foreach (var item in next)
+        foreach (var item in FilesAfter(listing.SortedFiles(), file.Name).Where(i => i.Size > 0 && i.Size <= options.ReadAheadMaxSize).Take(options.ReadAheadFiles * 2))
         {
             lock (walk)
             {
@@ -83,6 +79,28 @@ public sealed partial class DriveEngine
                 walk.Loaded++;
             }
             _ = ReadAheadAsync(driveId, item, walk);
+        }
+    }
+
+    /// <summary>The files after <paramref name="name"/> in name order, found by binary search; at most a few hundred are looked at.</summary>
+    static IEnumerable<DriveItemInfo> FilesAfter(DriveItemInfo[] sorted, string name)
+    {
+        int low = 0, high = sorted.Length;
+        while (low < high)
+        {
+            var middle = (low + high) / 2;
+            if (StringComparer.OrdinalIgnoreCase.Compare(sorted[middle].Name, name) <= 0)
+            {
+                low = middle + 1;
+            }
+            else
+            {
+                high = middle;
+            }
+        }
+        for (var i = low; i < sorted.Length && i < low + 256; i++)
+        {
+            yield return sorted[i];
         }
     }
 

@@ -1,4 +1,7 @@
 using System.Diagnostics;
+using System.Globalization;
+using System.Xml;
+using System.Xml.Linq;
 
 namespace Vfs365.Agent;
 
@@ -6,7 +9,7 @@ namespace Vfs365.Agent;
 /// vfs365-agent.exe as started at sign-in: runs the agent as a child process (--child) and starts it again when it crashes, so a fault
 /// in the agent or in a component it loads doesn't leave the user without the drive until the next sign-in. A normal stop (unmount,
 /// sign-out, uninstall, a restart from the tray) or a problem the agent reported itself ends the supervisor too. At most MaxRestarts
-/// within RestartWindow; crash details from the Windows event log go to agent.log.
+/// within RestartWindow; crash details from the Windows event log go to agent.log, and giving up goes to monitoring as a crash row.
 /// </summary>
 public static class AgentSupervisor
 {
@@ -16,9 +19,9 @@ public static class AgentSupervisor
 
     public static int Run(string[] args, Func<bool> sessionEnding)
     {
-        using (AgentLog.Open(newSession: !args.Contains("--after", StringComparer.OrdinalIgnoreCase)))
+        // Starts this sign-in's log, which the child appends to; not while an agent runs in this session (a second start, a restart)
+        using (AgentLog.Open(newSession: !args.Contains("--after", StringComparer.OrdinalIgnoreCase) && !AgentControl.IsMounted()))
         {
-            // Starts this sign-in's log; the child appends to it
         }
 
         var restarts = new Queue<DateTime>();
@@ -52,8 +55,10 @@ public static class AgentSupervisor
             var details = Task.Run(() => WriteCrashDetails(childId));
             if (restarts.Count >= MaxRestarts)
             {
-                Write([$"Agent:      stopped unexpectedly (exit code 0x{code:X8}); not started again: it stopped {MaxRestarts + 1} times within " +
-                    $"{RestartWindow.TotalMinutes:0} minutes. It starts at the next sign-in."]);
+                var gaveUp = $"The agent stopped unexpectedly (exit code 0x{code:X8}) {MaxRestarts + 1} times within {RestartWindow.TotalMinutes:0} minutes " +
+                    "and was not started again; it starts at the next sign-in";
+                Write([$"Agent:      {gaveUp}."]);
+                ReportGivingUp(args, gaveUp);
                 details.Wait(TimeSpan.FromSeconds(30));
                 return code;
             }
@@ -127,7 +132,7 @@ public static class AgentSupervisor
                 CreateNoWindow = true,
                 RedirectStandardOutput = true,
             };
-            foreach (var argument in new[] { "qe", "Application", "/q:*[System[(EventID=1026 or EventID=1000) and TimeCreated[timediff(@SystemTime) <= 120000]]]", "/c:6", "/rd:true", "/f:text" })
+            foreach (var argument in new[] { "qe", "Application", "/q:*[System[(EventID=1026 or EventID=1000) and TimeCreated[timediff(@SystemTime) <= 120000]]]", "/c:6", "/rd:true", "/f:xml" })
             {
                 query.ArgumentList.Add(argument);
             }
@@ -137,23 +142,92 @@ public static class AgentSupervisor
             {
                 return [];
             }
-            // Events are separated by "Event[n]" headers, newest first. Application Error names the process ID, the faulting module and the
-            // code; .NET Runtime (no process ID) the exception and the managed stack.
-            var events = output.Result.Split("Event[", StringSplitOptions.RemoveEmptyEntries)
-                .Where(e => e.Contains("vfs365-agent", StringComparison.OrdinalIgnoreCase)).ToList();
-            var fault = events.FirstOrDefault(e => e.Contains($"Faulting process id: 0x{processId:x}", StringComparison.OrdinalIgnoreCase));
-            if (fault is null)
-            {
-                return [];
-            }
-            static IEnumerable<string> From(string text, string first, int count) =>
-                text.Split('\n').Select(l => l.Trim()).SkipWhile(l => !l.StartsWith(first, StringComparison.Ordinal)).Where(l => l.Length > 0).Take(count);
-            var managed = events.FirstOrDefault(e => e.Contains("Exception Info", StringComparison.Ordinal));
-            return [.. From(fault, "Faulting module name", 3), .. managed is null ? [] : From(managed, "Exception Info", 10)];
+            return ParseCrashEvents(output.Result, processId);
         }
         catch (Exception e) when (e is IOException or InvalidOperationException or System.ComponentModel.Win32Exception)
         {
             return [];
+        }
+    }
+
+    /// <summary>
+    /// The crash of <paramref name="processId"/> from wevtutil's XML (events side by side, newest first), whatever the Windows language:
+    /// Application Error (1000) by its EventData names, or by position where a Windows version leaves them unnamed, gives the faulting
+    /// module and the exception code; .NET Runtime (1026, no process ID) holds the exception and the managed stack as one text.
+    /// </summary>
+    public static IReadOnlyList<string> ParseCrashEvents(string xml, int processId)
+    {
+        XElement root;
+        try
+        {
+            root = XElement.Parse($"<Events>{xml}</Events>");
+        }
+        catch (XmlException)
+        {
+            return [];
+        }
+        var events = root.Elements().Where(e => e.Name.LocalName == "Event").ToList();
+        static string? EventId(XElement e) => e.Descendants().FirstOrDefault(d => d.Name.LocalName == "EventID")?.Value.Trim();
+        static List<XElement> Data(XElement e) => e.Descendants().Where(d => d.Name.LocalName == "Data").ToList();
+        static string? Field(List<XElement> data, string name, int position) => data.Any(d => d.Attribute("Name") is not null)
+            ? data.FirstOrDefault(d => (string?)d.Attribute("Name") == name)?.Value
+            : data.ElementAtOrDefault(position)?.Value;
+
+        var fault = events.Where(e => EventId(e) == "1000").Select(Data).FirstOrDefault(d =>
+            (Field(d, "AppName", 0) ?? "").Contains("vfs365-agent", StringComparison.OrdinalIgnoreCase) && SameProcess(Field(d, "ProcessId", 8), processId));
+        if (fault is null)
+        {
+            return [];
+        }
+        var lines = new List<string>
+        {
+            $"Faulting module: {Field(fault, "ModuleName", 3)} {Field(fault, "ModuleVersion", 4)}, exception code {Hex(Field(fault, "ExceptionCode", 6))}, " +
+            $"offset {Hex(Field(fault, "FaultingOffset", 7))}",
+        };
+        var managed = events.Where(e => EventId(e) == "1026").Select(e => string.Join("\n", Data(e).Select(d => d.Value)))
+            .FirstOrDefault(text => text.Contains("vfs365-agent", StringComparison.OrdinalIgnoreCase));
+        if (managed is not null)
+        {
+            var text = managed.Split('\n').Select(l => l.Trim()).Where(l => l.Length > 0).ToList();
+            var from = text.FindIndex(l => l.Contains("Exception Info", StringComparison.Ordinal));
+            lines.AddRange(text.Skip(from >= 0 ? from : 2).Take(10));
+        }
+        return lines;
+    }
+
+    /// <summary>Hex as Windows writes it in these events: "0x1f34", "1f34", or "0x0x1f34" on some versions.</summary>
+    static long? ParseHex(string? value)
+    {
+        var text = value?.Trim() ?? "";
+        while (text.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+        {
+            text = text[2..];
+        }
+        return long.TryParse(text, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out var number) ? number : null;
+    }
+
+    static string? Hex(string? value) => ParseHex(value) is { } number ? $"0x{number:x8}" : value;
+
+    static bool SameProcess(string? value, int processId) => ParseHex(value) == processId;
+
+    /// <summary>A crash row from the supervisor itself, as no agent runs to report it. Best effort, 10 s at most.</summary>
+    static void ReportGivingUp(string[] args, string message)
+    {
+        try
+        {
+            var config = Array.IndexOf(args, "--config") is var at and >= 0 && at + 1 < args.Length ? args[at + 1] : null;
+            var settings = AgentSettings.Load(config);
+            if (MonitoringTarget.Parse(settings.MonitoringUrl, out _) is not { } target)
+            {
+                return;
+            }
+            var tenant = TenantResolver.Resolve(settings, DeviceJoin.Read()).Tenant;
+            var monitoring = new Monitoring(target, DeviceInfo.Current(), line => Write([line])) { TenantId = () => tenant, Detail = settings.MonitoringDetail };
+            monitoring.Error("crash", message);
+            monitoring.FlushAsync(TimeSpan.FromSeconds(10)).Wait();
+        }
+        catch (Exception e) when (e is IOException or System.Text.Json.JsonException or UnauthorizedAccessException or System.Security.SecurityException)
+        {
         }
     }
 }

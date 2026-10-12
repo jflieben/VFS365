@@ -14,4 +14,12 @@
     <PackageReference Include="WixToolset.Bal.wixext" Version="5.0.2" />
   </ItemGroup>
 
+  <!-- Signing: build.ps1 passes SignOutput=true when signing is configured; the engine is signed detached, then the whole setup -->
+  <Target Name="SignBundleEngine">
+    <Exec Command="pwsh -NoProfile -File &quot;$(MSBuildThisFileDirectory)..\..\build.ps1&quot; sign &quot;%(SignBundleEngine.FullPath)&quot;" />
+  </Target>
+  <Target Name="SignBundle">
+    <Exec Command="pwsh -NoProfile -File &quot;$(MSBuildThisFileDirectory)..\..\build.ps1&quot; sign &quot;%(SignBundle.FullPath)&quot;" />
+  </Target>
+
 </Project>

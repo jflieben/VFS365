@@ -4,6 +4,33 @@ using Microsoft.Win32;
 
 namespace Vfs365.Agent;
 
+/// <summary>The DriveLetter setting as WinFsp takes it.</summary>
+/// <param name="MountPoint">"M:", or null for the first free letter (also used with None, which removes the letter after mounting).</param>
+/// <param name="KeepLetter">False for None: only the UNC path and the navigation pane.</param>
+/// <param name="Problem">Why the value isn't usable; the drive then mounts without a letter.</param>
+public sealed record DriveLetterOption(string? MountPoint, bool KeepLetter, string? Problem = null)
+{
+    public static readonly DriveLetterOption None = new(null, false);
+
+    /// <summary>"M", "m", "M:", "M:\" and "m:\" give "M:"; "*" the first free letter; "None" or nothing none.</summary>
+    public static DriveLetterOption Parse(string? value)
+    {
+        var text = value?.Trim() ?? "";
+        if (text.Length == 0 || text.Equals("none", StringComparison.OrdinalIgnoreCase))
+        {
+            return None;
+        }
+        if (text == "*")
+        {
+            return new(null, true);
+        }
+        var letter = text.TrimEnd('\\', '/').TrimEnd(':');
+        return letter.Length == 1 && char.IsAsciiLetter(letter[0]) && text.Length - letter.Length <= 2
+            ? new($"{char.ToUpperInvariant(letter[0])}:", true)
+            : None with { Problem = $"DriveLetter '{text}' is not a letter, * or None" };
+    }
+}
+
 /// <summary>
 /// What Windows tells Explorer about the drive, as seen from the agent's own sign-in. Explorer labels a letter "Disconnected Network
 /// Drive" when no network provider reports it (WinFsp.Np missing from the provider order), when a remembered mapping

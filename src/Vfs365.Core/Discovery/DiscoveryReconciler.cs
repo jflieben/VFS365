@@ -1,13 +1,19 @@
 namespace Vfs365.Core.Discovery;
 
-public sealed record Reconciliation(IReadOnlyList<LibraryEntry> Visible, string? HidingSkippedReason);
+/// <summary>Misses: libraries kept although this run didn't find them, with the number of runs in a row they were missing.</summary>
+public sealed record Reconciliation(IReadOnlyList<LibraryEntry> Visible, string? HidingSkippedReason, IReadOnlyDictionary<string, int> Misses);
 
 public static class DiscoveryReconciler
 {
+    /// <summary>Runs in a row a library must be missing before it is hidden.</summary>
+    public const int MissesToHide = 2;
+
     /// <summary>
-    /// The visible set after a run. Libraries that failed to evaluate keep their previous entry. Nothing is hidden when search
-    /// was incomplete or the set shrank by more than <paramref name="safetyRatio"/> (M365AutoLink's deletion circuit breaker), except
-    /// libraries hidden by policy (site patterns and templates): those go whatever their share.
+    /// The visible set after a run. Libraries that failed to evaluate keep their previous entry. A library missing from a run is hidden
+    /// only when it was also missing from the run before (<see cref="MissesToHide"/>): one incomplete search answer doesn't wipe its
+    /// cache. Nothing is hidden, and no miss counted, when search was incomplete or the set shrank by more than
+    /// <paramref name="safetyRatio"/> (M365AutoLink's deletion circuit breaker). Libraries in <paramref name="goneAtOnce"/> (hidden by
+    /// policy, site patterns and templates, or excluded by the library rules) go at once whatever their share.
     /// </summary>
     public static Reconciliation Reconcile(
         IReadOnlyList<LibraryEntry> previous,
@@ -15,11 +21,12 @@ public static class DiscoveryReconciler
         IReadOnlySet<string> failedKeys,
         bool searchIncomplete,
         double safetyRatio,
-        IReadOnlySet<string>? hiddenByPolicy = null)
+        IReadOnlySet<string>? goneAtOnce = null,
+        IReadOnlyDictionary<string, int>? previousMisses = null)
     {
-        if (hiddenByPolicy is { Count: > 0 })
+        if (goneAtOnce is { Count: > 0 })
         {
-            previous = previous.Where(old => !hiddenByPolicy.Contains(old.Key)).ToList();
+            previous = previous.Where(old => !goneAtOnce.Contains(old.Key)).ToList();
         }
         var visible = found.ToDictionary(library => library.Key);
         foreach (var old in previous.Where(old => failedKeys.Contains(old.Key)))
@@ -27,9 +34,11 @@ public static class DiscoveryReconciler
             visible.TryAdd(old.Key, old);
         }
 
-        if (!previous.Any(old => !visible.ContainsKey(old.Key)))
+        var missing = previous.Where(old => !visible.ContainsKey(old.Key)).ToList();
+        var misses = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        if (missing.Count == 0)
         {
-            return new(visible.Values.ToList(), null);
+            return new(visible.Values.ToList(), null, misses);
         }
 
         string? reason = null;
@@ -42,13 +51,19 @@ public static class DiscoveryReconciler
             reason = $"the library set shrank from {previous.Count} to {visible.Count}";
         }
 
-        if (reason is not null)
+        foreach (var old in missing)
         {
-            foreach (var old in previous)
+            var before = previousMisses?.GetValueOrDefault(old.Key) ?? 0;
+            var count = reason is null ? before + 1 : before;
+            if (reason is not null || count < MissesToHide)
             {
                 visible.TryAdd(old.Key, old);
+                if (count > 0)
+                {
+                    misses[old.Key] = count;
+                }
             }
         }
-        return new(visible.Values.ToList(), reason);
+        return new(visible.Values.ToList(), reason, misses);
     }
 }

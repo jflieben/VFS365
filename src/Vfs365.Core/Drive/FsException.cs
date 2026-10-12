@@ -1,6 +1,7 @@
 namespace Vfs365.Core.Drive;
 
-public enum FsError { NotFound, NameCollision, NotSameDevice, AccessDenied, DirectoryNotEmpty, ReadOnly }
+/// <summary>Invalid: the open handle's content is gone (deleted or replaced while it was open).</summary>
+public enum FsError { NotFound, NameCollision, NotSameDevice, AccessDenied, DirectoryNotEmpty, ReadOnly, Invalid }
 
 /// <summary>A file system rule the engine enforces, for the front end to map to its own status codes.</summary>
 public sealed class FsException(FsError error, string message) : Exception(message)

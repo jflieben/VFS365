@@ -1,16 +1,38 @@
 namespace Vfs365.Core.Drive;
 
-public sealed record DriveItemInfo(string Id, string Name, bool IsFolder, long Size, DateTimeOffset Created, DateTimeOffset Modified, string? ETag, string? CTag);
+/// <summary>An item. ParentId is set where Graph returned it (single items and changes, not listings, where the folder is known).</summary>
+public sealed record DriveItemInfo(string Id, string Name, bool IsFolder, long Size, DateTimeOffset Created, DateTimeOffset Modified, string? ETag, string? CTag,
+    [property: System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)] string? ParentId = null);
 
 /// <summary>
-/// A download serves another length than the listing said: the file changed in Microsoft 365 since it was listed, or SharePoint serves
-/// an Office file with properties written into it. <see cref="Current"/> is the item with the length served.
+/// A download serves other content than the listing said: another length (the file changed in Microsoft 365 since it was listed, or
+/// SharePoint serves an Office file with properties written into it), or another version (<see cref="OtherVersion"/>).
+/// <see cref="Current"/> is the item as served.
 /// </summary>
-public sealed class ContentChangedException(DriveItemInfo current, long listed)
-    : IOException($"changed in Microsoft 365 since it was listed ({listed} bytes listed, {current.Size} served)")
+public sealed class ContentChangedException(DriveItemInfo current, long listed, bool otherVersion = false)
+    : IOException(otherVersion
+        ? "changed in Microsoft 365 since it was listed (another version is served)"
+        : $"changed in Microsoft 365 since it was listed ({listed} bytes listed, {current.Size} served)")
 {
     public DriveItemInfo Current { get; } = current;
     public long Listed { get; } = listed;
+    public bool OtherVersion { get; } = otherVersion;
+}
+
+/// <summary>Compares the content tag a listing gave (cTag, else eTag) with the item as it is now.</summary>
+public static class ContentTags
+{
+    /// <summary>
+    /// True when the item now holds another version than <paramref name="expected"/> names. Graph tags are "{id},version" (eTag) and
+    /// "c:{id},version" (cTag): a tag of the same kind and item with another version differs. Tags in another form never count as
+    /// different, so an unknown format can't fail every download.
+    /// </summary>
+    public static bool Differs(string? expected, DriveItemInfo current) =>
+        expected is not null && expected != current.CTag && expected != current.ETag && (SameStem(expected, current.CTag) || SameStem(expected, current.ETag));
+
+    static bool SameStem(string expected, string? current) =>
+        current is not null && expected.LastIndexOf(',') is var split and > 0 && current.LastIndexOf(',') == split
+        && expected.AsSpan(0, split).SequenceEqual(current.AsSpan(0, split));
 }
 
 /// <summary>One change from a drive's delta feed. Item is null for deletions (and for items that are neither file nor folder).</summary>
@@ -52,10 +74,11 @@ public interface IDriveApi
     Task<DriveItemInfo?> GetItemAsync(string driveId, string path, CancellationToken ct);
 
     /// <summary>
-    /// Content from <paramref name="offset"/> to the end, as it arrives. Throws <see cref="ContentChangedException"/> when the content
-    /// served isn't <paramref name="length"/> bytes long.
+    /// Content from <paramref name="offset"/> to the end, as it arrives, of the version <paramref name="contentTag"/> names (null: any).
+    /// Throws <see cref="ContentChangedException"/> when the item now holds another version (<see cref="ContentTags.Differs"/>) or the
+    /// content served isn't <paramref name="length"/> bytes long.
     /// </summary>
-    Task<Stream> OpenReadAsync(string driveId, string itemId, long offset, long length, CancellationToken ct);
+    Task<Stream> OpenReadAsync(string driveId, string itemId, string? contentTag, long offset, long length, CancellationToken ct);
 
     /// <summary>Whole-file upload: one request up to <see cref="UploadSession.SimpleUploadLimit"/>, else a session.</summary>
     Task<DriveItemInfo> UploadAsync(string driveId, UploadTarget target, string sourceFile, CancellationToken ct);

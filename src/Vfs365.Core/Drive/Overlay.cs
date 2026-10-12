@@ -32,8 +32,34 @@ internal sealed class PendingFile(string driveId, string drivePath, string stagi
     public bool Waiting { get; set; }
     public ProgressiveUpload? Progress { get; set; }
 
-    /// <summary>The upload running without the write gate; operations on this file wait for it.</summary>
-    public Task? Uploading { get; set; }
+    /// <summary>A close (or a deferred commit) asked for the upload: the file counts as waiting until it is uploaded.</summary>
+    public bool Queued { get; set; }
+
+    /// <summary>From the journal of an earlier run: the upload may have gone through before the crash.</summary>
+    public bool Recovered { get; set; }
+
+    /// <summary>Staged from a renamed-away original (<see cref="AliasItem"/>); deleting it follows the alias rules.</summary>
+    public AliasItem? Alias { get; set; }
+
+    /// <summary>The item this content went into (a conflict copy included) and its path, once uploaded. Handles follow it.</summary>
+    public DriveItemInfo? Result { get; private set; }
+    public string? ResultPath { get; private set; }
+
+    /// <summary>Deleted or replaced: handles still open on it may not write.</summary>
+    public bool Discarded { get; private set; }
+
+    public bool IsLive => Result is null && !Discarded;
+
+    /// <summary>Writes through handles hold it shared; ending the staging (upload done, discarded) holds it exclusively.</summary>
+    public ReaderWriterLockSlim Writing { get; } = new();
+
+    public void Retire(DriveItemInfo item, string drivePath)
+    {
+        ResultPath = drivePath;
+        Result = item;
+    }
+
+    public void Discard() => Discarded = true;
 
     int writes;
 

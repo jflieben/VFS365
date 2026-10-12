@@ -11,18 +11,43 @@ public class DiscoveryServiceTests
         public string OneDriveUrl = "https://contoso-my.sharepoint.com/personal/jos_contoso_com/Documents";
         public List<DiscoveredLibrary> Hits = [];
         public bool FailSearch;
+        public bool NoDocIds;
+        public List<(long After, int StartRow)> Searches = [];
         public HashSet<string> FailingSites = new(StringComparer.OrdinalIgnoreCase);
+        public HashSet<string> Unlistable = new(StringComparer.OrdinalIgnoreCase);
         public Dictionary<string, SiteMetadata> Sites = new(StringComparer.OrdinalIgnoreCase);
         public Dictionary<string, ListMetadata> Lists = new(StringComparer.OrdinalIgnoreCase);
         public int ListCalls;
+        public int WebListCalls;
+        public int DriveCalls;
 
-        public Task<MyDrive> GetMyDriveAsync(CancellationToken ct) => Task.FromResult(new MyDrive("b!me", OneDriveUrl));
+        public Task<MyDrive> GetMyDriveAsync(CancellationToken ct)
+        {
+            DriveCalls++;
+            return Task.FromResult(new MyDrive("b!me", OneDriveUrl));
+        }
 
-        public Task<SearchPage> SearchDocumentLibrariesAsync(string tenantRoot, int startRow, int rowLimit, CancellationToken ct) =>
-            FailSearch ? throw new HttpRequestException("search down") : Task.FromResult(new SearchPage(Hits.Skip(startRow).Take(rowLimit).ToList(), Math.Min(rowLimit, Math.Max(0, Hits.Count - startRow))));
+        /// <summary>Hit i has DocId i + 1.</summary>
+        public Task<SearchPage> SearchDocumentLibrariesAsync(string tenantRoot, long afterDocId, int startRow, int rowLimit, CancellationToken ct)
+        {
+            if (FailSearch)
+            {
+                throw new HttpRequestException("search down");
+            }
+            Searches.Add((afterDocId, startRow));
+            var rows = Hits.Select((hit, i) => (Hit: hit, DocId: i + 1L)).Where(r => r.DocId > afterDocId).Skip(startRow).Take(rowLimit).ToList();
+            return Task.FromResult(new SearchPage(rows.Select(r => r.Hit).ToList(), rows.Count, NoDocIds || rows.Count == 0 ? null : rows[^1].DocId));
+        }
 
         public Task<SiteMetadata> GetSiteAsync(string webUrl, CancellationToken ct) =>
             FailingSites.Contains(webUrl) ? throw new HttpRequestException("site down") : Task.FromResult(Sites.GetValueOrDefault(webUrl, new SiteMetadata(false, false)));
+
+        public Task<IReadOnlyList<PinnedLibrary>?> GetWebLibrariesAsync(string webUrl, CancellationToken ct)
+        {
+            Interlocked.Increment(ref WebListCalls);
+            return Task.FromResult<IReadOnlyList<PinnedLibrary>?>(Unlistable.Contains(webUrl) ? null
+                : Lists.Where(l => l.Key.StartsWith(webUrl + "|", StringComparison.OrdinalIgnoreCase)).Select(l => new PinnedLibrary(l.Key[(webUrl.Length + 1)..], l.Value)).ToList());
+        }
 
         public Task<ListMetadata?> GetListAsync(string baseUrl, string listId, CancellationToken ct)
         {
@@ -50,8 +75,11 @@ public class DiscoveryServiceTests
         }
     }
 
+    static readonly DateTimeOffset Start = new(2026, 10, 12, 8, 0, 0, TimeSpan.Zero);
+
+    /// <summary>Without the first-read jitter, so check times are exact.</summary>
     static Task<DiscoveryResult> Run(FakeApi api, DiscoveryState? previous = null, TimeSpan later = default) =>
-        new DiscoveryService(api, new DiscoveryOptions { Clock = () => DateTimeOffset.UtcNow + later }).RunAsync(previous);
+        new DiscoveryService(api, new DiscoveryOptions { Clock = () => Start + later, FirstReadJitter = TimeSpan.Zero }).RunAsync(previous);
 
     static readonly TimeSpan NextDay = TimeSpan.FromHours(49);
 
@@ -294,14 +322,242 @@ public class DiscoveryServiceTests
         var first = await Run(api);
 
         api.Hits.RemoveAt(0);
-        var small = await Run(api, first.State);
+        var small = await Run(api, await Run(api, first.State) is var once ? once.State : null);
         Assert.Equal(9, small.Libraries.Count);
         Assert.Null(small.HidingSkippedReason);
 
         api.Hits.RemoveRange(0, 5);
-        var large = await Run(api, small.State);
+        var large = await Run(api, await Run(api, small.State) is var largeOnce ? largeOnce.State : null);
         Assert.Equal(9, large.Libraries.Count);
         Assert.Contains("shrank from 9 to 4", large.HidingSkippedReason);
+        Assert.Empty(large.State.Misses!); // a run that hides nothing counts no misses either
+    }
+
+    [Fact]
+    public async Task A_library_missing_from_one_run_stays_and_goes_after_the_second()
+    {
+        var api = new FakeApi();
+        for (var i = 1; i <= 5; i++)
+        {
+            api.Add($"Site{i}", Id(i), "Documents");
+        }
+        var first = await Run(api);
+        var gone = api.Hits[0];
+
+        api.Hits.RemoveAt(0);
+        var once = await Run(api, first.State);
+        Assert.Equal(5, once.Libraries.Count);
+        Assert.Equal(1, once.State.Misses![gone.Key]);
+
+        api.Hits.Insert(0, gone); // back: the count starts over
+        var back = await Run(api, once.State);
+        Assert.Empty(back.State.Misses!);
+
+        api.Hits.RemoveAt(0);
+        var twice = await Run(api, await Run(api, back.State) is var again ? again.State : null);
+        Assert.Equal(4, twice.Libraries.Count);
+        Assert.DoesNotContain(twice.Libraries, l => l.Key == gone.Key);
+    }
+
+    [Fact]
+    public async Task A_library_the_rules_now_exclude_goes_at_once()
+    {
+        var api = new FakeApi();
+        api.Add("Finance", Id(1), "Documents");
+        api.Add("Sales", Id(2), "Documents");
+        var first = await Run(api);
+
+        api.Lists[$"{Root}/sites/Sales|{Id(2)}"] = new ListMetadata("Documents", false, 101, false, false, null, false, true, 5);
+        var second = await Run(api, first.State, NextDay);
+
+        Assert.Equal(["Finance"], second.Libraries.Select(l => l.SiteTitle));
+    }
+
+    [Fact]
+    public async Task A_site_answers_for_its_libraries_in_one_call()
+    {
+        var api = new FakeApi();
+        api.Add("Finance", Id(1), "Documents");
+        api.Add("Finance", Id(2), "Contracts");
+        api.Add("Finance", Id(3), "Site Assets", new ListMetadata("Site Assets", false, 101, false, false, null, false, false, 5, "SiteAssets"));
+
+        var result = await Run(api);
+
+        Assert.Equal(1, api.WebListCalls);
+        Assert.Equal(0, api.ListCalls);
+        Assert.Equal(["Contracts", "Documents"], result.Libraries.Select(l => l.LibraryTitle));
+    }
+
+    [Fact]
+    public async Task A_site_the_user_cannot_list_is_read_per_library()
+    {
+        var api = new FakeApi();
+        api.Add("Finance", Id(1), "Documents");
+        api.Add("Finance", Id(2), "Contracts");
+        api.Unlistable.Add($"{Root}/sites/Finance");
+
+        var result = await Run(api);
+
+        Assert.Equal(2, api.ListCalls);
+        Assert.Equal(2, result.Libraries.Count);
+    }
+
+    [Fact]
+    public async Task A_library_missing_from_the_site_list_is_read_by_id_also_on_the_site_collection()
+    {
+        var api = new FakeApi();
+        var webUrl = $"{Root}/sites/Finance/Sub";
+        api.Hits.Add(new DiscoveredLibrary(Id(10), Id(11), Id(12), webUrl, $"{Root}/sites/Finance", "Sub", "Documents"));
+        api.Hits.Add(new DiscoveredLibrary(Id(10), Id(11), Id(13), webUrl, $"{Root}/sites/Finance", "Sub", "Archive"));
+        api.Lists[$"{webUrl}|{Id(12)}"] = new ListMetadata("Documents", false, 101, false, false, null, false, false, 1);
+        api.Lists[$"{Root}/sites/Finance|{Id(13)}"] = new ListMetadata("Archive", false, 101, false, false, null, false, false, 1);
+
+        var result = await Run(api);
+
+        Assert.Equal(1, api.WebListCalls);
+        Assert.Equal(2, api.ListCalls); // Archive: on the web, then on the site collection
+        Assert.Equal(2, result.Libraries.Count);
+    }
+
+    [Fact]
+    public async Task First_reads_spread_their_check_times_the_same_way_every_time()
+    {
+        var api = new FakeApi();
+        for (var i = 1; i <= 20; i++)
+        {
+            api.Add($"Site{i}", Id(i), "Documents");
+        }
+        var options = new DiscoveryOptions { Clock = () => Start };
+
+        var first = await new DiscoveryService(api, options).RunAsync(null);
+        var again = await new DiscoveryService(api, options).RunAsync(null);
+
+        var offsets = first.Libraries.Select(l => Start - l.CheckedAt!.Value).ToList();
+        Assert.All(offsets, o => Assert.InRange(o, TimeSpan.Zero, TimeSpan.FromHours(24)));
+        Assert.True(offsets.Distinct().Count() > 10);
+        Assert.Equal(first.Libraries.Select(l => l.CheckedAt), again.Libraries.Select(l => l.CheckedAt));
+    }
+
+    [Fact]
+    public async Task Expired_sites_are_read_again_a_share_per_run_oldest_first()
+    {
+        var api = new FakeApi();
+        for (var i = 1; i <= 30; i++)
+        {
+            api.Add($"Site{i}", Id(i), "Documents");
+        }
+        var options = new DiscoveryOptions { Clock = () => Start, FirstReadJitter = TimeSpan.Zero, MinSiteRechecks = 5 };
+        var first = await new DiscoveryService(api, options).RunAsync(null);
+        // Sites 1 to 10 a day older than the rest
+        var aged = first.State with { Libraries = [.. first.State.Libraries.Select(l => int.Parse(l.SiteTitle[4..]) <= 10 ? l with { CheckedAt = Start - TimeSpan.FromDays(1) } : l)] };
+
+        api.ListCalls = 0;
+        var second = await new DiscoveryService(api, options with { Clock = () => Start + NextDay }).RunAsync(aged);
+        Assert.Equal(15, api.ListCalls);
+        Assert.Equal(30, second.Libraries.Count);
+        Assert.All(second.Libraries.Where(l => int.Parse(l.SiteTitle[4..]) <= 10), l => Assert.Equal(Start + NextDay, l.CheckedAt));
+
+        api.ListCalls = 0;
+        await new DiscoveryService(api, options with { Clock = () => Start + NextDay + TimeSpan.FromHours(1) }).RunAsync(second.State);
+        Assert.Equal(15, api.ListCalls);
+
+        api.ListCalls = 0;
+        await new DiscoveryService(api, options with { MetadataMaxAge = TimeSpan.Zero }).RunAsync(second.State);
+        Assert.Equal(30, api.ListCalls); // a refresh isn't held back
+    }
+
+    [Fact]
+    public async Task Search_pages_after_the_last_doc_id_or_by_row_without_one()
+    {
+        var api = new FakeApi();
+        for (var i = 1; i <= 1200; i++)
+        {
+            api.Add($"Site{i}", Id(i), "Documents");
+        }
+
+        var byDocId = await Run(api);
+        Assert.Equal([(0L, 0), (500L, 0), (1000L, 0)], api.Searches);
+        Assert.Equal(1200, byDocId.SearchHits);
+
+        api.Searches.Clear();
+        api.NoDocIds = true;
+        var byRow = await Run(api);
+        Assert.Equal([(0L, 0), (0L, 500), (0L, 1000)], api.Searches);
+        Assert.Equal(1200, byRow.SearchHits);
+    }
+
+    [Fact]
+    public async Task A_hidden_library_is_checked_again_with_the_metadata()
+    {
+        var api = new FakeApi();
+        api.Add("Finance", Id(1), "Documents");
+        api.Add("Finance", Id(2), "Archive", new ListMetadata("Archive", true, 101, false, false, null, false, false, 5));
+        var first = await Run(api);
+        Assert.Single(first.Libraries);
+        Assert.Empty(first.State.StaticExclusions);
+        Assert.Equal(LibraryRules.HiddenReason, first.State.Exclusions![api.Hits[1].Key].Reason);
+
+        api.WebListCalls = api.ListCalls = 0;
+        var sameDay = await Run(api, first.State);
+        Assert.Equal(0, api.WebListCalls + api.ListCalls);
+        Assert.Contains(sameDay.Skipped, s => s.Reason == LibraryRules.HiddenReason);
+
+        api.Lists[$"{Root}/sites/Finance|{Id(2)}"] = new ListMetadata("Archive", false, 101, false, false, null, false, false, 5);
+        var later = await Run(api, sameDay.State, NextDay);
+        Assert.Equal(2, later.Libraries.Count);
+
+        // Cached as static by earlier versions: read again
+        var old = first.State with { StaticExclusions = new Dictionary<string, string> { [api.Hits[1].Key] = LibraryRules.HiddenReason }, Exclusions = null };
+        Assert.Equal(2, (await Run(api, old)).Libraries.Count);
+    }
+
+    [Fact]
+    public async Task A_pinned_url_with_nothing_there_is_probed_again_only_after_the_metadata_age()
+    {
+        var api = new FakeApi();
+        var options = new DiscoveryOptions { PinnedLocations = ["https://contoso.sharepoint.com/sites/Gone"], Clock = () => Start };
+
+        var first = await new DiscoveryService(api, options).RunAsync(null);
+        var sameDay = await new DiscoveryService(api, options).RunAsync(first.State);
+        Assert.Equal(1, api.Resolves);
+        Assert.Contains(first.Errors, e => e.Reason == "Pinned location: nothing found there");
+        Assert.Contains(sameDay.Skipped, s => s.Reason == "Pinned location: nothing found there");
+
+        await new DiscoveryService(api, options with { Clock = () => Start + NextDay }).RunAsync(sameDay.State);
+        Assert.Equal(2, api.Resolves);
+    }
+
+    [Fact]
+    public async Task A_known_onedrive_is_not_read_again()
+    {
+        var api = new FakeApi();
+        var result = await new DiscoveryService(api, new DiscoveryOptions()).RunAsync(null, default, new MyDrive("b!known", api.OneDriveUrl));
+
+        Assert.Equal(0, api.DriveCalls);
+        Assert.Equal("b!known", result.State.OneDrive?.DriveId);
+    }
+
+    [Fact]
+    public async Task A_user_moved_to_another_geo_keeps_the_state_of_the_same_tenant()
+    {
+        var api = new FakeApi();
+        for (var i = 1; i <= 5; i++)
+        {
+            api.Add($"Site{i}", Id(i), "Documents");
+        }
+        var service = new DiscoveryService(api, new DiscoveryOptions { Clock = () => Start });
+        var first = await service.RunAsync(null, tenantId: "tenant-1");
+        api.OneDriveUrl = "https://contosoeur-my.sharepoint.com/personal/jos_contoso_com/Documents";
+        api.Hits.Clear(); // search in the new geo doesn't answer yet
+
+        api.ListCalls = 0;
+        var moved = await service.RunAsync(first.State, tenantId: "tenant-1");
+        Assert.Equal("https://contosoeur.sharepoint.com", moved.TenantRoot);
+        Assert.Equal(5, moved.Libraries.Count); // the safety check still holds
+        Assert.Equal("tenant-1", moved.State.TenantId);
+
+        var withoutId = await service.RunAsync(first.State);
+        Assert.Empty(withoutId.Libraries); // by host: another tenant
     }
 
     [Fact]
