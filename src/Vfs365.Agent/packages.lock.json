@@ -4,28 +4,28 @@
     "net10.0-windows7.0": {
       "Microsoft.Identity.Client": {
         "type": "Direct",
-        "requested": "[4.90.1, )",
-        "resolved": "4.90.1",
-        "contentHash": "GLsf4cfEfIZD4pBkmBc8kCjfE811PKsM29T9nMZQDS2px/buM/Ha8jVYiGPdiA7cqjYNIX+G5d0S12TtGZS6RA==",
+        "requested": "[4.91.0, )",
+        "resolved": "4.91.0",
+        "contentHash": "u+j8hdM/Eez1j0rQVodY+4MRfsLgmsskjMgVkf74xkLWssbW4mqSgz0Tx4H0CJTtrDes00M5s4545rbLN61/uw==",
         "dependencies": {
           "Microsoft.IdentityModel.Abstractions": "8.14.0"
         }
       },
       "Microsoft.Identity.Client.Broker": {
         "type": "Direct",
-        "requested": "[4.90.1, )",
-        "resolved": "4.90.1",
-        "contentHash": "n1sD4oVBfQjyekTXULWwgANj2DMCAmJcJq5pzBfAceCK2FauVyf8U0KxJ9jHWkA0d7cOfAangOmkeJ2uo4xhcw==",
+        "requested": "[4.91.0, )",
+        "resolved": "4.91.0",
+        "contentHash": "scM6YnngTsDyTesX7DhMuDG583ujw8e7cCtaw0dq+sort+a5N9K4K+elIuLIwcEi9HEQxitlG87AmFeKO24t3g==",
         "dependencies": {
-          "Microsoft.Identity.Client": "4.90.1",
+          "Microsoft.Identity.Client": "4.91.0",
           "Microsoft.Identity.Client.NativeInterop": "0.20.6"
         }
       },
       "System.Security.Cryptography.ProtectedData": {
         "type": "Direct",
-        "requested": "[10.0.12, )",
-        "resolved": "10.0.12",
-        "contentHash": "wO0W8VDMeRJZakRySOmemAnrBZMwEFRlbfBtATxUiLf2I3IhSRnCp1Vt157NWptdE4IJ7eftd5n8q9LtaKHFTQ=="
+        "requested": "[10.0.13, )",
+        "resolved": "10.0.13",
+        "contentHash": "aUSmC6cPjFLSE0rDTsmkR3wvUOnscqewebOaaELEToh12sNmoltZqT3f0C81mJ1zhxKjWco25soHTvYwsXCsUw=="
       },
       "Microsoft.Identity.Client.NativeInterop": {
         "type": "Transitive",
@@ -48,14 +48,14 @@
       "vfs365.drive.winfsp": {
         "type": "Project",
         "dependencies": {
-          "Vfs365.Core": "[0.3.2, )",
+          "Vfs365.Core": "[0.4.0, )",
           "winfsp.net": "[2.1.25156, )"
         }
       },
       "vfs365.graph": {
         "type": "Project",
         "dependencies": {
-          "Vfs365.Core": "[0.3.2, )"
+          "Vfs365.Core": "[0.4.0, )"
         }
       },
       "winfsp.net": {
