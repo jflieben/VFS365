@@ -140,6 +140,38 @@ public sealed class Monitoring(MonitoringTarget target, DeviceInfo device, Actio
     }
 
     /// <summary>
+    /// A throttling episode as a row in the errors table (source "throttled", time = its start) with its numbers as columns. Not
+    /// counted as an error; at most <see cref="MaxThrottlingPerHour"/> an hour.
+    /// </summary>
+    public void Throttling(ThrottleEpisodes.Episode episode)
+    {
+        var now = DateTimeOffset.UtcNow;
+        lock (gate)
+        {
+            if (now - throttlingHour >= TimeSpan.FromHours(1))
+            {
+                throttlingHour = now;
+                throttlingThisHour = 0;
+            }
+            if (++throttlingThisHour > MaxThrottlingPerHour)
+            {
+                return;
+            }
+        }
+        Track(SendAsync(ErrorsTable, episode.From.UtcDateTime.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture), NewestFirst(episode.From),
+        [
+            .. Common(), ("Source", "throttled"), ("Message", episode.Describe()), ("OccurredAt", episode.From), ("ThrottledUntil", episode.Until),
+            ("Responses", episode.Responses), ("HeldSeconds", (int)Math.Ceiling(episode.Held.TotalSeconds)), ("Status429", episode.Status429),
+            ("Status503", episode.Status503), ("GraphResponses", episode.Graph), ("SharePointResponses", episode.SharePoint),
+            ("BackgroundResponses", episode.Background), ("LongestWaitSeconds", (int)Math.Ceiling(episode.LongestPause.TotalSeconds)),
+        ]));
+    }
+
+    const int MaxThrottlingPerHour = 12;
+    DateTimeOffset throttlingHour = DateTimeOffset.MinValue;
+    int throttlingThisHour;
+
+    /// <summary>
     /// Message text without names: the given paths and any other volume path (a word starting with a single backslash, up to the next
     /// colon or the end, as in file system log lines) become "[path 1a2b3c4d]", the first 8 hex digits of the SHA-256 of the lower-cased
     /// path, so repeats still group. URLs keep only their host; UNC paths (\\VFS365\user) stay.
@@ -157,9 +189,9 @@ public sealed class Monitoring(MonitoringTarget target, DeviceInfo device, Actio
     }
 
     /// <summary>One row per day, device and Windows user. True when it was added (or was there already).</summary>
-    public Task<bool> StatisticsAsync(string day, IEnumerable<(string Name, object? Value)> values)
+    public Task<bool> StatisticsAsync(string day, IEnumerable<(string Name, object? Value)> values, string? user = null, string? version = null)
     {
-        var sending = SendAsync(StatisticsTable, day, $"{device.Id}_{WindowsIdentity.GetCurrent().User?.Value ?? Environment.UserName}", [.. Common(), .. values]);
+        var sending = SendAsync(StatisticsTable, day, $"{device.Id}_{WindowsIdentity.GetCurrent().User?.Value ?? Environment.UserName}", [.. Common(user, version), .. values]);
         Track(sending);
         return sending;
     }
@@ -183,10 +215,11 @@ public sealed class Monitoring(MonitoringTarget target, DeviceInfo device, Actio
         return Task.WhenAny(Task.WhenAll(waiting), Task.Delay(timeout));
     }
 
-    IEnumerable<(string, object?)> Common() =>
+    /// <summary>What every row carries; a statistics row of an earlier day brings that day's user and version.</summary>
+    IEnumerable<(string, object?)> Common(string? user = null, string? version = null) =>
     [
-        ("DeviceName", device.Name), ("DeviceId", device.Id), ("EntraDeviceId", device.EntraDeviceId), ("User", User()),
-        ("WindowsUser", $@"{Environment.UserDomainName}\{Environment.UserName}"), ("TenantId", TenantId()), ("Version", Version),
+        ("DeviceName", device.Name), ("DeviceId", device.Id), ("EntraDeviceId", device.EntraDeviceId), ("User", user ?? User()),
+        ("WindowsUser", $@"{Environment.UserDomainName}\{Environment.UserName}"), ("TenantId", TenantId()), ("Version", version ?? Version),
     ];
 
     void Track(Task task)

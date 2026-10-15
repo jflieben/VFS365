@@ -72,6 +72,8 @@ select, input[type=search] { border: 1px solid var(--ring); background: var(--su
 .tables { grid-template-columns: 1fr; margin-top: 12px; }
 .kpi { padding: 14px 16px; }
 .kpi .label { color: var(--ink-2); font-size: 12.5px; }
+.kpi.click { cursor: pointer; }
+.kpi.click:hover, .kpi.click:focus-visible { background: var(--surface-2); }
 .kpi .value { font-size: 26px; font-weight: 650; margin-top: 2px; }
 .kpi .note { color: var(--ink-2); font-size: 12.5px; min-height: 18px; }
 .kpi svg { display: block; margin-top: 6px; width: 100%; height: 28px; }
@@ -406,6 +408,8 @@ async function loadAll(c, days, refresh, progress) {
 /* Crash and start errors may come before sign-in, with only the Windows user; statistics rows link it to the UPN */
 const upnOf = new Map();
 const userOf = r => r.User || upnOf.get(r.WindowsUser) || r.WindowsUser || "(unknown)";
+/* A device by its name: a host rebuilt from an image (AVD) keeps its name and Entra ID but gets a new MachineGuid (DeviceId) */
+const deviceOf = r => String(r.DeviceName || r.EntraDeviceId || r["DeviceId"] || "?").toLowerCase();
 /* Sources the agent reports, each with a fixed color; anything else is "other" */
 const SOURCE_COLOR = { upload: "--s1", "conflict copy": "--s2", "sign-in": "--s3", "file system": "--s4", discovery: "--s5", start: "--s6", "drive letter": "--s7", crash: "--s8", security: "--s8" };
 const KNOWN_SOURCES = Object.keys(SOURCE_COLOR);
@@ -425,9 +429,21 @@ function buildModel(range, filters) {
   const today = new Date();
   const allDays = [];
   for (let back = range; back >= 0; back--) allDays.push(localDay(addDays(today, -back)));
-  const days = allDays.slice(1), statDays = allDays.slice(0, -1);
-  const start = dayToDate(days[0]); start.setHours(0, 0, 0, 0);
-  const prevStart = addDays(start, -range);
+  let days = allDays.slice(1), statDays = allDays.slice(0, -1);
+  const rangeStart = dayToDate(days[0]); rangeStart.setHours(0, 0, 0, 0);
+  const prevStart = addDays(rangeStart, -range);
+  // When monitoring began within the period, charts start at the first report (at least two days)
+  const firstDay = [...[...data.statistics].filter(([, rows]) => rows.length).map(([day]) => day),
+    ...[...data.errors.values()].flat().map(r => localDay(new Date(r.OccurredAt || r.Timestamp)))].sort()[0];
+  if (firstDay) {
+    const fromFirst = list => list.filter(d => d >= firstDay).length >= 2 ? list.filter(d => d >= firstDay) : list.slice(-2);
+    days = fromFirst(days);
+    statDays = fromFirst(statDays);
+  }
+  const start = rangeStart;
+  const earlierData = !!firstDay && firstDay <= localDay(prevStart);
+  // Devices send a day's statistics during the next day: yesterday is still arriving
+  const provisional = statDays.slice(-1).filter(d => d === localDay(addDays(today, -1)));
   const text = filters.text.trim().toLowerCase();
   const pass = r => (!filters.tenant || r.TenantId === filters.tenant) && (!filters.version || r.Version === filters.version)
     && (!text || [r.DeviceName, r.User, r.WindowsUser, r.Users, r.Version, r.Message, r.Source].some(v => v && String(v).toLowerCase().includes(text)));
@@ -435,7 +451,10 @@ function buildModel(range, filters) {
   upnOf.clear();
   for (const r of [...data.statistics.values()].flat().concat(...data.errors.values())) if (r.User && r.WindowsUser) upnOf.set(r.WindowsUser, r.User);
   const stats = [...data.statistics.values()].flat().filter(r => r.PartitionKey >= statDays[0] && r.PartitionKey <= statDays[statDays.length - 1] && pass(r));
-  const allErrors = [...data.errors.values()].flat().map(r => ({ ...r, at: new Date(r.OccurredAt || r.Timestamp) })).filter(pass);
+  const allEvents = [...data.errors.values()].flat().map(r => ({ ...r, at: new Date(r.OccurredAt || r.Timestamp) })).filter(pass);
+  // Throttling episodes (agents from 0.4.1) share the errors table but aren't errors
+  const allErrors = allEvents.filter(r => r.Source !== "throttled");
+  const episodes = allEvents.filter(r => r.Source === "throttled" && r.at >= rangeStart).map(r => ({ ...r, until: new Date(r.ThrottledUntil || r.at) })).sort((a, b) => b.at - a.at);
   const errors = allErrors.filter(r => r.at >= start).sort((a, b) => b.at - a.at);
   const previousErrors = allErrors.filter(r => r.at >= prevStart && r.at < start);
   const installs = data.devices.map(r => ({ ...r, at: new Date(r.OccurredAt || r.Timestamp) })).filter(pass).sort((a, b) => b.at - a.at);
@@ -443,8 +462,9 @@ function buildModel(range, filters) {
   const perDay = Object.fromEntries(allDays.map(d => [d, { graph: 0, sp: 0, ru: 0, rx: 0, tx: 0, throttled: 0, throttledSec: 0, budgetUser: 0, budgetBackground: 0, budgetUnsplit: 0, minutes: 0, users: new Set(), devices: new Set(), errors: {} }]));
   const devices = new Map(), users = new Map();
   const device = r => {
-    if (!devices.has(r.DeviceId)) devices.set(r.DeviceId, { id: r.DeviceId, name: r.DeviceName || r.DeviceId, entra: r.EntraDeviceId || "", users: new Set(), version: "", versionDay: "", lastSeen: null, errors: 0, crashes: 0, ru: 0, requests: 0, rx: 0, tx: 0, throttled: 0, budgetUser: 0, budgetBackground: 0, budgetUnsplit: 0, minutes: 0, days: new Set(), install: null });
-    const d = devices.get(r.DeviceId); if (r.DeviceName) d.name = r.DeviceName; if (r.EntraDeviceId) d.entra = r.EntraDeviceId; return d;
+    const key = deviceOf(r);
+    if (!devices.has(key)) devices.set(key, { id: key, name: r.DeviceName || r["DeviceId"], entra: r.EntraDeviceId || "", machineIds: new Set(), users: new Set(), version: "", versionDay: "", lastSeen: null, errors: 0, crashes: 0, ru: 0, requests: 0, rx: 0, tx: 0, throttled: 0, budgetUser: 0, budgetBackground: 0, budgetUnsplit: 0, minutes: 0, days: new Set(), install: null });
+    const d = devices.get(key); if (r.DeviceName) d.name = r.DeviceName; if (r.EntraDeviceId) d.entra = r.EntraDeviceId; if (r["DeviceId"]) d.machineIds.add(r["DeviceId"]); return d;
   };
   const user = r => {
     const key = userOf(r);
@@ -460,20 +480,21 @@ function buildModel(range, filters) {
     const wait = { budgetUser: num(r.BudgetWaitForegroundSeconds), budgetBackground: num(r.BudgetWaitBackgroundSeconds) };
     wait.budgetUnsplit = Math.max(0, num(r.BudgetWaitSeconds) - wait.budgetUser - wait.budgetBackground);
     for (const [key, value] of Object.entries(wait)) p[key] += value;
-    p.minutes += num(r.MinutesRunning); p.users.add(userOf(r)); p.devices.add(r.DeviceId);
+    p.minutes += num(r.MinutesRunning); p.users.add(userOf(r)); p.devices.add(deviceOf(r));
     const reported = r.Timestamp ? new Date(r.Timestamp) : new Date(r.PartitionKey + "T23:59:59");
     const d = device(r), u = user(r);
     for (const x of [d, u]) { x.ru += ru; x.requests += graph + sp; x.rx += rx; x.tx += tx; x.throttled += num(r.Throttled); x.minutes += num(r.MinutesRunning); x.days.add(r.PartitionKey); seen(x, reported); for (const [key, value] of Object.entries(wait)) x[key] += value; }
-    d.users.add(userOf(r)); u.devices.add(r.DeviceId);
-    if (r.PartitionKey >= d.versionDay) { d.version = r.Version; d.versionDay = r.PartitionKey; }
+    d.users.add(userOf(r)); u.devices.add(deviceOf(r));
+    // The latest day's version; a host reporting two versions that day (rolled out meanwhile) counts as the newer one
+    if (r.PartitionKey > d.versionDay || (r.PartitionKey === d.versionDay && semverCompare(r.Version, d.version) > 0)) { d.version = r.Version; d.versionDay = r.PartitionKey; }
   }
   for (const r of errors) {
     const day = localDay(r.at), p = perDay[day], source = r.Source || "other";
     if (p) p.errors[source] = (p.errors[source] || 0) + 1;
     const d = device(r), u = user(r);
     d.errors++; u.errors++; if (source === "crash") d.crashes++;
-    d.users.add(userOf(r)); u.devices.add(r.DeviceId); seen(d, r.at); seen(u, r.at);
-    if (!d.version || localDay(r.at) >= d.versionDay) { d.version = r.Version; d.versionDay = localDay(r.at); }
+    d.users.add(userOf(r)); u.devices.add(deviceOf(r)); seen(d, r.at); seen(u, r.at);
+    if (!d.version || localDay(r.at) > d.versionDay || (localDay(r.at) === d.versionDay && semverCompare(r.Version, d.version) > 0)) { d.version = r.Version; d.versionDay = localDay(r.at); }
   }
   for (const r of installs) {
     const d = device(r);
@@ -489,20 +510,22 @@ function buildModel(range, filters) {
   for (const r of errors) {
     const key = (r.Source || "other") + "|" + errorPattern(r.Message);
     if (!groups.has(key)) groups.set(key, { key, source: r.Source || "other", pattern: errorPattern(r.Message), sample: r.Message, rows: [], devices: new Set(), users: new Set(), first: r.at, last: r.at });
-    const g = groups.get(key); g.rows.push(r); g.devices.add(r.DeviceId); g.users.add(userOf(r));
+    const g = groups.get(key); g.rows.push(r); g.devices.add(deviceOf(r)); g.users.add(userOf(r));
     if (r.at < g.first) g.first = r.at; if (r.at > g.last) { g.last = r.at; g.sample = r.Message; }
   }
   const sum = f => allDays.reduce((t, d) => t + f(perDay[d]), 0);
-  const activeDevices = new Set([...stats.map(r => r.DeviceId), ...errors.map(r => r.DeviceId)]);
+  const activeDevices = new Set([...stats.map(r => deviceOf(r)), ...errors.map(r => deviceOf(r))]);
   const activeUsers = new Set([...stats.map(userOf), ...errors.map(userOf)]);
   const userDays = stats.length;
+  const statsWithoutUpn = stats.filter(r => !r.User && !upnOf.get(r.WindowsUser)).length;
+  const throttledUserDays = stats.filter(r => num(r.Throttled) > 0).sort((a, b) => b.PartitionKey.localeCompare(a.PartitionKey) || num(b.Throttled) - num(a.Throttled));
   const sourceTotals = {};
   for (const r of errors) sourceTotals[r.Source || "other"] = (sourceTotals[r.Source || "other"] || 0) + 1;
   const tenants = [...new Set([...data.statistics.values()].flat().concat(...data.errors.values(), data.devices).map(r => r.TenantId).filter(Boolean))];
   const allVersions = [...new Set([...data.statistics.values()].flat().concat(...data.errors.values(), data.devices).map(r => r.Version).filter(Boolean))].sort(semverCompare).reverse();
 
   return {
-    range, days, statDays, perDay, start, devices: [...devices.values()], users: [...users.values()], errors, previousErrors, installs, groups: [...groups.values()].sort((a, b) => b.rows.length - a.rows.length),
+    range, days, statDays, perDay, start, firstDay, earlierData, provisional, statsWithoutUpn, episodes, throttledUserDays, devices: [...devices.values()], users: [...users.values()], errors, previousErrors, installs, groups: [...groups.values()].sort((a, b) => b.rows.length - a.rows.length),
     versions: versionCounts, latest, tenants, allVersions, sourceTotals,
     totals: {
       devices: activeDevices.size, users: activeUsers.size, userDays, errors: errors.length, previousErrors: previousErrors.length,
@@ -515,9 +538,21 @@ function buildModel(range, filters) {
 }
 
 /* ---------- Insights: what needs attention ---------- */
+/* " Mostly <user> (n)." when one user accounts for at least half of several reports */
+function mostly(rows) {
+  if (rows.length < 3) return "";
+  const [who, count] = Object.entries(rows.reduce((t, r) => (t[userOf(r)] = (t[userOf(r)] || 0) + 1, t), {})).sort((a, b) => b[1] - a[1])[0];
+  return count * 2 >= rows.length ? ` Mostly ${who} (${count}).` : "";
+}
+/* Plain words for messages that need explaining */
+function hintFor(message) {
+  return /cancel+ed authentication|authentication_canceled/i.test(message || "")
+    ? " A sign-in window was closed without signing in; often an admin or service account that doesn't use the drive."
+    : "";
+}
 function insights(m, c) {
   const out = [];
-  const crashDevices = new Set(m.errors.filter(r => r.Source === "crash").map(r => r.DeviceId));
+  const crashDevices = new Set(m.errors.filter(r => r.Source === "crash").map(r => deviceOf(r)));
   if (m.totals.crashes) {
     const latest = m.errors.find(r => r.Source === "crash");
     out.push({ level: "critical", label: "Crashes", text: `The agent stopped unexpectedly ${m.totals.crashes} time(s) on ${crashDevices.size} device(s); it restarts by itself. Latest: ${latest.DeviceName}, ${dateTime(latest.at)}.`, action: () => openGroupBySource("crash") });
@@ -525,27 +560,32 @@ function insights(m, c) {
   // Rows from vfs365-agent.exe itself when it stopped restarting the agent: those users have no drive until they sign in again
   const gaveUp = m.errors.filter(r => r.Source === "crash" && /not started again/.test(r.Message || ""));
   if (gaveUp.length) {
-    const users = new Set(gaveUp.map(r => `${r.DeviceId}|${r.WindowsUser || r.User || ""}`));
-    out.push({ level: "critical", label: "Gave up restarting", text: `On ${new Set(gaveUp.map(r => r.DeviceId)).size} device(s) the agent crashed 4 times within 15 minutes and was not started again, for ${users.size} user(s); they have no drive until they sign in again. Latest: ${gaveUp[0].DeviceName}, ${dateTime(gaveUp[0].at)}.`, action: () => openGroupBySource("crash") });
+    const users = new Set(gaveUp.map(r => `${deviceOf(r)}|${r.WindowsUser || r.User || ""}`));
+    out.push({ level: "critical", label: "Gave up restarting", text: `On ${new Set(gaveUp.map(r => deviceOf(r))).size} device(s) the agent crashed 4 times within 15 minutes and was not started again, for ${users.size} user(s); they have no drive until they sign in again. Latest: ${gaveUp[0].DeviceName}, ${dateTime(gaveUp[0].at)}.`, action: () => openGroupBySource("crash") });
   }
   const security = m.errors.filter(r => r.Source === "security");
-  if (security.length) out.push({ level: "critical", label: "Security", text: `On ${new Set(security.map(r => r.DeviceId)).size} device(s) another user held a user's \\\\VFS365\\<user> path, so that user's drive didn't start. Check who runs what on those PCs. Latest: ${clip(security[0].Message, 160)}`, action: () => openGroupBySource("security") });
+  if (security.length) out.push({ level: "critical", label: "Security", text: `On ${new Set(security.map(r => deviceOf(r))).size} device(s) another user held a user's \\\\VFS365\\<user> path, so that user's drive didn't start. Check who runs what on those PCs. Latest: ${clip(security[0].Message, 160)}`, action: () => openGroupBySource("security") });
   const dayAgo = Date.now() - 86400000;
   const recent = m.errors.filter(r => r.at.getTime() >= dayAgo);
   if (recent.length) {
     const top = Object.entries(recent.reduce((t, r) => (t[r.Source || "other"] = (t[r.Source || "other"] || 0) + 1, t), {})).sort((a, b) => b[1] - a[1])[0];
-    out.push({ level: "warning", label: "Last 24 hours", text: `${recent.length} error(s) on ${new Set(recent.map(r => r.DeviceId)).size} device(s); most: ${top[0]} (${top[1]}).`, action: () => showTab("errors") });
+    out.push({ level: "warning", label: "Last 24 hours", text: `${recent.length} error(s) on ${new Set(recent.map(r => deviceOf(r))).size} device(s); most: ${top[0]} (${top[1]}).`, action: () => showTab("errors") });
   }
   for (const [source, label] of [["sign-in", "Sign-in problems"], ["start", "Drive didn't start"], ["drive letter", "Drive letter"], ["upload", "Uploads waiting"], ["conflict copy", "Conflict copies"]]) {
     const rows = m.errors.filter(r => r.Source === source);
-    if (rows.length) out.push({ level: source === "conflict copy" ? "info" : "warning", label, text: `${rows.length} report(s) from ${new Set(rows.map(r => r.DeviceId)).size} device(s). Latest: ${clip(rows[0].Message, 160)}`, action: () => openGroupBySource(source) });
+    if (rows.length) out.push({ level: source === "conflict copy" ? "info" : "warning", label, text: `${rows.length} report(s) from ${new Set(rows.map(r => deviceOf(r))).size} device(s).${mostly(rows)} Latest: ${clip(rows[0].Message, 160)}${hintFor(rows[0].Message)}`, action: () => openGroupBySource(source) });
   }
+  const unnamed = m.statsWithoutUpn;
+  if (unnamed) out.push({ level: "info", label: "Data", text: `${unnamed} user-day(s) of statistics came without the signed-in account (agents before 0.4.1 sent them before the first sign-in of the day); they show by Windows account.` });
   const throttledDays = m.statDays.filter(d => m.perDay[d].throttled > 0);
-  if (throttledDays.length) out.push({ level: "warning", label: "Throttling", text: `Microsoft throttled VFS365 on ${throttledDays.length} day(s): ${fmtInt(m.totals.throttled)} response(s), ${duration(m.totals.throttledSec)} waited. Lower ApiBudgetPerMinute or spread sign-ins if this repeats.` });
+  if (throttledDays.length || m.episodes.length) {
+    const byUser = Object.entries(m.throttledUserDays.reduce((t, r) => (t[userOf(r)] = (t[userOf(r)] || 0) + num(r.Throttled), t), {})).sort((a, b) => b[1] - a[1]);
+    const most = byUser.slice(0, 3).map(([who, count]) => `${who} (${fmtInt(count)})`).join(", ");
+    out.push({ level: "warning", label: "Throttling", text: `Microsoft throttled VFS365 on ${throttledDays.length} day(s) for ${byUser.length} user(s): ${fmtInt(m.totals.throttled)} response(s), ${duration(m.totals.throttledSec)} waited${most ? `; most: ${most}` : ""}. Lower ApiBudgetPerMinute or spread sign-ins if this repeats.`, action: () => showTab("throttling") });
+  }
   const waitedUsers = m.users.filter(u => u.budgetUser > 0).length;
   if (m.totals.budgetUser > 0) out.push({ level: m.totals.budgetUser >= 60 ? "warning" : "info", label: "Users waited", text: `Opening and saving files waited ${duration(m.totals.budgetUser)} for the per-user API budget (ApiBudgetPerMinute), for ${waitedUsers} user(s). When Microsoft isn't throttling, a higher budget removes this.`, action: () => showTab("users") });
   if (m.totals.budgetBackground > 60) out.push({ level: "info", label: "Background pacing", text: `Background work (discovery after sign-in, change checks, loading ahead) waited ${duration(m.totals.budgetBackground)} for the API budget. Users don't wait for this; it spreads VFS365's calls over time.` });
-  if (m.totals.budgetUnsplit > 60) out.push({ level: "info", label: "API budget", text: `Versions before 0.3.0 waited ${duration(m.totals.budgetUnsplit)} for the API budget; they don't report whether users or background work waited.` });
   const outdated = m.devices.filter(d => d.version && m.latest && semverCompare(d.version, m.latest) < 0 && d.install?.Action !== "uninstall");
   if (outdated.length) out.push({ level: "info", label: "Versions", text: `${outdated.length} device(s) run a version older than ${m.latest}.`, action: () => showTab("devices") });
   const silent = m.devices.filter(d => d.install && d.install.Action !== "uninstall" && (!d.lastSeen || Date.now() - d.lastSeen > 3 * 86400000));
@@ -553,7 +593,6 @@ function insights(m, c) {
   if (!data.sample) for (const f of sasFindings(c)) if (f.level !== "info") out.push({ level: f.level, label: "SAS", text: f.text });
   if (pagingHidden) out.push({ level: "warning", label: "Incomplete", text: "A day has more than 1000 rows, and the browser can't see where the next rows start: set Exposed headers to * in the storage account's CORS rule for the Table service. Until then, rows after the first 1000 of such a day are missing." });
   if (data.missing.size) out.push({ level: "info", label: "Tables", text: `No table yet for ${[...data.missing].join(", ")}: nothing was reported there, or the tables weren't created (errors, statistics, devices).` });
-  if (!data.devices.length && !data.missing.has("devices") && m.devices.length) out.push({ level: "info", label: "Installs", text: "No install reports yet: the installer reports only when MonitoringUrl is set as a computer policy at install time. Devices are listed from their statistics and errors." });
   if (!out.some(i => i.level === "critical" || i.level === "warning")) out.unshift({ level: "good", label: "All clear", text: "No crashes, throttling or recent errors in this period." });
   return out;
 }
@@ -585,7 +624,12 @@ function legend(series, line, always) {
   return h("div", { class: "legend" }, series.map(sr => h("span", {}, h("span", { class: line ? "key-line" : "key-rect", style: `background:${css(sr.color)}` }), sr.label)));
 }
 /* Columns (stacked) or lines over days, one y-axis. series: [{label, color (css var), values[]}], format(v) */
-function timeChart(host, { days, series, type, format, kind, alwaysLegend }) {
+/* "Last 30 days", or "Since 7 Oct, the first report" when monitoring began within the period */
+function periodText(m) {
+  return m.firstDay && m.firstDay > localDay(m.start) ? `Since ${shortDay(m.firstDay)}, the first report` : `Last ${m.range} days`;
+}
+/* Columns (stacked) or lines over days, one y-axis. Days in `provisional` (still arriving) are drawn lighter and said so. */
+function timeChart(host, { days, series, type, format, kind, alwaysLegend, provisional = [] }) {
   const box = h("div", { class: "chart" });
   host.replaceChildren(legend(series, type === "lines", alwaysLegend) || "", box);
   const total = days.map((_, i) => type === "columns" ? series.reduce((t, sr) => t + sr.values[i], 0) : Math.max(0, ...series.map(sr => sr.values[i])));
@@ -619,13 +663,18 @@ function timeChart(host, { days, series, type, format, kind, alwaysLegend }) {
         const path = r > 0
           ? `M${x0},${yTop + hgt}V${yTop + r}Q${x0},${yTop} ${x0 + r},${yTop}H${x0 + bw - r}Q${x0 + bw},${yTop} ${x0 + bw},${yTop + r}V${yTop + hgt}Z`
           : `M${x0},${yTop + hgt}V${yTop}H${x0 + bw}V${yTop + hgt}Z`;
-        svg.append(s("path", { d: path, fill: css(p.sr.color) }));
+        svg.append(s("path", { d: path, fill: css(p.sr.color), "fill-opacity": provisional.includes(d) ? 0.4 : 1 }));
         base += p.v;
       });
     });
   } else {
+    // The line runs solid up to the last complete day and dashed into days still arriving
+    const solid = days.findIndex(d => provisional.includes(d)), end = solid < 0 ? days.length : Math.max(1, solid);
     for (const sr of series) {
-      svg.append(s("path", { d: sr.values.map((v, i) => `${i ? "L" : "M"}${xc(i)},${y(v)}`).join(""), fill: "none", stroke: css(sr.color), "stroke-width": 2, "stroke-linejoin": "round", "stroke-linecap": "round" }));
+      svg.append(s("path", { d: sr.values.slice(0, end).map((v, i) => `${i ? "L" : "M"}${xc(i)},${y(v)}`).join(""), fill: "none", stroke: css(sr.color), "stroke-width": 2, "stroke-linejoin": "round", "stroke-linecap": "round" }));
+      if (end < days.length) {
+        svg.append(s("path", { d: sr.values.slice(end - 1).map((v, k) => `${k ? "L" : "M"}${xc(end - 1 + k)},${y(v)}`).join(""), fill: "none", stroke: css(sr.color), "stroke-width": 2, "stroke-dasharray": "4 4", "stroke-linecap": "round" }));
+      }
       const last = sr.values.length - 1;
       svg.append(s("circle", { cx: xc(last), cy: y(sr.values[last]), r: 4, fill: css(sr.color), stroke: surface, "stroke-width": 2 }));
     }
@@ -639,7 +688,7 @@ function timeChart(host, { days, series, type, format, kind, alwaysLegend }) {
     cross.setAttribute("x1", xc(i)); cross.setAttribute("x2", xc(i)); cross.setAttribute("visibility", "visible");
     // With many series (error sources) only the ones that occurred that day
     const shown = series.filter(sr => series.length <= 2 || sr.values[i] > 0);
-    showTip(e, longDay(days[i]), shown.length ? shown.map(sr => ({ label: sr.label, value: format(sr.values[i]), color: css(sr.color), line: type === "lines" })) : [{ label: "none", value: "", color: "transparent" }]);
+    showTip(e, longDay(days[i]) + (provisional.includes(days[i]) ? " (still arriving)" : ""), shown.length ? shown.map(sr => ({ label: sr.label, value: format(sr.values[i]), color: css(sr.color), line: type === "lines" })) : [{ label: "none", value: "", color: "transparent" }]);
   });
   hit.addEventListener("pointerleave", () => { cross.setAttribute("visibility", "hidden"); hideTip(); });
   svg.append(hit);
@@ -712,7 +761,7 @@ const versionBadge = (v, latest) => v ? h("span", { class: "badge", title: lates
 function sourceDot(source) { return h("span", {}, h("span", { class: "dot", style: `background:${css(SOURCE_COLOR[source] || "--other")}` }), source); }
 
 /* ---------- Page ---------- */
-const ui = { range: Number(store.get("range")) || 30, tab: "devices", filters: { tenant: "", version: "", text: "" }, conn: null, model: null, errorView: "groups" };
+const ui = { range: Number(store.get("range")) || 30, tab: "devices", filters: { tenant: "", version: "", text: "" }, conn: null, model: null, errorView: "groups", throttleView: "episodes" };
 let refreshTimer = null, nextRefreshAt = null, loading = false;
 
 function statusLine(c) {
@@ -849,17 +898,23 @@ function render() {
   ui.model = m;
   const t = m.totals, perDay = d => m.perDay[d];
   const errorsDelta = t.errors - t.previousErrors;
-  const kpi = (label, value, note, spark, title) => h("section", { class: "card kpi", title: title || "" }, h("div", { class: "label" }, label), h("div", { class: "value" }, value), h("div", { class: "note" }, note), spark ? sparkline(spark) : null);
+  const peakUsers = m.statDays.map(d => ({ day: d, size: perDay(d).users.size })).filter(p => p.size && !m.provisional.includes(p.day)).sort((a, b) => b.size - a.size)[0]
+    ?? m.statDays.map(d => ({ day: d, size: perDay(d).users.size })).filter(p => p.size).sort((a, b) => b.size - a.size)[0];
+  const kpi = (label, value, note, spark, title, action) => h("section", { class: action ? "card kpi click" : "card kpi", title: title || "", onclick: action, role: action ? "button" : null, tabindex: action ? "0" : null,
+    onkeydown: action ? e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); action(); } } : null },
+    h("div", { class: "label" }, label), h("div", { class: "value" }, value), h("div", { class: "note" }, note), spark ? sparkline(spark) : null);
   const kpis = h("div", { class: "grid kpis" },
     kpi("Devices", fmtInt(t.devices), t.installed ? `${fmtInt(t.installed)} installed` : "with data in this period", m.statDays.map(d => perDay(d).devices.size), "Devices that sent statistics or errors in this period"),
-    kpi("Users", fmtInt(t.users), t.userDays ? `${(t.userDays / Math.max(1, m.statDays.filter(d => perDay(d).users.size).length)).toFixed(1)} a day on average` : "", m.statDays.map(d => perDay(d).users.size)),
-    kpi("Errors", fmtInt(t.errors), h("span", {}, h("span", { class: errorsDelta > 0 ? "delta-bad" : errorsDelta < 0 ? "delta-good" : "" }, `${errorsDelta > 0 ? "+" : ""}${fmtInt(errorsDelta)}`), ` vs the ${ui.range} days before${t.crashes ? `, ${t.crashes} crash(es)` : ""}`), m.days.map(d => Object.values(perDay(d).errors).reduce((a, b) => a + b, 0))),
+    kpi("Users", fmtInt(t.users), peakUsers ? `${(t.userDays / Math.max(1, m.statDays.filter(d => perDay(d).users.size).length)).toFixed(1)} a day on average, most ${fmtInt(peakUsers.size)} on ${shortDay(peakUsers.day)}` : "", m.statDays.map(d => perDay(d).users.size)),
+    kpi("Errors", fmtInt(t.errors), m.earlierData
+      ? h("span", {}, h("span", { class: errorsDelta > 0 ? "delta-bad" : errorsDelta < 0 ? "delta-good" : "" }, `${errorsDelta > 0 ? "+" : ""}${fmtInt(errorsDelta)}`), ` vs the ${ui.range} days before${t.crashes ? `, ${t.crashes} crash(es)` : ""}`)
+      : `no earlier reports to compare${t.crashes ? `; ${t.crashes} crash(es)` : ""}`, m.days.map(d => Object.values(perDay(d).errors).reduce((a, b) => a + b, 0))),
     kpi("API requests", compact(t.graph + t.sp), `${compact(t.ru)} resource units${t.userDays ? `, ${compact(t.ru / t.userDays)} per user-day` : ""}`, m.statDays.map(d => perDay(d).graph + perDay(d).sp), "Graph and SharePoint requests; Microsoft limits resource units per app per tenant"),
-    kpi("Throttled", fmtInt(t.throttled), t.throttled ? `${duration(t.throttledSec)} waited` : "Microsoft didn't throttle", m.statDays.map(d => perDay(d).throttled), "429 and 503 answers from Microsoft 365"),
+    kpi("Throttled", fmtInt(t.throttled), t.throttled ? `${duration(t.throttledSec)} waited, ${fmtInt(new Set(m.throttledUserDays.map(userOf)).size)} user(s)` : "Microsoft didn't throttle", m.statDays.map(d => perDay(d).throttled), "429 and 503 answers from Microsoft 365: who, when and how much", () => showTab("throttling")),
     kpi("Data", bytes(t.rx + t.tx), `${bytes(t.rx)} in, ${bytes(t.tx)} out`, m.statDays.map(d => perDay(d).rx + perDay(d).tx)),
     kpi("Running", `${fmtInt(t.minutes / 60)} h`, t.userDays ? `${(t.minutes / t.userDays / 60).toFixed(1)} h per user-day` : "", m.statDays.map(d => perDay(d).minutes), "Time the agent ran"));
 
-  const insightCard = h("section", { class: "card insights" }, h("div", { class: "card-head" }, h("div", {}, h("h2", {}, "Needs attention"), h("div", { class: "sub" }, `Last ${ui.range} days`))),
+  const insightCard = h("section", { class: "card insights" }, h("div", { class: "card-head" }, h("div", {}, h("h2", {}, "Needs attention"), h("div", { class: "sub" }, periodText(m)))),
     insights(m, ui.conn).map(i => h("div", { class: "insight" }, icon(i.level), h("div", { class: "text" }, h("span", { class: "label" }, i.label), i.text, i.action ? [" ", h("button", { class: "btn link", onclick: i.action }, "Show")] : null))));
 
   const dayTable = cols => () => m.statDays.map(d => ({ day: d, ...cols(perDay(d)) }));
@@ -877,19 +932,19 @@ function render() {
 
   const charts = h("div", { class: "grid charts" },
     chartCard("Microsoft 365 requests per day", "Graph (files) and SharePoint (discovery and transfers), up to yesterday",
-      el => timeChart(el, { days: m.statDays, type: "columns", format: compact, series: [{ label: "Graph", color: "--s1", values: m.statDays.map(d => perDay(d).graph) }, { label: "SharePoint", color: "--s2", values: m.statDays.map(d => perDay(d).sp) }] }),
+      el => timeChart(el, { days: m.statDays, provisional: m.provisional, type: "columns", format: compact, series: [{ label: "Graph", color: "--s1", values: m.statDays.map(d => perDay(d).graph) }, { label: "SharePoint", color: "--s2", values: m.statDays.map(d => perDay(d).sp) }] }),
       dayTable(p => ({ graph: p.graph, sp: p.sp, ru: p.ru })), [{ label: "Day", value: r => r.day, render: r => shortDay(r.day) }, { label: "Graph", num: true, value: r => r.graph, render: r => fmtInt(r.graph) }, { label: "SharePoint", num: true, value: r => r.sp, render: r => fmtInt(r.sp) }, { label: "Resource units", num: true, value: r => r.ru, render: r => fmtInt(r.ru) }]),
     chartCard("Errors per day", "By source; the most frequent first",
       el => timeChart(el, { days: m.days, type: "columns", format: fmtInt, series: errorSeries, alwaysLegend: true }),
       () => m.days.map(d => ({ day: d, ...perDay(d).errors })), [{ label: "Day", value: r => r.day, render: r => shortDay(r.day) }, ...sources.map(src => ({ label: src, num: true, value: r => r[src] || 0 }))]),
-    chartCard("Active users and devices per day", "Who used VFS365 that day; a day's statistics arrive the next day",
-      el => timeChart(el, { days: m.statDays, type: "lines", format: fmtInt, series: [{ label: "Users", color: "--s1", values: m.statDays.map(d => perDay(d).users.size) }, { label: "Devices", color: "--s2", values: m.statDays.map(d => perDay(d).devices.size) }] }),
+    chartCard("Active users and devices per day", "Who used VFS365 that day; devices send a day's statistics the next day, so the last day is still arriving (dashed)",
+      el => timeChart(el, { days: m.statDays, provisional: m.provisional, type: "lines", format: fmtInt, series: [{ label: "Users", color: "--s1", values: m.statDays.map(d => perDay(d).users.size) }, { label: "Devices", color: "--s2", values: m.statDays.map(d => perDay(d).devices.size) }] }),
       dayTable(p => ({ users: p.users.size, devices: p.devices.size })), [{ label: "Day", value: r => r.day, render: r => shortDay(r.day) }, { label: "Users", num: true, value: r => r.users }, { label: "Devices", num: true, value: r => r.devices }]),
     chartCard("Data transferred per day", "Downloaded and uploaded",
-      el => timeChart(el, { days: m.statDays, type: "columns", format: bytes, kind: "bytes", series: [{ label: "Received", color: "--s1", values: m.statDays.map(d => perDay(d).rx) }, { label: "Sent", color: "--s2", values: m.statDays.map(d => perDay(d).tx) }] }),
+      el => timeChart(el, { days: m.statDays, provisional: m.provisional, type: "columns", format: bytes, kind: "bytes", series: [{ label: "Received", color: "--s1", values: m.statDays.map(d => perDay(d).rx) }, { label: "Sent", color: "--s2", values: m.statDays.map(d => perDay(d).tx) }] }),
       dayTable(p => ({ rx: p.rx, tx: p.tx })), [{ label: "Day", value: r => r.day, render: r => shortDay(r.day) }, { label: "Received", num: true, value: r => r.rx, render: r => bytes(r.rx) }, { label: "Sent", num: true, value: r => r.tx, render: r => bytes(r.tx) }]),
     chartCard("Waiting for Microsoft 365 per day", "Time requests waited: because Microsoft throttled, or for VFS365's own API budget",
-      el => timeChart(el, { days: m.statDays, type: "lines", format: duration, kind: "seconds", series: waitSeries }),
+      el => timeChart(el, { days: m.statDays, provisional: m.provisional, type: "lines", format: duration, kind: "seconds", series: waitSeries }),
       dayTable(p => ({ throttled: p.throttled, sec: p.throttledSec, user: p.budgetUser, background: p.budgetBackground, unsplit: p.budgetUnsplit })),
       [{ label: "Day", value: r => r.day, render: r => shortDay(r.day) }, { label: "Throttled answers", num: true, value: r => r.throttled }, { label: "Throttled wait", num: true, value: r => r.sec, render: r => duration(r.sec) },
         { label: "Budget: user actions", num: true, value: r => r.user, render: r => duration(r.user) }, { label: "Budget: background", num: true, value: r => r.background, render: r => duration(r.background) },
@@ -905,7 +960,7 @@ function render() {
       el => barChart(el, m.versions.map(v => ({ label: v.version, value: v.devices, tip: "devices" })), { format: fmtInt, emphasis: item => item.label === m.latest }),
       () => m.versions, [{ label: "Version", value: r => r.version }, { label: "Devices", num: true, value: r => r.devices }]));
 
-  const tabs = [["devices", `Devices (${fmtInt(m.devices.length)})`], ["users", `Users (${fmtInt(m.users.length)})`], ["errors", `Errors (${fmtInt(m.errors.length)})`], ["installs", `Installs (${fmtInt(m.installs.length)})`]];
+  const tabs = [["devices", `Devices (${fmtInt(m.devices.length)})`], ["users", `Users (${fmtInt(m.users.length)})`], ["errors", `Errors (${fmtInt(m.errors.length)})`], ["throttling", `Throttling (${fmtInt(m.episodes.length || m.throttledUserDays.length)})`], ["installs", `Installs (${fmtInt(m.installs.length)})`]];
   const tabBody = h("div");
   const tabBar = h("div", { class: "tabs", role: "tablist" }, tabs.map(([key, label]) => h("button", { role: "tab", "aria-selected": String(ui.tab === key), onclick: () => { ui.tab = key; render(); } }, label)));
   tabBody.append(tabContent(m));
@@ -938,6 +993,9 @@ function tabContent(m) {
     { label: "Data", value: r => r.rx + r.tx, num: true, render: r => bytes(r.rx + r.tx), narrow: true },
     { label: "Budget wait", value: r => r.budgetUser, num: true, render: r => r.budgetUser ? duration(r.budgetUser) : "", narrow: true },
   ], m.users, { onClick: openUser, sort: { label: "Errors" } });
+  if (ui.tab === "throttling") {
+    return throttlingView(m.episodes, m.throttledUserDays, true);
+  }
   if (ui.tab === "errors") {
     const switcher = h("div", { class: "seg", style: "margin-bottom:8px" }, [["groups", "Grouped"], ["all", "Every error"]].map(([key, label]) => h("button", { "aria-pressed": String(ui.errorView === key), onclick: () => { ui.errorView = key; render(); } }, label)));
     const table = ui.errorView === "groups"
@@ -958,7 +1016,7 @@ function tabContent(m) {
     { label: "Action", value: r => r.Action },
     { label: "Version", value: r => r.Version || "" },
     { label: "Signed-in users", value: r => r.Users || "", wrap: true, narrow: true },
-  ], m.installs, { onClick: r => openDevice(m.devices.find(d => d.id === r.DeviceId)) });
+  ], m.installs, { onClick: r => openDevice(m.devices.find(d => d.id === deviceOf(r))) });
 }
 function errorList(rows) {
   return dataTable([
@@ -968,7 +1026,40 @@ function errorList(rows) {
     { label: "Version", value: r => r.Version || "", narrow: true },
     { label: "Source", value: r => r.Source || "", render: r => sourceDot(r.Source || "other") },
     { label: "Message", value: r => r.Message || "", wrap: true },
-  ], rows, { onClick: r => openDevice(ui.model.devices.find(d => d.id === r.DeviceId)) });
+  ], rows, { onClick: r => openDevice(ui.model.devices.find(d => d.id === deviceOf(r))) });
+}
+/* Who got throttled, when and how much: episodes with exact times (agents from 0.4.1) or the daily totals per user */
+function throttlingView(episodes, userDays, switchable) {
+  if (!episodes.length && !userDays.length) return h("p", { class: "empty" }, "Microsoft didn't throttle VFS365 in this period.");
+  const view = episodes.length ? (userDays.length ? ui.throttleView : "episodes") : "days";
+  const switcher = switchable && episodes.length && userDays.length
+    ? h("div", { class: "seg", style: "margin-bottom:8px" }, [["episodes", "Episodes, exact times"], ["days", "Per user per day"]].map(([key, label]) =>
+      h("button", { "aria-pressed": String(view === key), onclick: () => { ui.throttleView = key; render(); } }, label)))
+    : null;
+  const mix = r => [num(r.BackgroundResponses) >= num(r.Responses) / 2 ? "mostly background work" : "mostly user actions",
+    num(r.SharePointResponses) >= num(r.GraphResponses) ? "SharePoint" : "Graph"].join(", ");
+  const table = view === "episodes"
+    ? dataTable([
+      { label: "From", value: r => r.at.getTime(), render: r => dateTime(r.at) },
+      { label: "Until", value: r => r.until.getTime(), render: r => r.until.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" }), narrow: true },
+      { label: "User", value: r => userOf(r).toLowerCase(), render: r => userOf(r) },
+      { label: "Device", value: r => (r.DeviceName || "").toLowerCase(), render: r => r.DeviceName, narrow: true },
+      { label: "Responses", value: r => num(r.Responses), num: true },
+      { label: "Held back", value: r => num(r.HeldSeconds), num: true, render: r => duration(num(r.HeldSeconds)) },
+      { label: "Longest wait", value: r => num(r.LongestWaitSeconds), num: true, render: r => duration(num(r.LongestWaitSeconds)), narrow: true },
+      { label: "What", value: r => mix(r), render: r => mix(r), narrow: true },
+    ], episodes, { onClick: r => openUser(ui.model.users.find(u => u.key === userOf(r))), sort: { label: "From" } })
+    : dataTable([
+      { label: "Day", value: r => r.PartitionKey, render: r => shortDay(r.PartitionKey) },
+      { label: "User", value: r => userOf(r).toLowerCase(), render: r => userOf(r) },
+      { label: "Device", value: r => (r.DeviceName || "").toLowerCase(), render: r => r.DeviceName, narrow: true },
+      { label: "Responses", value: r => num(r.Throttled), num: true },
+      { label: "Waited", value: r => num(r.ThrottledSeconds), num: true, render: r => duration(num(r.ThrottledSeconds)) },
+      { label: "Resource units that day", value: r => num(r.ResourceUnits), num: true, render: r => compact(num(r.ResourceUnits)), narrow: true },
+      { label: "Version", value: r => r.Version || "", narrow: true },
+    ], userDays, { onClick: r => openUser(ui.model.users.find(u => u.key === userOf(r))), sort: { label: "Day" } });
+  const note = !episodes.length ? h("p", { class: "sub" }, "Per user per day from the daily statistics; agents from 0.4.1 also report each episode with its exact times.") : null;
+  return h("div", {}, switcher, table, note);
 }
 function showTab(tab) { ui.tab = tab; render(); $("tables")?.scrollIntoView({ behavior: "smooth" }); }
 function openGroupBySource(source) { const g = ui.model.groups.find(x => x.source === source); g ? openGroup(g) : showTab("errors"); }
@@ -995,20 +1086,21 @@ function usageCard(title, perDay) {
   const m = ui.model;
   const body = h("div");
   const card = h("section", { class: "card", style: "margin-top:12px" }, h("div", { class: "card-head" }, h("div", {}, h("h2", {}, title))), body);
-  requestAnimationFrame(() => timeChart(body, { days: m.statDays, type: "columns", format: compact, series: [
+  requestAnimationFrame(() => timeChart(body, { days: m.statDays, provisional: m.provisional, type: "columns", format: compact, series: [
     { label: "Graph", color: "--s1", values: perDay.map(rows => rows.reduce((t, r) => t + num(r.GraphRequests), 0)) },
     { label: "SharePoint", color: "--s2", values: perDay.map(rows => rows.reduce((t, r) => t + num(r.SharePointRequests), 0)) }] }));
   return card;
 }
 function openDevice(d) {
   if (!d) return;
-  const m = ui.model, { perDay } = rowsFor(r => r.DeviceId === d.id);
-  const errors = m.errors.filter(r => r.DeviceId === d.id), installs = data.devices.filter(r => r.DeviceId === d.id).map(r => ({ ...r, at: new Date(r.OccurredAt || r.Timestamp) })).sort((a, b) => b.at - a.at);
-  drawer(d.name, `Device ID ${d.id}${d.entra ? ` · Entra device ID ${d.entra}` : ""}`,
+  const m = ui.model, { perDay } = rowsFor(r => deviceOf(r) === d.id);
+  const errors = m.errors.filter(r => deviceOf(r) === d.id), installs = data.devices.filter(r => deviceOf(r) === d.id).map(r => ({ ...r, at: new Date(r.OccurredAt || r.Timestamp) })).sort((a, b) => b.at - a.at);
+  drawer(d.name, `${d.entra ? `Entra device ID ${d.entra} · ` : ""}${d.machineIds.size > 1 ? `${d.machineIds.size} Windows installations (rebuilt from an image): ` : "Windows machine ID "}${[...d.machineIds].join(", ")}`,
     facts([["Version", d.version || "unknown"], ["Users", fmtInt(d.users.size)], ["Last seen", ago(d.lastSeen)], ["Errors", fmtInt(d.errors)], ["Resource units", compact(d.ru)], ["Running", `${fmtInt(d.minutes / 60)} h`], ...budgetFacts(d)]),
     usageCard("Requests per day", perDay),
     h("section", { class: "card", style: "margin-top:12px" }, h("h2", {}, "Users"), h("p", {}, [...d.users].join(", ") || "none")),
     h("section", { class: "card", style: "margin-top:12px" }, h("h2", {}, `Errors (${errors.length})`), h("div", { class: "table-scroll" }, errorList(errors))),
+    throttlingCard(r => deviceOf(r) === d.id),
     h("section", { class: "card", style: "margin-top:12px" }, h("h2", {}, "Install history"), installs.length
       ? h("div", { class: "table-scroll" }, dataTable([{ label: "When", value: r => r.at.getTime(), render: r => dateTime(r.at) }, { label: "Action", value: r => r.Action }, { label: "Version", value: r => r.Version }, { label: "Signed-in users", value: r => r.Users || "", wrap: true }], installs))
       : h("p", { class: "sub" }, "No install reports for this device.")));
@@ -1020,7 +1112,16 @@ function openUser(u) {
     facts([["Devices", fmtInt(u.devices.size)], ["Days active", fmtInt(u.days.size)], ["Last seen", ago(u.lastSeen)], ["Errors", fmtInt(u.errors)], ["Resource units", compact(u.ru)], ["Data", bytes(u.rx + u.tx)], ...budgetFacts(u)]),
     usageCard("Requests per day", perDay),
     h("section", { class: "card", style: "margin-top:12px" }, h("h2", {}, "Devices"), h("p", {}, [...u.devices].map(id => m.devices.find(d => d.id === id)?.name || id).join(", ") || "none")),
-    h("section", { class: "card", style: "margin-top:12px" }, h("h2", {}, `Errors (${errors.length})`), h("div", { class: "table-scroll" }, errorList(errors))));
+    h("section", { class: "card", style: "margin-top:12px" }, h("h2", {}, `Errors (${errors.length})`), h("div", { class: "table-scroll" }, errorList(errors))),
+    throttlingCard(r => userOf(r) === u.key));
+}
+/* A device's or user's throttling, when there was any */
+function throttlingCard(match) {
+  const m = ui.model, episodes = m.episodes.filter(match), days = m.throttledUserDays.filter(match);
+  if (!episodes.length && !days.length) return null;
+  const responses = days.reduce((t, r) => t + num(r.Throttled), 0);
+  return h("section", { class: "card", style: "margin-top:12px" }, h("h2", {}, `Throttled (${fmtInt(responses || episodes.reduce((t, r) => t + num(r.Responses), 0))} responses)`),
+    h("div", { class: "table-scroll" }, throttlingView(episodes, episodes.length ? [] : days, false)));
 }
 function openGroup(g) {
   const m = ui.model, body = h("div");
@@ -1089,6 +1190,17 @@ function makeSample() {
       if (!errors.has(key)) errors.set(key, []);
       errors.get(key).push({ PartitionKey: key, RowKey: String(i), DeviceId: d.id, DeviceName: d.name, User: u, WindowsUser: "CONTOSO\\" + u.split("@")[0], TenantId: tenant, Version: versionOn(localDay(at), hosts.indexOf(d)), Source: source, Message: pick(messages[source]), OccurredAt: at.toISOString() });
     }
+  }
+  // Throttling episodes on the throttled days, from the statistics rows that were throttled
+  for (const row of [...stats.values()].flat().filter(r => num(r.Throttled) > 0 && r.Version === "0.3.0")) {
+    const at = dayToDate(row.PartitionKey); at.setHours(8, Math.floor(rnd() * 50), 0, 0);
+    const held = num(row.ThrottledSeconds) + Math.round(rnd() * 120), responses = num(row.Throttled), key = utcDay(at);
+    if (!errors.has(key)) errors.set(key, []);
+    errors.get(key).push({ PartitionKey: key, RowKey: "t" + row.RowKey, DeviceId: row.DeviceId, DeviceName: row.DeviceName, User: row.User, WindowsUser: row.WindowsUser,
+      TenantId: tenant, Version: row.Version, Source: "throttled", OccurredAt: at.toISOString(), ThrottledUntil: new Date(at.getTime() + held * 1000).toISOString(),
+      Responses: responses, HeldSeconds: held, LongestWaitSeconds: Math.min(held, 60 + Math.round(rnd() * 60)), Status429: responses, Status503: 0,
+      GraphResponses: Math.floor(responses / 3), SharePointResponses: responses - Math.floor(responses / 3), BackgroundResponses: Math.ceil(responses * 0.7),
+      Message: `Microsoft throttled VFS365 for ${Math.round(held / 60)} min: ${responses} response(s) (429 x${responses}).` });
   }
   data.statistics = stats; data.errors = errors; data.devices = devices; data.missing = new Set(); data.loadedAt = new Date(); data.sample = true;
 }

@@ -541,6 +541,17 @@ public static class AgentCommands
         }
         var networkUp = NetworkInterface.GetIsNetworkAvailable();
         var networkFailedAt = DateTimeOffset.MinValue;
+        // Throttled responses, grouped into episodes for the log and monitoring (who, when, how much)
+        var throttling = new ThrottleEpisodes();
+        client.Throttled = throttling.Add;
+        void ReportThrottling(DateTimeOffset now)
+        {
+            if (throttling.Ended(now) is { } episode)
+            {
+                say($"Throttled:  {episode.Describe()}");
+                monitoring?.Throttling(episode);
+            }
+        }
         void NetworkChanged(object? sender, NetworkAvailabilityEventArgs e)
         {
             networkUp = e.IsAvailable;
@@ -1172,10 +1183,11 @@ public static class AgentCommands
                         {
                             await engine.ProcessDueAsync(false, due.Token);
                             engine.HotPollingPaused = engine.PrefetchPaused = client.BackgroundPaused;
+                            ReportThrottling(DateTimeOffset.UtcNow);
                             _ = engine.PollActiveAsync();
                             if (statistics is not null && tick % 60 == 0)
                             {
-                                ReportStatistics(statistics, monitoring!, client, ref statisticsDue, ref statisticsSending);
+                                ReportStatistics(statistics, monitoring!, client, tokens.LastResult?.Account.Username, ref statisticsDue, ref statisticsSending);
                             }
                             if (tick++ % 5 == 0)
                             {
@@ -1259,6 +1271,7 @@ public static class AgentCommands
             {
             }
             await engine.ProcessDueAsync(true, default);
+            ReportThrottling(DateTimeOffset.MaxValue); // an episode still going on
             keeper.SaveIfChanged();
             if (accountChanged)
             {
@@ -1276,7 +1289,7 @@ public static class AgentCommands
             }
             if (statistics is not null)
             {
-                statistics.Fold(client.Usage, monitoring!.Errors, DateTime.Now);
+                statistics.Fold(client.Usage, monitoring!.Errors, DateTime.Now, tokens.LastResult?.Account.Username, Monitoring.Version);
                 statistics.Save();
                 await monitoring.FlushAsync(TimeSpan.FromSeconds(3));
             }
@@ -1328,10 +1341,10 @@ public static class AgentCommands
     /// Adds the last minute's usage to today's statistics. Finished days go out a few minutes after the start or after midnight (spread,
     /// so a tenant's devices don't all send at once); a day that doesn't arrive (offline, an expired SAS) stays and is tried an hour later.
     /// </summary>
-    static void ReportStatistics(UsageStatistics statistics, Monitoring monitoring, M365Client client, ref DateTime? due, ref Task<int>? sending)
+    static void ReportStatistics(UsageStatistics statistics, Monitoring monitoring, M365Client client, string? user, ref DateTime? due, ref Task<int>? sending)
     {
         var now = DateTime.Now;
-        statistics.Fold(client.Usage, monitoring.Errors, now);
+        statistics.Fold(client.Usage, monitoring.Errors, now, user, Monitoring.Version);
         statistics.Save();
         if (sending is { IsCompleted: true } sent)
         {
@@ -1351,6 +1364,6 @@ public static class AgentCommands
             return;
         }
         due = now + TimeSpan.FromHours(1);
-        sending = statistics.SendCompletedAsync(now, (day, usage) => monitoring.StatisticsAsync(day, UsageStatistics.Values(day, usage)));
+        sending = statistics.SendCompletedAsync(now, (day, usage) => monitoring.StatisticsAsync(day, UsageStatistics.Values(day, usage), usage.User, usage.Version));
     }
 }

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.4.1 (unreleased)
+
+- Monitoring: a day's statistics carry the signed-in account and the version of that day. Before, an agent that sent them before its first sign-in of the day (statistics go out 1 to 15 minutes after the start) left the account out, and after an update the old day was labelled with the new version.
+- Throttling is reported per episode (from the first throttled response until 2 quiet minutes): when it started and ended, how many responses, how long requests were held back, and whether it hit SharePoint or Graph, background work or user actions. The log gets the same line.
+- Dashboard: a Throttling tab shows who got throttled, when and how much: episodes with exact times (agents from 0.4.1), or per user per day from the daily statistics. The Throttled tile opens it, the insight names the users most affected, and user and device details list their throttling. Throttling rows are not counted as errors.
+- Dashboard: a PC rebuilt from an image (AVD hosts get a new Windows installation, and with it a new machine ID) counts as one device, found by its name; its details list the installations. Charts and totals start at the first report when monitoring began within the period, and errors are compared with the period before only when there was one. Yesterday's statistics, which devices send during today, show lighter and "still arriving". A host that reports two versions on one day counts as the newer. Insights name the user behind most reports and explain a cancelled sign-in, and a note counts statistics that came without the signed-in account.
+
 ## 0.4.0 (2026-10-12)
 
 Result of a full review of the code (security, data safety, reliability, API use, user experience).

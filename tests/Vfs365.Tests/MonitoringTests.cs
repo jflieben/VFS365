@@ -90,6 +90,34 @@ public sealed class MonitoringTests : IDisposable
     }
 
     [Fact]
+    public async Task A_throttling_episode_is_one_row_with_its_numbers_and_no_error()
+    {
+        var episodes = new ThrottleEpisodes();
+        var start = new DateTimeOffset(2026, 10, 14, 7, 0, 0, TimeSpan.Zero);
+        episodes.Add(new ThrottleNotice(start, 429, TimeSpan.FromSeconds(60), Graph: false, Background: true));
+        episodes.Add(new ThrottleNotice(start.AddSeconds(30), 503, TimeSpan.FromSeconds(120), Graph: true, Background: false));
+        Assert.Null(episodes.Ended(start.AddMinutes(3))); // the last pause ends at 7:02:30, then 2 quiet minutes
+        var episode = episodes.Ended(start.AddMinutes(5))!;
+        Assert.Null(episodes.Ended(start.AddMinutes(6)));
+
+        var monitoring = Create();
+        monitoring.Throttling(episode);
+        await monitoring.FlushAsync(TimeSpan.FromSeconds(10));
+
+        using var body = JsonDocument.Parse(Assert.Single(server.Requests).Body);
+        var row = body.RootElement;
+        Assert.Equal("throttled", row.GetProperty("Source").GetString());
+        Assert.Equal("2026-10-14T07:00:00.000Z", row.GetProperty("OccurredAt").GetString());
+        Assert.Equal("2026-10-14T07:02:30.000Z", row.GetProperty("ThrottledUntil").GetString());
+        Assert.Equal(2, row.GetProperty("Responses").GetInt32());
+        Assert.Equal(150, row.GetProperty("HeldSeconds").GetInt32());
+        Assert.Equal(1, row.GetProperty("BackgroundResponses").GetInt32());
+        Assert.Equal(1, row.GetProperty("GraphResponses").GetInt32());
+        Assert.Equal(120, row.GetProperty("LongestWaitSeconds").GetInt32());
+        Assert.Contains("for 3 min: 2 response(s) (429 x1, 503 x1)", row.GetProperty("Message").GetString());
+        Assert.Equal(0, monitoring.Errors);
+    }
+    [Fact]
     public async Task A_failure_is_logged_once_with_a_hint()
     {
         server.Status = 403;
@@ -233,6 +261,18 @@ public sealed class MonitoringTests : IDisposable
         Assert.EndsWith(": 503 ServiceUnavailable", message);
     }
 
+    [Fact]
+    public void A_day_keeps_its_user_and_version_for_a_send_before_the_first_token()
+    {
+        var statistics = UsageStatistics.Load(statisticsFile);
+        statistics.Fold(new ClientUsage(1, 0, 1, 0, 0, 0, 0, 0, 0), 0, new DateTime(2026, 10, 6, 9, 0, 0), "ann@contoso.com", "0.3.2");
+        statistics.Fold(new ClientUsage(2, 0, 2, 0, 0, 0, 0, 0, 0), 0, new DateTime(2026, 10, 6, 17, 0, 0), null, "0.4.0"); // updated, no token yet
+        statistics.Save();
+
+        var day = UsageStatistics.Load(statisticsFile).Days["2026-10-06"];
+        Assert.Equal("ann@contoso.com", day.User);
+        Assert.Equal("0.4.0", day.Version);
+    }
     public void Dispose()
     {
         server.Dispose();

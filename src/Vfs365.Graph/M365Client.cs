@@ -25,6 +25,8 @@ public sealed class M365RequestException(HttpStatusCode status, Uri uri, string 
     };
 }
 
+/// <summary>A throttled response: when, its status (429 or 503), how long requests now wait, and what kind of request it was.</summary>
+public sealed record ThrottleNotice(DateTimeOffset At, int Status, TimeSpan Pause, bool Graph, bool Background);
 /// <summary>What a client did since it started, for statistics.</summary>
 public readonly record struct ClientUsage(long GraphRequests, long SharePointRequests, long ResourceUnits, long BytesReceived, long BytesSent,
     long Throttled, long ThrottledSeconds, long BudgetWaitForegroundSeconds, long BudgetWaitBackgroundSeconds)
@@ -116,6 +118,9 @@ public sealed class M365Client(HttpClient http, ITokenSource tokens, RequestBudg
 
     /// <summary>Called once per request with status, method, path and duration.</summary>
     public Action<string>? Log { get; set; }
+
+    /// <summary>Called for every throttled response (429 or 503).</summary>
+    public Action<ThrottleNotice>? Throttled { get; set; }
 
     public Task<JsonDocument?> GetJsonAsync(Uri uri, CancellationToken ct, bool notFoundAsNull = false) =>
         SendJsonAsync(HttpMethod.Get, uri, null, ct, notFoundAsNull: notFoundAsNull);
@@ -263,6 +268,7 @@ public sealed class M365Client(HttpClient http, ITokenSource tokens, RequestBudg
                     Interlocked.Increment(ref throttledResponses);
                     Interlocked.Add(ref throttledTicks, pause.Ticks);
                     Pause(pause, ThrottlePause > pause ? Jitter(ThrottlePause) : pause);
+                    Throttled?.Invoke(new ThrottleNotice(LastThrottled, status, pause, isGraph, priority?.IsBackground ?? false));
                 }
                 var retry = attempt < MaxAttempts && (throttled ? readOnly || retryAfter is not null : readOnly && status is 500 or 502 or 504);
                 if (!retry)

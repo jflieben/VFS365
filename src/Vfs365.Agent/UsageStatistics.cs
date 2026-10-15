@@ -27,6 +27,10 @@ public sealed class UsageStatistics(string filePath)
         public long BudgetWaitBackgroundSeconds { get; set; }
         public int Errors { get; set; }
         public double MinutesRunning { get; set; }
+
+        /// <summary>The last signed-in account (UPN) and VFS365 version of that day, kept for a send before the first token or after an update.</summary>
+        public string? User { get; set; }
+        public string? Version { get; set; }
     }
 
     readonly string filePath = filePath;
@@ -68,12 +72,14 @@ public sealed class UsageStatistics(string filePath)
     static string DayOf(DateTime local) => local.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
 
     /// <summary>Adds what the client and the error count did since the last call to the day of <paramref name="localNow"/>.</summary>
-    public void Fold(ClientUsage usage, int errors, DateTime localNow)
+    public void Fold(ClientUsage usage, int errors, DateTime localNow, string? user = null, string? version = null)
     {
         lock (gate)
         {
             var delta = usage.Since(seen);
             var day = days.TryGetValue(DayOf(localNow), out var known) ? known : days[DayOf(localNow)] = new Day();
+            day.User = user ?? day.User;
+            day.Version = version ?? day.Version;
             day.GraphRequests += delta.GraphRequests;
             day.SharePointRequests += delta.SharePointRequests;
             day.ResourceUnits += delta.ResourceUnits;
