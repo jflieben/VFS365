@@ -1,6 +1,10 @@
 # Changelog
 
-## 0.4.1 (unreleased)
+## 0.4.2 (2026-10-22)
+
+- Signed binaries!
+
+## 0.4.1 (2026-10-15)
 
 - Monitoring: a day's statistics carry the signed-in account and the version of that day. Before, an agent that sent them before its first sign-in of the day (statistics go out 1 to 15 minutes after the start) left the account out, and after an update the old day was labelled with the new version.
 - Throttling is reported per episode (from the first throttled response until 2 quiet minutes): when it started and ended, how many responses, how long requests were held back, and whether it hit SharePoint or Graph, background work or user actions. The log gets the same line.
