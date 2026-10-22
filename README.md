@@ -6,6 +6,8 @@ Shows Microsoft 365 (OneDrive, Teams and SharePoint libraries) as a drive and as
 
 Status: early releases, in use at the first organisations. Downloads: [Releases](../../releases). What changed: [CHANGELOG.md](CHANGELOG.md).
 
+https://github.com/user-attachments/assets/a4b3872f-d3fd-4372-a001-83f90e983e33
+
 ## What users see
 
 One location in Explorer, named by policy (default "VFS365"), with every library the user can reach. Apps use plain paths such as `M:\Finance\Documents\Budget.xlsx` or `\\VFS365\<user>\Finance\Documents\Budget.xlsx`.
@@ -92,10 +94,50 @@ With the `MonitoringUrl` policy, every device reports errors, daily usage and in
 
 ![Monitoring dashboard with sample data](assets/screenshots/dashboard.png)
 
-## Limits no design removes
+#### Setting up monitoring
+
+You need an Azure storage account with three tables and two shared access signatures (SAS): one that devices use to add rows and can't read anything, and one that the dashboard uses to read and can't change anything.
+
+1. **Storage account.** Any StorageV2 account works; Standard LRS is plenty. Create the tables `errors`, `statistics` and `devices` (portal: Storage browser > Tables > Add table).
+2. **SAS for the devices.** Storage account > Security + networking > Shared access signature: allowed services **Table**, resource types **Object**, permissions **Add** only, HTTPS only, an expiry date (one or two years, with a reminder to renew). Generate and copy the **Table service SAS URL** (`https://<account>.table.core.windows.net/?sv=...&sp=a&...`).
+3. **Policy.** Set **Report to Azure table storage** (`MonitoringUrl`) to that URL as a **computer** policy: Group Policy (Computer Configuration > Administrative Templates > JSolve > VFS365 > Monitoring) or the Intune settings catalog after importing the ADMX. It is the registry value `MonitoringUrl` (REG_SZ) under `HKLM\SOFTWARE\Policies\JSolve\VFS365`. Computer policy, so the installer can report installs and updates too. Optional: **Detail in error reports** (`MonitoringDetail`) = `NoPaths` keeps file and folder paths out of the reports.
+4. **SAS for the dashboard.** A second SAS: services **Table**, resource types **Container** and **Object**, permissions **Read** and **List**, HTTPS only, a short expiry (the dashboard warns three days before it ends).
+5. **CORS**, so a browser may read the tables: Settings > Resource sharing (CORS) > Table service: allowed origins `*` (or where you host the dashboard), methods `GET` and `OPTIONS`, allowed and exposed headers `*`, max age `3600`.
+6. **Open the dashboard** ([vfs365-monitoring.html](monitoring/vfs365-monitoring.html), also attached to every release) in a browser and paste the second SAS URL. Rows appear as devices report: errors at once, a day's statistics the next day.
+
+The same with the Azure CLI, in PowerShell:
+
+```powershell
+$account = "contosovfs365"; $group = "rg-vfs365"; $location = "westeurope"   # account names: 3-24 lower-case letters and digits
+az group create --name $group --location $location
+az storage account create --name $account --resource-group $group --location $location --sku Standard_LRS --kind StorageV2 --min-tls-version TLS1_2 --allow-blob-public-access false
+$key = az storage account keys list --account-name $account --resource-group $group --query "[0].value" -o tsv
+foreach ($table in "errors", "statistics", "devices") { az storage table create --name $table --account-name $account --account-key $key }
+
+# Devices: add only, two years
+$add = az storage account generate-sas --account-name $account --account-key $key --services t --resource-types o --permissions a --https-only --expiry (Get-Date).AddYears(2).ToString("yyyy-MM-dd") -o tsv
+"MonitoringUrl: https://$account.table.core.windows.net/?$add"
+
+# Dashboard: read and list, 30 days
+$read = az storage account generate-sas --account-name $account --account-key $key --services t --resource-types co --permissions rl --https-only --expiry (Get-Date).AddDays(30).ToString("yyyy-MM-dd") -o tsv
+"Dashboard: https://$account.table.core.windows.net/?$read"
+
+az storage cors add --account-name $account --account-key $key --services t --methods GET OPTIONS --origins "*" --allowed-headers "*" --exposed-headers "*" --max-age 3600
+```
+
+Good to know:
+
+- **Renewing and revoking.** An expired devices SAS sends nothing (each device logs that once); set the new URL in the policy before the old one ends. A SAS can't be revoked on its own: regenerating the storage key it was signed with (`key1` above) revokes every SAS signed with that key. Sign new ones with `key2` first, roll them out, then regenerate `key1`.
+- **Network.** Devices send over https straight to `<account>.table.core.windows.net`. With the storage firewall on, allow your offices, VPN and AVD subnets, or the reports don't arrive (the log says why).
+- **Privacy.** Rows contain user and device names, and error rows file and folder paths unless `MonitoringDetail` is `NoPaths`. Keep the dashboard SAS short-lived and only share it with whoever needs it; anyone with it can read every row.
+- **Cost.** Small: a statistics row per user per day and a few error rows. For 2,500 users that is about 2,500 rows and a few MB a day, which costs cents a month in a standard account.
+
+See [Monitoring in DEPLOYMENT.md](docs/DEPLOYMENT.md#monitoring) for every column and when it is sent.
+
+## Limitations
 
 - Discovery uses SharePoint Search: sites excluded from search and Restricted Content Discovery sites aren't found. Pinned locations (policy, or `vfs365 pin` per user) fill the gap.
-- Byte-range locks don't cross machines: multi-user Access, QuickBooks and SQLite files are unsafe. The `DatabaseFiles` policy makes them read-only or blocks them.
+- Byte-range locks don't cross machines: multi-user Access, QuickBooks and SQLite files are unsafe. The `DatabaseFiles` policy makes them read-only or blocks them if you want / expect concurrent use
 - No Office co-authoring from the drive; that works only through Microsoft's own client.
 
 ## Docs
@@ -108,7 +150,7 @@ With the `MonitoringUrl` policy, every device reports errors, daily usage and in
 
 VFS365 is free software; support is not free. Bugs and ideas are welcome as [issues](../../issues). For help with deployment, troubleshooting or changes for your organisation, see [SUPPORT.md](SUPPORT.md) or https://jsolve.nl.
 
-## Build
+## If you want to build your own
 
 Needs the .NET 10 SDK (`build.ps1` finds a portable one too). Running the drive needs WinFsp. Releases also compile the small C network provider with Zig, which `build.ps1` fetches (pinned, hash-checked).
 

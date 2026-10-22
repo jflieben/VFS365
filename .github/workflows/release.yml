@@ -5,15 +5,11 @@
 # provenance attestation (verify with: gh attestation verify <file> --repo <owner>/<repo>). Actions are pinned by commit (Dependabot
 # keeps them current); NuGet restores in locked mode against the packages.lock.json files (CI=true).
 #
-# Optional code signing with Azure Artifact Signing (formerly Trusted Signing): set these repository variables (Settings, Secrets and
-# variables, Actions, Variables) and the build signs vfs365np.dll, VFS365's exes and DLLs, the MSIs and the setups before the
-# checksums. Without them the release is unsigned. No secret is stored: the build signs in to Azure with GitHub's OIDC token.
-#   AZURE_CLIENT_ID, AZURE_TENANT_ID  app registration with a federated credential for this repository's environment "release"
-#                                     (subject repo:<owner>/<repo>:environment:release) and the Certificate Profile Signer role on
-#                                     the certificate profile
-#   SIGNING_ENDPOINT                  the account's region endpoint, for example https://weu.codesigning.azure.net/
-#   SIGNING_ACCOUNT                   the Artifact Signing account name
-#   SIGNING_PROFILE                   the certificate profile name
+# Code signing with Azure Artifact Signing (formerly Trusted Signing): with the repository variable SIGNING_PROFILE set to the
+# certificate profile name (Settings, Secrets and variables, Actions, Variables), the build signs vfs365np.dll, VFS365's exes and
+# DLLs, the MSIs and the setups before the checksums. Without it the release is unsigned. No secret is stored: the build signs in
+# to Azure with GitHub's OIDC token as app "VFS365 release signing", whose federated credential trusts this repository's
+# environment "release" and which needs the Artifact Signing Certificate Profile Signer role on the account or profile.
 name: Release
 
 on:
@@ -23,6 +19,12 @@ on:
   workflow_dispatch:
 
 permissions: {}
+
+env:
+  SIGNING_CLIENT_ID: cb8cbae6-dea1-4aec-986f-fe6f122dfdf3
+  SIGNING_TENANT_ID: ab773612-c917-4af5-8b81-4a5222340706
+  SIGNING_ENDPOINT: https://weu.codesigning.azure.net/
+  SIGNING_ACCOUNT: jsolvebv
 
 concurrency:
   group: release
@@ -92,19 +94,17 @@ jobs:
           dotnet-version: 10.0.x
 
       - name: Azure sign-in for signing
-        if: vars.SIGNING_ACCOUNT != ''
+        if: vars.SIGNING_PROFILE != ''
         uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
         with:
-          client-id: ${{ vars.AZURE_CLIENT_ID }}
-          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          client-id: ${{ env.SIGNING_CLIENT_ID }}
+          tenant-id: ${{ env.SIGNING_TENANT_ID }}
           allow-no-subscriptions: true
 
       - name: Signing client
-        if: vars.SIGNING_ACCOUNT != ''
+        if: vars.SIGNING_PROFILE != ''
         shell: pwsh
         env:
-          SIGNING_ENDPOINT: ${{ vars.SIGNING_ENDPOINT }}
-          SIGNING_ACCOUNT: ${{ vars.SIGNING_ACCOUNT }}
           SIGNING_PROFILE: ${{ vars.SIGNING_PROFILE }}
         run: |
           # Microsoft's signtool plug-in for Artifact Signing (its own licence terms); a build tool only, nothing of it ships
