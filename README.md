@@ -98,6 +98,21 @@ With the `MonitoringUrl` policy, every device reports errors, daily usage and in
 
 You need an Azure storage account with three tables and two shared access signatures (SAS): one that devices use to add rows and can't read anything, and one that the dashboard uses to read and can't change anything.
 
+**Quickest: deploy it to Azure.**
+
+[![Deploy to Azure](https://aka.ms/deploytoazurebutton)](https://portal.azure.com/#create/Microsoft.Template/uri/https%3A%2F%2Fraw.githubusercontent.com%2Fjflieben%2FVFS365%2Fmain%2Fmonitoring%2Fazuredeploy.json)
+
+The [template](monitoring/azuredeploy.json) creates, in a resource group you choose:
+- a storage account (StorageV2, TLS 1.2, no public blob access) with the tables `errors`, `statistics` and `devices`;
+- the dashboard on the account's static website (`https://<account>.z<n>.web.core.windows.net/`, the latest release's page), with CORS that lets only that address read the tables;
+- two outputs (resource group > Deployments > the deployment > Outputs): `monitoringUrl`, the policy value for the devices (add only, two years), and `dashboardLink`, the dashboard connected with a read-only SAS (30 days).
+
+Then set the policy (step 3 below). To renew both SAS URLs and update the dashboard page, deploy again into the same resource group: the account keeps its name and its rows.
+
+The outputs stay in the resource group's deployment history, where anyone who can read the group sees them; `dashboardSasDays` = 0 leaves the dashboard link out. Hosting the dashboard runs a short deployment script on Azure Container Instances; where a policy blocks that, set `hostDashboard` to false, open the page from disk and add `*` to `extraCorsOrigins`.
+
+**By hand**, or with the Azure CLI below:
+
 1. **Storage account.** Any StorageV2 account works; Standard LRS is plenty. Create the tables `errors`, `statistics` and `devices` (portal: Storage browser > Tables > Add table).
 2. **SAS for the devices.** Storage account > Security + networking > Shared access signature: allowed services **Table**, resource types **Object**, permissions **Add** only, HTTPS only, an expiry date (one or two years, with a reminder to renew). Generate and copy the **Table service SAS URL** (`https://<account>.table.core.windows.net/?sv=...&sp=a&...`).
 3. **Policy.** Set **Report to Azure table storage** (`MonitoringUrl`) to that URL as a **computer** policy: Group Policy (Computer Configuration > Administrative Templates > JSolve > VFS365 > Monitoring) or the Intune settings catalog after importing the ADMX. It is the registry value `MonitoringUrl` (REG_SZ) under `HKLM\SOFTWARE\Policies\JSolve\VFS365`. Computer policy, so the installer can report installs and updates too. Optional: **Detail in error reports** (`MonitoringDetail`) = `NoPaths` keeps file and folder paths out of the reports.

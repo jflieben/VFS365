@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.6.1
+
+- Monitoring in one step: a Deploy to Azure button (README, Setting up monitoring) creates the storage account and tables, hosts the dashboard on the account's static website with CORS for that address only, and hands out the devices' `MonitoringUrl` and a ready dashboard link. Deploying again renews both.
+
 ## 0.6.0
 
 - Folder redirection (policy `FolderRedirection`): Decide if Windows' user folders (Desktop, Documents, Downloads, Pictures and the others, or any known folder by ID) move into VFS365 while the drive is mounted, and back at unmount. Paths take environment variables, `%UPN%` and `%UPNNAME%`, and wildcards (`Sites\Project*\Documents`); missing folders are made inside the library; `|move` moves the local content in. Folders moved by something else (OneDrive's folder backup, a Folder Redirection policy) are left alone and reported.

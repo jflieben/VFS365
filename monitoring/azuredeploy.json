@@ -1,0 +1,161 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "metadata": {
+    "description": "VFS365 monitoring: a storage account with the errors, statistics and devices tables, the dashboard on the account's static website, CORS for it, and the two SAS URLs (devices: add only; dashboard: read only). See README.md, Setting up monitoring."
+  },
+  "parameters": {
+    "storageAccountName": {
+      "type": "string",
+      "defaultValue": "[concat('vfs365', uniqueString(resourceGroup().id))]",
+      "minLength": 3,
+      "maxLength": 24,
+      "metadata": { "description": "3 to 24 lower-case letters and digits, unique in Azure." }
+    },
+    "location": {
+      "type": "string",
+      "defaultValue": "[resourceGroup().location]",
+      "metadata": { "description": "Where the storage account is (the resource group's location by default)." }
+    },
+    "redundancy": {
+      "type": "string",
+      "defaultValue": "Standard_LRS",
+      "allowedValues": [ "Standard_LRS", "Standard_ZRS", "Standard_GRS" ],
+      "metadata": { "description": "Standard_LRS is plenty for monitoring rows." }
+    },
+    "devicesSasYears": {
+      "type": "int",
+      "defaultValue": 2,
+      "minValue": 1,
+      "maxValue": 5,
+      "metadata": { "description": "Years the devices SAS (MonitoringUrl, add only) is valid. Renew it before then." }
+    },
+    "dashboardSasDays": {
+      "type": "int",
+      "defaultValue": 30,
+      "minValue": 0,
+      "maxValue": 365,
+      "metadata": { "description": "Days the dashboard link's read-only SAS is valid; 0: no link. The link is kept in the resource group's deployment history, where anyone with read access to the group can see it." }
+    },
+    "hostDashboard": {
+      "type": "bool",
+      "defaultValue": true,
+      "metadata": { "description": "Put the dashboard on the account's static website (https://<account>.z<n>.web.core.windows.net/) and allow only that address in CORS. Uses a short-lived deployment script (Azure Container Instances)." }
+    },
+    "dashboardSource": {
+      "type": "string",
+      "defaultValue": "https://github.com/jflieben/VFS365/releases/latest/download/vfs365-monitoring.html",
+      "metadata": { "description": "Where the deployment script gets the dashboard page: the latest release by default." }
+    },
+    "extraCorsOrigins": {
+      "type": "array",
+      "defaultValue": [],
+      "metadata": { "description": "More addresses that may read the tables from a browser, for example [\"*\"] to also open the dashboard from disk." }
+    },
+    "now": {
+      "type": "string",
+      "defaultValue": "[utcNow('u')]",
+      "metadata": { "description": "Leave as is: the SAS lifetimes start now." }
+    }
+  },
+  "variables": {
+    "storageId": "[resourceId('Microsoft.Storage/storageAccounts', parameters('storageAccountName'))]",
+    "tableEndpoint": "[format('https://{0}.table.{1}/', parameters('storageAccountName'), environment().suffixes.storage)]",
+    "tables": [ "errors", "statistics", "devices" ],
+    "devicesSas": {
+      "signedServices": "t",
+      "signedResourceTypes": "o",
+      "signedPermission": "a",
+      "signedProtocol": "https",
+      "signedExpiry": "[dateTimeAdd(parameters('now'), format('P{0}Y', parameters('devicesSasYears')), 'yyyy-MM-ddTHH:mm:ssZ')]"
+    },
+    "dashboardSas": {
+      "signedServices": "t",
+      "signedResourceTypes": "o",
+      "signedPermission": "r",
+      "signedProtocol": "https",
+      "signedExpiry": "[dateTimeAdd(parameters('now'), format('P{0}D', max(parameters('dashboardSasDays'), 1)), 'yyyy-MM-ddTHH:mm:ssZ')]"
+    },
+    "script": "set -e\npython3 -c 'import sys, urllib.request; urllib.request.urlretrieve(sys.argv[1], \"vfs365-monitoring.html\")' \"$SOURCE\"\ngrep -q 'VFS365 monitoring' vfs365-monitoring.html\naz storage blob service-properties update --account-name \"$ACCOUNT\" --account-key \"$KEY\" --static-website --index-document vfs365-monitoring.html --404-document vfs365-monitoring.html --output none\naz storage blob upload --account-name \"$ACCOUNT\" --account-key \"$KEY\" --container-name '$web' --name vfs365-monitoring.html --file vfs365-monitoring.html --content-type 'text/html; charset=utf-8' --overwrite --output none\n"
+  },
+  "resources": [
+    {
+      "type": "Microsoft.Storage/storageAccounts",
+      "apiVersion": "2023-05-01",
+      "name": "[parameters('storageAccountName')]",
+      "location": "[parameters('location')]",
+      "sku": { "name": "[parameters('redundancy')]" },
+      "kind": "StorageV2",
+      "properties": {
+        "accessTier": "Hot",
+        "minimumTlsVersion": "TLS1_2",
+        "supportsHttpsTrafficOnly": true,
+        "allowBlobPublicAccess": false,
+        "allowSharedKeyAccess": true
+      }
+    },
+    {
+      "type": "Microsoft.Storage/storageAccounts/tableServices",
+      "apiVersion": "2023-05-01",
+      "name": "[format('{0}/default', parameters('storageAccountName'))]",
+      "dependsOn": [ "[variables('storageId')]" ],
+      "properties": {
+        "cors": {
+          "corsRules": "[if(and(not(parameters('hostDashboard')), empty(parameters('extraCorsOrigins'))), createArray(), createArray(createObject('allowedOrigins', union(if(parameters('hostDashboard'), createArray(replace(reference(variables('storageId'), '2023-05-01').primaryEndpoints.web, '.net/', '.net')), createArray()), parameters('extraCorsOrigins')), 'allowedMethods', createArray('GET', 'OPTIONS'), 'allowedHeaders', createArray('*'), 'exposedHeaders', createArray('*'), 'maxAgeInSeconds', 3600)))]"
+        }
+      }
+    },
+    {
+      "copy": { "name": "tables", "count": "[length(variables('tables'))]" },
+      "type": "Microsoft.Storage/storageAccounts/tableServices/tables",
+      "apiVersion": "2023-05-01",
+      "name": "[format('{0}/default/{1}', parameters('storageAccountName'), variables('tables')[copyIndex()])]",
+      "dependsOn": [ "[resourceId('Microsoft.Storage/storageAccounts/tableServices', parameters('storageAccountName'), 'default')]" ]
+    },
+    {
+      "condition": "[parameters('hostDashboard')]",
+      "type": "Microsoft.Resources/deploymentScripts",
+      "apiVersion": "2023-08-01",
+      "name": "[format('{0}-dashboard', parameters('storageAccountName'))]",
+      "location": "[parameters('location')]",
+      "kind": "AzureCLI",
+      "dependsOn": [ "[variables('storageId')]" ],
+      "properties": {
+        "azCliVersion": "2.61.0",
+        "timeout": "PT15M",
+        "retentionInterval": "PT1H",
+        "cleanupPreference": "OnSuccess",
+        "environmentVariables": [
+          { "name": "ACCOUNT", "value": "[parameters('storageAccountName')]" },
+          { "name": "KEY", "secureValue": "[listKeys(variables('storageId'), '2023-05-01').keys[0].value]" },
+          { "name": "SOURCE", "value": "[parameters('dashboardSource')]" }
+        ],
+        "scriptContent": "[variables('script')]"
+      }
+    }
+  ],
+  "outputs": {
+    "monitoringUrl": {
+      "type": "string",
+      "value": "[concat(variables('tableEndpoint'), '?', listAccountSas(variables('storageId'), '2023-05-01', variables('devicesSas')).accountSasToken)]",
+      "metadata": { "description": "The MonitoringUrl policy value for every device (add only)." }
+    },
+    "dashboardUrl": {
+      "condition": "[parameters('hostDashboard')]",
+      "type": "string",
+      "value": "[reference(variables('storageId'), '2023-05-01').primaryEndpoints.web]"
+    },
+    "dashboardLink": {
+      "condition": "[and(parameters('hostDashboard'), greater(parameters('dashboardSasDays'), 0))]",
+      "type": "string",
+      "value": "[concat(reference(variables('storageId'), '2023-05-01').primaryEndpoints.web, '#connect=', uriComponent(concat(variables('tableEndpoint'), '?', listAccountSas(variables('storageId'), '2023-05-01', variables('dashboardSas')).accountSasToken)))]",
+      "metadata": { "description": "The dashboard, connected with a read-only SAS. Keep it private." }
+    },
+    "dashboardSasUrl": {
+      "condition": "[greater(parameters('dashboardSasDays'), 0)]",
+      "type": "string",
+      "value": "[concat(variables('tableEndpoint'), '?', listAccountSas(variables('storageId'), '2023-05-01', variables('dashboardSas')).accountSasToken)]",
+      "metadata": { "description": "The read-only SAS URL to paste into the dashboard (read only). Keep it private." }
+    }
+  }
+}
