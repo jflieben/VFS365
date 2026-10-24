@@ -48,7 +48,7 @@ Both add a Start menu entry "VFS365" that starts the drive again after it was cl
 
 Install the newer setup or MSI. The installer stops running agents with `vfs365.exe machine-stop` (pending changes upload first) and starts them again for every signed-in user with `vfs365.exe machine-start` after the upgrade, so users keep their drive. A `vfs365np.dll` that Explorer has loaded is replaced at the next restart; the old one keeps working until then.
 
-The older version is removed inside the upgrade's transaction: if the upgrade fails, Windows Installer puts the older version back and its agents start again. A release built again under the same version replaces the installed one instead of installing next to it. A repair (Settings, Apps, or `msiexec /f`) only puts files and registry values back; it runs none of the `vfs365.exe machine-*` steps. These run as SYSTEM without a window; their output is in the MSI log (`msiexec /l*v <log>`).
+When an upgrade through the setup fails, the setup puts the older version back; its agents start again at the next sign-in (or from VFS365 in the Start menu). A release built again under the same version replaces the installed one instead of installing next to it. A repair (Settings, Apps, or `msiexec /f`) only puts files and registry values back; it runs none of the `vfs365.exe machine-*` steps. These run as SYSTEM without a window; their output is in the MSI log (`msiexec /l*v <log>`).
 
 ## Uninstall
 

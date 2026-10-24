@@ -12,9 +12,8 @@
     <!-- The setup project in bundle\ leaves .wxl files in its obj folder; they must not be globbed into the MSI -->
     <DefaultItemExcludes>$(DefaultItemExcludes);bundle\**</DefaultItemExcludes>
     <!-- ICE38, 43, 57 expect Start menu shortcuts in the user's profile with an HKCU key path; this per-machine package uses the all-users
-         one. ICE61: same-version upgrades are on purpose. ICE63: the only action before RemoveExistingProducts is the rollback restart
-         of agents, which must be there to run after the older version is put back. -->
-    <SuppressIces>ICE38;ICE43;ICE57;ICE61;ICE63</SuppressIces>
+         one. ICE61: same-version upgrades are on purpose. -->
+    <SuppressIces>ICE38;ICE43;ICE57;ICE61</SuppressIces>
   </PropertyGroup>
 
   <ItemGroup>

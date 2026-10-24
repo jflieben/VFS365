@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.5.1
+
+- The installer runs its machine steps without console windows and not on a repair; a rebuilt release of the same version replaces the installed one.
+
 ## 0.5.0
 
 Result of a second full review of the code, and a new sign-in.
@@ -35,7 +39,7 @@ API use
 Security
 - The network provider no longer asks the network about \\VFS365 when the drive isn't mounted. DEPLOYMENT.md explains how to keep that name from resolving on the network; the agent warns (log and monitoring) when it does.
 - The agent refuses a monitoring SAS that can read, change or delete rows, since every user can read it from the policy. Add-only SASes keep working.
-- The installer runs its machine steps without console windows and not on a repair; a failed upgrade restores the previous version and restarts its agents; a rebuilt release of the same version replaces the installed one.
+- The installer runs its machine steps without console windows and not on a repair; a rebuilt release of the same version replaces the installed one.
 - Uninstall cleans up very deep folder trees and does the machine-wide steps first; stopping agents signals only each session's own agent.
 - Releases are built and signed in separate jobs, only from main, and every signature is checked before publishing.
 

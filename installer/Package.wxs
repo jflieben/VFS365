@@ -10,9 +10,11 @@
     A repair runs none of these.
   -->
   <Package Name="VFS365" Manufacturer="JSolve B.V." Version="$(Version)" UpgradeCode="{9E0B7C21-3F64-4D3A-8B65-2D9A6F0C3651}" Scope="perMachine" Compressed="yes">
-    <!-- The older version goes inside this install's transaction, so a failed upgrade rolls back to it. A release cut again with the
-         same version replaces the first cut instead of installing next to it. -->
-    <MajorUpgrade Schedule="afterInstallInitialize" AllowSameVersionUpgrades="yes" DowngradeErrorMessage="A newer version of VFS365 is already installed." />
+    <!-- The older version is removed before files are installed (the default schedule). Not inside the transaction
+         (afterInstallInitialize): files are then chosen while the older ones are still there, so those of the same version (the .NET
+         runtime) are skipped and then removed with the older version. The setup (Burn) puts the older bundle back when an upgrade
+         fails. A release cut again with the same version replaces the first cut instead of installing next to it. -->
+    <MajorUpgrade AllowSameVersionUpgrades="yes" DowngradeErrorMessage="A newer version of VFS365 is already installed." />
     <MediaTemplate EmbedCab="yes" />
 
     <Icon Id="vfs365.ico" SourceFile="$(AssetsDir)\vfs365.ico" />
@@ -97,11 +99,7 @@
     <!-- Last: starts the agent as the user in every signed-in session without one (an upgrade stopped them) -->
     <SetProperty Id="StartAgents" Value="&quot;[INSTALLFOLDER]vfs365.exe&quot; machine-start" Before="StartAgents" Sequence="execute" />
     <CustomAction Id="StartAgents" BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)" DllEntry="WixQuietExec" Execute="deferred" Impersonate="no" Return="ignore" />
-    <!-- Rollback of a failed upgrade: the older version is back by then, and its agents, which its removal stopped, start again -->
-    <SetProperty Id="RestartAgentsOnRollback" Value="&quot;[INSTALLFOLDER]vfs365.exe&quot; machine-start" Before="RestartAgentsOnRollback" Sequence="execute" />
-    <CustomAction Id="RestartAgentsOnRollback" BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)" DllEntry="WixQuietExec" Execute="rollback" Impersonate="no" Return="ignore" />
     <InstallExecuteSequence>
-      <Custom Action="RestartAgentsOnRollback" Before="RemoveExistingProducts" Condition="NOT Installed AND WIX_UPGRADE_DETECTED" />
       <Custom Action="ReportUninstall" Before="StopAgentsAndCleanUp" Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
       <Custom Action="StopAgents" Before="RemoveFiles" Condition="REMOVE~=&quot;ALL&quot; AND UPGRADINGPRODUCTCODE" />
       <Custom Action="StopAgentsAndCleanUp" Before="RemoveFiles" Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
