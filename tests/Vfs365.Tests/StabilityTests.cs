@@ -23,7 +23,7 @@ public sealed class StabilityTests
 
     const string Unc = @"\\VFS365\JaneDoe";
 
-    static DriveLetterReport Healthy => new("T:", @"\Device\Volume{x}", 0, Unc, null, true, true);
+    static DriveLetterReport Healthy => new("T:", @"\Device\Volume{x}", 0, Unc, null, true);
 
     [Fact]
     public void A_healthy_letter_has_no_problems() => Assert.Empty(Healthy.Problems(Unc));
@@ -132,7 +132,7 @@ public sealed class StabilityTests
     [Fact]
     public void A_provider_order_without_vfs365_is_reported()
     {
-        Assert.NotNull(DriveLetterReport.ProviderProblem(["WinFsp.Np", "RDPNP", "LanmanWorkstation"]));
-        Assert.Null(DriveLetterReport.ProviderProblem(["WinFsp.Np", "VFS365.Np", "LanmanWorkstation"]));
+        Assert.NotNull(NetworkProviderOrder.Problem(["WinFsp.Np", "RDPNP", "LanmanWorkstation"]));
+        Assert.Null(NetworkProviderOrder.Problem(["WinFsp.Np", "VFS365.Np", "LanmanWorkstation"]));
     }
 }

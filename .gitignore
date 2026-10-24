@@ -14,6 +14,9 @@ TestResults/
 # Maintainer notes, research, status and test scripts with tenant details: kept locally, never published
 private/
 
+# demo creation
+tools/demo
+
 # Editor / OS
 .vs/
 .vscode/

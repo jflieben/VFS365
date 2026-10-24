@@ -8,7 +8,6 @@ public enum GraphOperation
     DeltaWithToken,
     DeltaWithoutToken,
     ListChildren,
-    Create,
     Update,
     Delete,
     Upload,
@@ -24,8 +23,6 @@ public readonly record struct AppBudget(int PerMinute, int Per24Hours);
 /// </summary>
 public static class ResourceUnits
 {
-    public const int UserRequestsPer5Minutes = 3_000;
-
     public static int Cost(GraphOperation operation) => operation switch
     {
         GraphOperation.GetItem or GraphOperation.Download or GraphOperation.DeltaWithToken => 1,
@@ -67,15 +64,5 @@ public static class ResourceUnits
         <= 15_000 => new(3_750, 3_600_000),
         <= 50_000 => new(5_000, 4_800_000),
         _ => new(6_250, 6_000_000),
-    };
-
-    /// <summary>Tenant-wide limit across all apps, per 5 minutes.</summary>
-    public static int TenantPer5MinutesFor(int licenses) => licenses switch
-    {
-        <= 1_000 => 18_750,
-        <= 5_000 => 37_500,
-        <= 15_000 => 56_250,
-        <= 50_000 => 75_000,
-        _ => 93_750,
     };
 }

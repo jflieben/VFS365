@@ -60,7 +60,6 @@ public enum DriveScope { All, OneDrive, SharePoint }
 /// </summary>
 public sealed class DriveNamespace
 {
-    readonly MyDrive oneDrive;
     readonly DriveScope scope;
     readonly Func<LibraryEntry, CancellationToken, Task<string>> resolveDriveId;
     readonly Action<LibraryEntry, string>? driveResolved;
@@ -72,7 +71,7 @@ public sealed class DriveNamespace
     DriveNamespace(MyDrive oneDrive, DriveScope scope, Func<LibraryEntry, CancellationToken, Task<string>> resolveDriveId,
         Action<LibraryEntry, string>? driveResolved)
     {
-        (this.oneDrive, this.scope, this.resolveDriveId, this.driveResolved) = (oneDrive, scope, resolveDriveId, driveResolved);
+        (this.scope, this.resolveDriveId, this.driveResolved) = (scope, resolveDriveId, driveResolved);
         oneDriveMount = new DriveMount(_ => Task.FromResult(oneDrive.DriveId), false);
         root = new VirtualFolder("");
     }
@@ -87,8 +86,6 @@ public sealed class DriveNamespace
         ns.SetLibraries(libraries);
         return ns;
     }
-
-    public MyDrive OneDrive => oneDrive;
 
     /// <summary>Replaces the libraries. Returns the volume paths of virtual folders whose children changed (for change notifications).</summary>
     public IReadOnlyList<string> SetLibraries(IReadOnlyList<LibraryEntry> libraries)

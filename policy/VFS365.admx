@@ -115,6 +115,20 @@
         <multiText id="PinnedLocations" valueName="PinnedLocations" />
       </elements>
     </policy>
+    <policy name="FolderRedirection" class="Both" displayName="$(string.FolderRedirection)" explainText="$(string.FolderRedirection_Help)" presentation="$(presentation.FolderRedirection)" key="Software\Policies\JSolve\VFS365">
+      <parentCategory ref="VFS365" />
+      <supportedOn ref="SUPPORTED_Windows11" />
+      <elements>
+        <multiText id="FolderRedirection" valueName="FolderRedirection" />
+      </elements>
+    </policy>
+    <policy name="DriveMappings" class="Both" displayName="$(string.DriveMappings)" explainText="$(string.DriveMappings_Help)" presentation="$(presentation.DriveMappings)" key="Software\Policies\JSolve\VFS365">
+      <parentCategory ref="VFS365" />
+      <supportedOn ref="SUPPORTED_Windows11" />
+      <elements>
+        <multiText id="DriveMappings" valueName="DriveMappings" />
+      </elements>
+    </policy>
     <policy name="ChangeCheckSeconds" class="Both" displayName="$(string.ChangeCheckSeconds)" explainText="$(string.ChangeCheckSeconds_Help)" presentation="$(presentation.ChangeCheckSeconds)" key="Software\Policies\JSolve\VFS365">
       <parentCategory ref="VFS365_Api" />
       <supportedOn ref="SUPPORTED_Windows11" />

@@ -38,7 +38,7 @@ flowchart LR
 
 ## How it works
 
-- A WinFsp network volume per user: `\\VFS365\<user>` and a navigation pane entry, optionally a drive letter. Works on multi-session hosts (AVD). Name, letter, content (SharePoint sites, OneDrive or both) and site filters are set by policy.
+- A WinFsp network volume per user: `\\VFS365\<user>` and a navigation pane entry, optionally a drive letter. Works on multi-session hosts (AVD). Name, letter, content (SharePoint sites, OneDrive or both) and site filters are set by policy, as are Windows' user folders moved into it (Desktop, Documents, ...) and drive letters of their own for libraries or folders (`Z:` for Finance), with environment variables and wildcards in their paths ([how](docs/DEPLOYMENT.md#folder-redirection-and-drive-letters)).
 - Signs in through Windows' own Web Account Manager (silently on Entra joined or registered devices) with JSolve's multi-tenant app: an admin consents once per tenant, no app registration needed. Forks and tenants that require their own registration set `ClientId`. Member accounts in their own tenant only (no guest access).
 - Reports errors and daily usage to your own Azure table storage when `MonitoringUrl` is set, with a [dashboard](monitoring/vfs365-monitoring.html) to view them; API use per user is capped by policy.
 - Libraries are discovered per user with SharePoint Search (M365AutoLink's method) and listed when opened; nothing is mirrored up front, so library size doesn't matter.

@@ -457,6 +457,24 @@ public sealed class WriteIntegrityTests : IDisposable
     }
 
     [Fact]
+    public async Task A_colleagues_save_read_by_the_feed_ends_the_follow_to_an_own_save()
+    {
+        api.Add("plan.txt", content: "v1");
+        var engine = Create();
+        await engine.PollAsync("b!me");
+        await engine.ListAsync((await engine.GetEntryAsync("\\OneDrive", default))!, default);
+        var before = (await engine.GetEntryAsync(Root + "plan.txt", default))!;
+        await SaveAsync(engine, "plan.txt", "alice");
+        await engine.PollAsync("b!me"); // the echo of the own save
+        Assert.NotSame(before, engine.Follow(before));
+        api.RemoteEdit("plan.txt", "bob");
+        await engine.PollAsync("b!me");
+
+        Assert.Same(before, engine.Follow(before));
+        Assert.Equal("bob", await ReadAllAsync(engine, (await engine.GetEntryAsync(Root + "plan.txt", default))!));
+    }
+
+    [Fact]
     public async Task A_metadata_change_on_the_server_does_not_end_a_save_in_a_conflict_copy()
     {
         var original = api.Add("log.txt", content: "v1");

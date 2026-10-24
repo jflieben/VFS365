@@ -14,8 +14,9 @@ public sealed class AgentLog : TextWriter
     public const long MaxBytes = 10L << 20;
     public const int KeepDays = 7, MaxFiles = 50;
 
-    public static string Folder { get; } = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "VFS365");
-    public static string FilePath { get; } = Path.Combine(Folder, "agent.log");
+    const string FileName = "agent.log";
+
+    public static string FilePath { get; } = Path.Combine(DiscoveryStore.DataDirectory, FileName);
 
     readonly string folder;
     readonly long maxBytes;
@@ -32,7 +33,7 @@ public sealed class AgentLog : TextWriter
     public override Encoding Encoding => Encoding.UTF8;
 
     /// <summary>The agent's log; <paramref name="newSession"/> (a sign-in, not a restart from the tray) starts a new file.</summary>
-    public static TextWriter Open(bool newSession) => TextWriter.Synchronized(Open(Folder, newSession, MaxBytes, () => DateTime.Now));
+    public static TextWriter Open(bool newSession) => TextWriter.Synchronized(Open(DiscoveryStore.DataDirectory, newSession, MaxBytes, () => DateTime.Now));
 
     public static AgentLog Open(string folder, bool newSession, long maxBytes, Func<DateTime> clock)
     {
@@ -75,7 +76,7 @@ public sealed class AgentLog : TextWriter
     /// </summary>
     void Roll()
     {
-        writer.WriteLine($"{clock():yyyy-MM-dd HH:mm:ss} Log reached {maxBytes >> 20} MB; it continues in agent.log");
+        writer.WriteLine($"{clock():yyyy-MM-dd HH:mm:ss} Log reached {maxBytes >> 20} MB; it continues in {FileName}");
         writer.Dispose();
         var archived = Archive(folder);
         Prune(folder, clock());
@@ -92,7 +93,7 @@ public sealed class AgentLog : TextWriter
 
     AppendFile OpenFile(out long length)
     {
-        var file = new AppendFile(Path.Combine(folder, "agent.log"));
+        var file = new AppendFile(Path.Combine(folder, FileName));
         length = file.Length;
         return file;
     }
@@ -143,7 +144,7 @@ public sealed class AgentLog : TextWriter
     /// <summary>Moves agent.log, if it has anything, to logs\ under the time of its last line. Returns where it went.</summary>
     static string? Archive(string folder)
     {
-        var current = Path.Combine(folder, "agent.log");
+        var current = Path.Combine(folder, FileName);
         var info = new FileInfo(current);
         if (!info.Exists || info.Length == 0)
         {
@@ -169,7 +170,7 @@ public sealed class AgentLog : TextWriter
     /// <summary>Removes logs older than KeepDays and all but the newest MaxFiles, and the agent.log.old of earlier versions.</summary>
     static void Prune(string folder, DateTime now)
     {
-        TryDelete(Path.Combine(folder, "agent.log.old"));
+        TryDelete(Path.Combine(folder, FileName + ".old"));
         var logs = Path.Combine(folder, "logs");
         if (!Directory.Exists(logs))
         {

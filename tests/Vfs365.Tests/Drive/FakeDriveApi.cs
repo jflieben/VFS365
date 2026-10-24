@@ -284,9 +284,6 @@ sealed class FakeDriveApi : IDriveApi
         }
     }
 
-    /// <summary>How long each whole-file upload takes, like a network would.</summary>
-    public TimeSpan UploadDelay { get; set; }
-
     /// <summary>Held at the start of each whole-file upload, to test what happens meanwhile.</summary>
     public Func<Task>? BeforeUpload { get; set; }
 
@@ -307,10 +304,6 @@ sealed class FakeDriveApi : IDriveApi
                 await hold();
             }
             var bytes = await File.ReadAllBytesAsync(sourceFile, ct);
-            if (UploadDelay > TimeSpan.Zero)
-            {
-                await Task.Delay(UploadDelay, ct);
-            }
             return Commit(target, bytes, whole: true);
         }
         finally

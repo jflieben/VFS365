@@ -10,8 +10,29 @@ namespace Vfs365.Agent;
 public static class NetworkProviderOrder
 {
     public const string Name = "VFS365.Np";
-    const string WinFsp = "WinFsp.Np";
+    internal const string WinFsp = "WinFsp.Np";
     const string Key = @"SYSTEM\CurrentControlSet\Control\NetworkProvider";
+    internal const string OrderKey = Key + @"\Order";
+
+    /// <summary>The providers in Windows' order now; empty when it can't be read.</summary>
+    public static IReadOnlyList<string> Current()
+    {
+        try
+        {
+            using var key = Registry.LocalMachine.OpenSubKey(OrderKey);
+            return (key?.GetValue("ProviderOrder") as string ?? "").Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+        }
+        catch (Exception e) when (e is SecurityException or UnauthorizedAccessException or IOException)
+        {
+            return [];
+        }
+    }
+
+    /// <summary>A provider order without VFS365.Np: typed or pasted \\VFS365 paths don't open in Explorer (the drive itself works).</summary>
+    public static string? Problem(IReadOnlyList<string> order) => order.Contains(Name, StringComparer.OrdinalIgnoreCase)
+        ? null
+        : "VFS365.Np is not in the network provider order (HKLM\\" + OrderKey + "): typed or pasted \\\\VFS365 paths won't open in Explorer. " +
+          "Run 'vfs365.exe machine-setup' as an administrator, or add VFS365.Np after WinFsp.Np in the policy that sets that order.";
 
     /// <summary>The order with VFS365.Np right after WinFsp.Np, or first when WinFsp.Np is missing.</summary>
     public static string With(string order)

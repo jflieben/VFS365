@@ -36,18 +36,13 @@ public sealed record DriveLetterOption(string? MountPoint, bool KeepLetter, stri
 /// Drive" when no network provider reports it (WinFsp.Np missing from the provider order), when a remembered mapping
 /// (HKCU\Network\&lt;letter&gt;) holds the letter for another share, or when the letter is gone while the drive still works by UNC path.
 /// </summary>
-public sealed record DriveLetterReport(string Letter, string? Target, int ConnectionError, string? RemoteName, string? Remembered, bool WinFspInOrder, bool VfsInOrder)
+public sealed record DriveLetterReport(string Letter, string? Target, int ConnectionError, string? RemoteName, string? Remembered, bool WinFspInOrder)
 {
-    const string OrderKey = @"SYSTEM\CurrentControlSet\Control\NetworkProvider\Order";
-
     /// <summary>Reads it now; <paramref name="letter"/> like "T:".</summary>
     public static DriveLetterReport Read(string letter)
     {
-        var target = new StringBuilder(1024);
-        var hasTarget = QueryDosDevice(letter, target, target.Capacity) > 0;
-        var remote = new StringBuilder(1024);
-        var length = remote.Capacity;
-        var error = WNetGetConnection(letter, remote, ref length);
+        var target = DosDevices.Target(letter);
+        var error = DosDevices.Connection(letter, out var remote);
         string? remembered = null;
         try
         {
@@ -57,22 +52,8 @@ public sealed record DriveLetterReport(string Letter, string? Target, int Connec
         catch (Exception e) when (e is System.Security.SecurityException or UnauthorizedAccessException or IOException)
         {
         }
-        var order = ProviderOrder();
-        return new(letter, hasTarget ? target.ToString() : null, error, error == 0 ? remote.ToString() : null, remembered,
-            order.Contains("WinFsp.Np", StringComparer.OrdinalIgnoreCase), order.Contains("VFS365.Np", StringComparer.OrdinalIgnoreCase));
-    }
-
-    public static IReadOnlyList<string> ProviderOrder()
-    {
-        try
-        {
-            using var key = Registry.LocalMachine.OpenSubKey(OrderKey);
-            return (key?.GetValue("ProviderOrder") as string ?? "").Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
-        }
-        catch (Exception e) when (e is System.Security.SecurityException or UnauthorizedAccessException or IOException)
-        {
-            return [];
-        }
+        return new(letter, target, error, remote, remembered,
+            NetworkProviderOrder.Current().Contains(NetworkProviderOrder.WinFsp, StringComparer.OrdinalIgnoreCase));
     }
 
     /// <summary>What is wrong and how to fix it; empty when Windows shows the letter as VFS365's <paramref name="unc"/>.</summary>
@@ -94,7 +75,7 @@ public sealed record DriveLetterReport(string Letter, string? Target, int Connec
         if (Target is not null && ConnectionError != 0)
         {
             problems.Add($"No network provider reports {Letter} (WNetGetConnection error {ConnectionError}), so Explorer shows it as a disconnected network drive " +
-                "although it works." + (WinFspInOrder ? "" : " WinFsp.Np is missing from the network provider order (HKLM\\" + OrderKey + "), which a policy or another " +
+                "although it works." + (WinFspInOrder ? "" : " WinFsp.Np is missing from the network provider order (HKLM\\" + NetworkProviderOrder.OrderKey + "), which a policy or another " +
                 "installer can replace. Put WinFsp.Np back in it, or run 'vfs365.exe machine-setup' as an administrator."));
         }
         else if (RemoteName is not null && !RemoteName.Equals(unc, StringComparison.OrdinalIgnoreCase))
@@ -103,16 +84,48 @@ public sealed record DriveLetterReport(string Letter, string? Target, int Connec
         }
         return problems;
     }
+}
 
-    /// <summary>A provider order without VFS365.Np: typed or pasted \\VFS365 paths don't open in Explorer (the drive itself works).</summary>
-    public static string? ProviderProblem(IReadOnlyList<string> order) => order.Contains("VFS365.Np", StringComparer.OrdinalIgnoreCase)
-        ? null
-        : "VFS365.Np is not in the network provider order (HKLM\\" + OrderKey + "): typed or pasted \\\\VFS365 paths won't open in Explorer. " +
-          "Run 'vfs365.exe machine-setup' as an administrator, or add VFS365.Np after WinFsp.Np in the policy that sets that order.";
+/// <summary>Drive letters through Windows: DOS devices of the session (as subst makes them) and network connections.</summary>
+internal static class DosDevices
+{
+    const uint RawTargetPath = 1, RemoveDefinition = 2, ExactMatchOnRemove = 4;
+
+    /// <summary>What <paramref name="letter"/> ("T:") points at, or null when it is free.</summary>
+    public static string? Target(string letter)
+    {
+        var target = new StringBuilder(1024);
+        return QueryDosDevice(letter, target, target.Capacity) > 0 ? target.ToString() : null;
+    }
+
+    /// <summary>Gives the letter <paramref name="device"/> (\??\UNC\...) as its raw target path; when false, <c>new Win32Exception()</c> tells why.</summary>
+    public static bool Define(string letter, string device) => DefineDosDevice(RawTargetPath, letter, device);
+
+    /// <summary>Removes the letter's definition when it is <paramref name="device"/>.</summary>
+    public static void Remove(string letter, string device) => DefineDosDevice(RawTargetPath | RemoveDefinition | ExactMatchOnRemove, letter, device);
+
+    /// <summary>Disconnects the network drive on the letter, open files or not; a remembered mapping goes too (CONNECT_UPDATE_PROFILE).</summary>
+    public static void Disconnect(string letter) => WNetCancelConnection2(letter, 1, true);
+
+    /// <summary>WNetGetConnection: 0 and the remote name a network provider reports for the letter, else the error and null.</summary>
+    public static int Connection(string letter, out string? remote)
+    {
+        var name = new StringBuilder(1024);
+        var length = name.Capacity;
+        var error = WNetGetConnection(letter, name, ref length);
+        remote = error == 0 ? name.ToString() : null;
+        return error;
+    }
 
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
     static extern uint QueryDosDevice(string device, StringBuilder target, int max);
 
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern bool DefineDosDevice(uint flags, string device, string target);
+
     [DllImport("mpr.dll", CharSet = CharSet.Unicode)]
     static extern int WNetGetConnection(string local, StringBuilder remote, ref int length);
+
+    [DllImport("mpr.dll", CharSet = CharSet.Unicode)]
+    static extern int WNetCancelConnection2(string name, uint flags, bool force);
 }

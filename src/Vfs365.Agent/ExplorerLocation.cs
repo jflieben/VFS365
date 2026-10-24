@@ -5,7 +5,8 @@ namespace Vfs365.Agent;
 
 /// <summary>
 /// Explorer integration, all per user (HKCU, no admin rights): a navigation pane node (delegate folder) that shows the drive or UNC path,
-/// registered in the 64-bit and 32-bit views so file dialogs of both kinds show it, and the name Explorer gives the network drive.
+/// registered in the 64-bit and 32-bit views so file dialogs of both kinds show it, and the names Explorer gives the network drive and
+/// the drive letters for folders (<see cref="SessionDriveLetters"/>) in MountPoints2.
 /// </summary>
 static class ExplorerLocation
 {
@@ -94,9 +95,10 @@ static class ExplorerLocation
     /// </summary>
     public static void SetDriveLabel(string uncPrefix, string label)
     {
-        var keyName = uncPrefix.Replace('\\', '#').Insert(0, "#");
+        var keyName = LabelKey(uncPrefix);
         using var mountPoints = Registry.CurrentUser.CreateSubKey($@"{Explorer}\MountPoints2");
-        foreach (var stale in DriveLabelKeys(mountPoints).Where(name => !name.Equals(keyName, StringComparison.OrdinalIgnoreCase)))
+        foreach (var stale in DriveLabelKeys(mountPoints).Where(name => !name.Equals(keyName, StringComparison.OrdinalIgnoreCase)
+            && !name.StartsWith(keyName + "#", StringComparison.OrdinalIgnoreCase)))
         {
             mountPoints.DeleteSubKeyTree(stale, false);
         }
@@ -105,8 +107,31 @@ static class ExplorerLocation
         Refresh();
     }
 
-    static void Refresh() => SHChangeNotify(0x08000000, 0, IntPtr.Zero, IntPtr.Zero); // SHCNE_ASSOCCHANGED
+    /// <summary>The name Explorer shows for a drive letter given a folder inside the volume (policy DriveMappings), by its UNC path.</summary>
+    public static void SetFolderLabel(string unc, string label)
+    {
+        using var mountPoint = Registry.CurrentUser.CreateSubKey($@"{Explorer}\MountPoints2\{LabelKey(unc)}");
+        mountPoint.SetValue("_LabelFromReg", label);
+        Refresh();
+    }
 
-    [DllImport("shell32.dll")]
-    static extern void SHChangeNotify(int eventId, uint flags, IntPtr item1, IntPtr item2);
+    public static void RemoveFolderLabel(string unc)
+    {
+        using var mountPoints = Registry.CurrentUser.OpenSubKey($@"{Explorer}\MountPoints2", writable: true);
+        mountPoints?.DeleteSubKeyTree(LabelKey(unc), false);
+    }
+
+    /// <summary>MountPoints2's key for \\server\share\path (or \server\share): ##server#share#path.</summary>
+    static string LabelKey(string unc) => "##" + unc.TrimStart('\\').Replace('\\', '#');
+
+    /// <summary>Tells Explorer to read its folders and names again (SHCNE_ASSOCCHANGED).</summary>
+    internal static void Refresh() => SHChangeNotify(0x08000000, 0, null, IntPtr.Zero);
+
+    /// <summary>Tells Explorer a drive letter ("Z:") came (SHCNE_DRIVEADD) or went (SHCNE_DRIVEREMOVED), by its path (SHCNF_PATHW).</summary>
+    internal static void DriveAdded(string letter) => SHChangeNotify(0x100, 5, letter + @"\", IntPtr.Zero);
+
+    internal static void DriveRemoved(string letter) => SHChangeNotify(0x80, 5, letter + @"\", IntPtr.Zero);
+
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
+    static extern void SHChangeNotify(int eventId, uint flags, string? item1, IntPtr item2);
 }

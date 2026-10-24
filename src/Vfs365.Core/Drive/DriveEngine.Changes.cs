@@ -442,9 +442,7 @@ public sealed partial class DriveEngine
             wait = TimeSpan.FromTicks(Math.Min(LastFeedRetry.Ticks, FirstFeedRetry.Ticks << Math.Min(feed.Failures - 1, 10))) * (0.75 + 0.5 * options.Random());
             feed.RetryAt = Now + wait;
         }
-        var problem = e is RemoteException { Error: RemoteError.ReadOnly }
-            ? "SharePoint has the library read-only for now (maintenance or a site move)"
-            : e.Message;
+        var problem = e is RemoteException { Error: RemoteError.ReadOnly } ? ReadOnlyCause : e.Message;
         if (problem != feed.Problem)
         {
             Log($"change feed of {FeedName(driveId)}: {problem}. Folders are read again when opened; trying again in {wait.TotalMinutes:0} min, then less often");
@@ -919,6 +917,7 @@ public sealed partial class DriveEngine
                 continue; // already known (an echo of this engine's own upload), or older than what is known
             }
             target.Set(item);
+            SeenVersion(item);
             if (holders is not null)
             {
                 holders[item.Id] = newFolder;

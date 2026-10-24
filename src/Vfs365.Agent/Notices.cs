@@ -50,6 +50,10 @@ public static partial class PlainCause
 
     public static string Text(Cause cause, CultureInfo? culture = null) => UiText.Get(culture, $"Cause.{cause}");
 
+    /// <summary>No network or Microsoft 365 unreachable: connection failures and timeouts.</summary>
+    public static bool IsNetwork(Exception e) =>
+        e is HttpRequestException or TaskCanceledException or TimeoutException or System.Net.Sockets.SocketException;
+
     [GeneratedRegex(@"^\s*(\d{3})\s")]
     private static partial Regex StatusCode();
 
@@ -95,8 +99,7 @@ public sealed record StartProblem(StartWait Wait, string Reason)
     {
         SignInException when SignInText.Permanent(e) => new(StartWait.Retry, SignInText.Of(e, culture)),
         SignInException => new(StartWait.SignIn, SignInText.Of(e, culture)),
-        HttpRequestException or TaskCanceledException or TimeoutException or System.Net.Sockets.SocketException =>
-            new(StartWait.Network, PlainCause.Text(Cause.Offline, culture)),
+        _ when PlainCause.IsNetwork(e) => new(StartWait.Network, PlainCause.Text(Cause.Offline, culture)),
         _ when PlainCause.Of(e.Message, offline) is var cause && cause is Cause.Offline or Cause.Throttled or Cause.Unavailable =>
             new(StartWait.Network, PlainCause.Text(cause, culture)),
         _ => new(StartWait.Retry, e.Message),

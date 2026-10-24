@@ -85,6 +85,8 @@ Values: on/off settings also take REG_SZ (`1`/`0`, `true`/`false`, `yes`/`no`, `
 | `NotifyUploads` | REG_DWORD | `1` | `0`: no "Uploaded" notification when files that had to wait are uploaded. Conflict copies and waiting uploads always notify |
 | `HelpUrl` | REG_SZ | `https://jsolve.nl` | Page the tray menu's Help opens, for example your service desk (http or https) |
 | `PinnedLocations` | REG_MULTI_SZ | none | Site, library or folder URLs to show for everyone with access, also when search doesn't find them (Restricted Content Discovery, new sites, the root site). A site URL shows all its libraries; site patterns don't apply |
+| `FolderRedirection` | REG_MULTI_SZ | none | Windows' user folders in VFS365 while the drive is mounted: `Documents=OneDrive\Documents`, `\|move` to move their content in. See [Folder redirection and drive letters](#folder-redirection-and-drive-letters) |
+| `DriveMappings` | REG_MULTI_SZ | none | Drive letters of their own for folders in VFS365: `Z:=Sites\Finance\Documents`, `\|Finance` for the name in Explorer. See [Folder redirection and drive letters](#folder-redirection-and-drive-letters) |
 | `ChangeCheckSeconds` | REG_DWORD | `20` | How often a library in use (last 2 minutes) checks for changes made elsewhere, 5 to 300 s (1 to 4 count as 5); `0` relies on SharePoint's push (often 20 to 30 s). With push working, each check doubles the wait up to 8 times this (160 s) until this PC changes something there; without push, each check that finds nothing doubles it up to 4 times this (80 s). Pauses when the tenant is throttled |
 | `DatabaseFiles` | REG_SZ | `Allow` | Multi-user database files (Access, QuickBooks, SQLite): `Allow`, `ReadOnly` (open but never saved) or `Block` (can't be opened). Their locks don't reach other PCs, so two users can both write |
 | `ApiBudgetPerMinute` | REG_DWORD | `600` | SharePoint resource units one user's VFS365 uses per minute at most (at least 60, so 1 to 59 count as 60; `0`: no limit of its own). See [API use](#api-use) |
@@ -101,6 +103,29 @@ The UNC path is `\\VFS365\<user>`, with the Windows user name (`%USERNAME%`).
 Drive letter only: set `DriveLetter` to a letter (for example `M`) and `NavigationPane` to `0`. The drive then shows under This PC as `M:`, with no navigation pane entry. The UNC path keeps working.
 
 Accounts: VFS365 works with member accounts in their own tenant, through JSolve's app or your own app registration. Guests (B2B) and accounts synced in from another tenant are refused with a message in the log.
+
+## Folder redirection and drive letters
+
+`FolderRedirection` moves Windows' user folders into VFS365; `DriveMappings` gives folders in VFS365 a drive letter of their own, for apps and habits that expect `Z:\` (for example after OneDriveMapper). One entry per line:
+
+```
+Documents=OneDrive\Documents|move
+Desktop=OneDrive\Desktop
+Pictures=Sites\Home\Documents\%USERNAME%\Pictures
+Z:=Sites\Finance\Documents|Finance
+H:=Sites\Home\Documents\%UPNNAME%|Home
+P:=Sites\Project*\Documents
+```
+
+- Folders: `Desktop`, `Documents`, `Downloads`, `Music`, `Pictures`, `Videos`, `Favorites`, `Contacts`, `Links`, `SavedGames`, `SavedSearches`, or any known folder's ID in braces. Documents, Downloads, Music, Pictures and Videos move together with their "This PC" entry.
+- Paths are from the drive's root, as the drive shows them (`OneDrive\...`, `Sites\<site>\<library>\...`; with `Scope` OneDrive just the folders in it). `M:\...` on the drive's own letter and `\\VFS365\<user>\...` work too; anything outside VFS365 is refused.
+- Placeholders: environment variables (`%USERNAME%`, `%USERDOMAIN%`, `%COMPUTERNAME%`, ...), `%UPN%` (the signed-in account) and `%UPNNAME%` (its part before the @). `*` and `?` in a folder name take the first matching folder by name.
+- Folders that don't exist are made inside the library (a user's own folder on a shared library); sites and libraries themselves never are.
+- `|move` moves what the local folder holds into the new place when it is redirected; names that exist there stay local, and desktop.ini stays. Without it, the local content stays where it is (visible again when the folder goes back).
+
+Redirection lasts as long as the drive is mounted: after the mount (and after each discovery, every hour and after sleep, for targets that weren't there yet) the folders move into VFS365; at unmount (sign-out, shutdown, `vfs365 signout`, uninstall) they go back to where they were. Windows therefore never starts a session with a desktop that isn't there yet; the next start moves them again. A folder that something else moved (OneDrive's folder backup, a Folder Redirection policy, the user) is left alone and reported in the log and monitoring; remove the other redirection to hand it over. A rule removed from the policy puts its folder back. After a crash the next start takes the folders over again.
+
+Drive letters exist for the user's sign-in only and go at unmount. Explorer names them after the label, or as `<folder> (\\VFS365\<user>\...)`. A letter held by an old SharePoint WebDAV mapping (OneDriveMapper, `net use` to `*.sharepoint.com`), or remembered for the next sign-in (`HKCU\Network`), is taken over and that mapping removed; a letter in use by anything else is left and reported. Explorer shows a letter as connected only with `vfs365np.dll` in the network provider order (the installer puts it there); without it the letter works but shows as disconnected.
 
 ## API use
 
@@ -174,6 +199,7 @@ Per user in `%LOCALAPPDATA%\VFS365`:
 | `staging\` | Unsaved changes until they upload | Plain, deleted after upload |
 | `statistics.json` | Usage per day until it is sent to monitoring (only with `MonitoringUrl`) | Plain (counts) |
 | `refreshed.txt` | When the user last used Refresh | Plain (a time) |
+| `redirection.json` | Folders moved by `FolderRedirection` and where they were, while the drive is mounted (only with that policy) | Plain (paths) |
 | `enrolled` | Marker: the device was in Intune at the last start, so leaving Intune wipes the cache | Plain (a time) |
 | `agent.log` | Log of the current sign-in, starting with the settings in effect and where each comes from | Plain |
 | `logs\` | Logs of earlier sign-ins (`agent-<time of the last line>.log`): kept 7 days, at most 50 files; a log that reaches 10 MB continues in a new file | Plain |

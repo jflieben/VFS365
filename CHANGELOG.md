@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.6.0
+
+- Folder redirection (policy `FolderRedirection`): Decide if Windows' user folders (Desktop, Documents, Downloads, Pictures and the others, or any known folder by ID) move into VFS365 while the drive is mounted, and back at unmount. Paths take environment variables, `%UPN%` and `%UPNNAME%`, and wildcards (`Sites\Project*\Documents`); missing folders are made inside the library; `|move` moves the local content in. Folders moved by something else (OneDrive's folder backup, a Folder Redirection policy) are left alone and reported.
+- Drive letters for folders (policy `DriveMappings`): `Z:=Sites\Finance\Documents|Finance` gives a library or folder a letter of its own, as OneDriveMapper did, with the same placeholders and wildcards. A letter still held or remembered by a SharePoint WebDAV mapping (OneDriveMapper, `net use`) is taken over. The network provider reports these letters to Explorer as connected.
+
 ## 0.5.1
 
 - The installer runs its machine steps without console windows and not on a repair; a rebuilt release of the same version replaces the installed one.

@@ -341,8 +341,6 @@ public sealed partial class DriveEngine(DriveNamespace ns, IDriveApi api, Conten
 
     internal static string Key(string driveId, string drivePath) => $"{driveId}|{drivePath}";
 
-    public DriveNamespace Namespace => ns;
-
     public async Task<FsEntry?> GetEntryAsync(string path, CancellationToken ct)
     {
         var resolved = ns.Resolve(path);
@@ -464,8 +462,6 @@ public sealed partial class DriveEngine(DriveNamespace ns, IDriveApi api, Conten
         return content.Open(driveId, file.ItemId!, file.ContentTag, file.Size, current => ContentChanged(driveId, current));
     }
 
-    public string? StagingPathOf(FsEntry file) => PendingOf(file)?.StagingPath;
-
     async Task<DriveItemInfo?> LookupAsync(string driveId, string drivePath, CancellationToken ct)
     {
         Listing? stale = null;
@@ -506,8 +502,7 @@ public sealed partial class DriveEngine(DriveNamespace ns, IDriveApi api, Conten
         {
             item = await api.GetItemAsync(driveId, drivePath, ct);
         }
-        catch (Exception e) when (stale is not null && !ct.IsCancellationRequested
-            && (e is RemoteException { Error: RemoteError.Throttled or RemoteError.Unavailable } || e is not (RemoteException or FsException)))
+        catch (Exception e) when (stale is not null && !ct.IsCancellationRequested && IsTransient(e, readOnlyCounts: false))
         {
             // Offline or Microsoft 365 unreachable: the last known listing answers (cached files keep opening), until it can be read again
             return stale.Items.GetValueOrDefault(NameOf(drivePath));

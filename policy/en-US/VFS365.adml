@@ -58,6 +58,18 @@ Disabled: no "Uploaded" notifications. Conflict copies and uploads that wait are
       <string id="PinnedLocations">Pinned locations</string>
       <string id="PinnedLocations_Help">Site or library addresses to show for everyone who can open them, one per line, also where SharePoint Search doesn't find them (Restricted Content Discovery, sites excluded from search, the root site, portals, new sites). A link copied from the browser works. Users add their own with vfs365.exe pin.</string>
 
+      <string id="FolderRedirection">Folder redirection</string>
+      <string id="FolderRedirection_Help">Moves Windows' user folders into VFS365 while the drive is mounted, one per line: Folder=path. Folders: Desktop, Documents, Downloads, Music, Pictures, Videos, Favorites, Contacts, Links, SavedGames, SavedSearches, or any known folder's ID in braces. The path is from the drive's root (OneDrive\Documents, Sites\Home\Documents\%USERNAME%) and may use %USERNAME%, %USERDOMAIN%, %COMPUTERNAME% and other environment variables, %UPN% and %UPNNAME% (the signed-in account, and its part before the @), and * or ? in a folder name for the first matching folder. Folders that don't exist are made inside the library. Add |move to move what the local folder holds into it (names that exist there stay).
+
+At unmount (sign-out, shutdown, uninstall) each folder goes back where it was, so Windows never starts with a desktop that isn't there yet; the next start moves it again. A folder that something else moved (OneDrive's folder backup, a Folder Redirection policy, the user) is left alone and reported.
+
+Example: Documents=OneDrive\Documents|move</string>
+
+      <string id="DriveMappings">Drive letters for folders</string>
+      <string id="DriveMappings_Help">Gives folders in VFS365 a drive letter of their own, one per line: Z:=path, with |label for the name Explorer shows. The path is written as in Folder redirection (environment variables, %UPN%, wildcards; missing folders inside a library are made). The letters exist for the user's sign-in only, while the drive is mounted. A letter that an old SharePoint WebDAV mapping holds (OneDriveMapper, net use to *.sharepoint.com), now or remembered for the next sign-in, is taken over; a letter in use by anything else is left and reported.
+
+Example: Z:=Sites\Finance\Documents|Finance</string>
+
       <string id="ChangeCheckSeconds">Change check interval</string>
       <string id="ChangeCheckSeconds_Help">How often, in seconds, a library someone used in the last 2 minutes is checked for changes made elsewhere, on top of SharePoint's push notifications (which take 20 to 30 seconds). While push notifications work, each check doubles the wait, up to 8 times this (160 seconds by default), until this PC changes something in the library; without them, each check that finds nothing doubles it, up to 4 times this (80 seconds), until a change arrives. Default 20; 0 leaves it to push notifications; 5 to 300 (1 to 4 count as 5, and the log says so). Each check costs 1 resource unit of the tenant's API budget. Checking pauses after Microsoft throttles (see "Pause after throttling").</string>
 
@@ -132,6 +144,8 @@ Disabled: no entry. With a drive letter (see "Drive letter") the drive shows und
       <presentation id="IncludedSites"><multiTextBox refId="IncludedSites">Site URL patterns, one per line</multiTextBox></presentation>
       <presentation id="CacheSizeMB"><decimalTextBox refId="CacheSizeMB" defaultValue="2048">MB</decimalTextBox></presentation>
       <presentation id="PinnedLocations"><multiTextBox refId="PinnedLocations">Site or library addresses, one per line</multiTextBox></presentation>
+      <presentation id="FolderRedirection"><multiTextBox refId="FolderRedirection">Folder=path, one per line</multiTextBox></presentation>
+      <presentation id="DriveMappings"><multiTextBox refId="DriveMappings">Letter:=path, one per line</multiTextBox></presentation>
       <presentation id="ChangeCheckSeconds"><decimalTextBox refId="ChangeCheckSeconds" defaultValue="20">Seconds (0: push notifications only)</decimalTextBox></presentation>
       <presentation id="ApiBudgetPerMinute"><decimalTextBox refId="ApiBudgetPerMinute" defaultValue="600">Resource units per minute (0: no limit of its own)</decimalTextBox></presentation>
       <presentation id="ThrottlePauseMinutes"><decimalTextBox refId="ThrottlePauseMinutes" defaultValue="15">Minutes</decimalTextBox></presentation>

@@ -16,8 +16,6 @@ internal sealed class FileContent(string path) : IContentSource
 {
     readonly SafeFileHandle file = File.OpenHandle(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
 
-    public string Path { get; } = path;
-
     public long Length => RandomAccess.GetLength(file);
 
     public ValueTask<int> ReadAsync(long offset, Memory<byte> buffer, CancellationToken ct) =>

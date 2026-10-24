@@ -5,7 +5,7 @@ Guidance for coding agents and contributors. Maintainers: when `private/` exists
 ## Rules
 - Style: concise plain Markdown and comments, no em dashes. Document what and how; add why only where it isn't obvious.
 - Delegated Graph permissions only; public APIs only. Never app-only, never Sites.FullControl.All, never the OneDrive client's User-Agent.
-- Items are tracked by drive ID + item ID (`ItemRef`), never by path.
+- Items are tracked by drive ID + item ID, never by path.
 - Data safety rules in docs/ARCHITECTURE.md are hard rules: never acknowledge a write that isn't durably queued, never delete server content except on an explicit user delete.
 - Core and Graph stay platform neutral: no WinFsp, cfapi or MSAL types there.
 - Writes in tests run against the in-memory `FakeDriveApi`. Live tests write only to a test folder in a test tenant, never to production data.

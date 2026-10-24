@@ -55,7 +55,7 @@ public sealed class CacheCipher
 
     static long Chunks(long length) => (length + ChunkSize - 1) / ChunkSize;
 
-    /// <summary>Starts a cache file: sets its size and writes the footer with a new nonce. Chunks are written with <see cref="Write"/>.</summary>
+    /// <summary>Starts a cache file: sets its size and writes the footer with a new nonce. Chunks are written with <see cref="SealedFile.Write"/>.</summary>
     internal SealedFile Create(SafeFileHandle file, long length, string name)
     {
         var footer = new byte[FooterSize];

@@ -4,7 +4,8 @@ using Vfs365.Agent;
 // Started at sign-in, this is the supervisor: it runs the agent as a child process and starts it again after a crash. The child writes
 // to %LOCALAPPDATA%\VFS365\agent.log, a new file per sign-in (a restart from the tray, with --after, appends). The session ends cleanly
 // on logoff, shutdown and the installer (Restart Manager): only once Windows really ends it (SessionEnded, not a shutdown that is still
-// asked about and can be cancelled), the navigation pane entry goes, then the mount uploads pending changes and stops.
+// asked about and can be cancelled), redirected folders go back, the drive letters for folders and the navigation pane entry go, then
+// the mount uploads pending changes and stops.
 if (!args.Contains(AgentSupervisor.ChildFlag, StringComparer.OrdinalIgnoreCase))
 {
     var ending = false;

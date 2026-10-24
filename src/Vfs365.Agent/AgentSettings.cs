@@ -29,7 +29,7 @@ public sealed class AgentSettings
         "ClientId", "TenantId", "DriveLetter", "Label", "Scope", "IncludedSites", "ExcludedSites", "IncludedSiteTemplates", "ExcludedSiteTemplates",
         "PinnedLocations", "NavigationPane", "CacheSizeMB", "TrayIcon", "NotifyUploads", "HelpUrl", "ChangeCheckSeconds", "ApiBudgetPerMinute",
         "ThrottlePauseMinutes", "WalkPrefetchFolders", "ReadAheadFiles", "BackgroundUploads", "RepeatSaveSeconds", "DatabaseFiles", "MonitoringUrl",
-        "MonitoringDetail",
+        "MonitoringDetail", "FolderRedirection", "DriveMappings",
     ];
 
     readonly List<(string Source, Func<string, object?> Read)> sources = [];
@@ -72,6 +72,12 @@ public sealed class AgentSettings
     public IReadOnlyList<string> PinnedLocations => List("PinnedLocations") ?? [];
 
     public bool NavigationPane => Bool("NavigationPane") ?? true;
+
+    /// <summary>Known folders moved into the volume while it is mounted: "Documents=OneDrive\Documents", "|move" moves their content.</summary>
+    public IReadOnlyList<string> FolderRedirection => List("FolderRedirection") ?? [];
+
+    /// <summary>Drive letters for folders in the volume: "Z:=Sites\Finance\Documents", "|Finance" names it in Explorer.</summary>
+    public IReadOnlyList<string> DriveMappings => List("DriveMappings") ?? [];
 
     public const int DefaultCacheSizeMB = 2048;
 
@@ -162,6 +168,8 @@ public sealed class AgentSettings
             ("ExcludedSiteTemplates", ExcludedSiteTemplates.Count == 0 ? "none" : string.Join("; ", ExcludedSiteTemplates), From("ExcludedSiteTemplates")),
             ("PinnedLocations", PinnedLocations.Count == 0 ? "none" : string.Join("; ", PinnedLocations), From("PinnedLocations")),
             ("NavigationPane", OnOff(NavigationPane), From("NavigationPane")),
+            ("FolderRedirection", FolderRedirection.Count == 0 ? "none" : string.Join("; ", FolderRedirection), From("FolderRedirection")),
+            ("DriveMappings", DriveMappings.Count == 0 ? "none" : string.Join("; ", DriveMappings), From("DriveMappings")),
             ("CacheSizeMB", CacheSizeMB.ToString(), From("CacheSizeMB")),
             ("TrayIcon", OnOff(TrayIcon), From("TrayIcon")),
             ("NotifyUploads", OnOff(NotifyUploads), From("NotifyUploads")),
@@ -222,7 +230,7 @@ public sealed class AgentSettings
         {
             Unreadable(name, Raw(name, out _) is string, "text", "the default");
         }
-        foreach (var name in new[] { "IncludedSites", "ExcludedSites", "IncludedSiteTemplates", "ExcludedSiteTemplates", "PinnedLocations" })
+        foreach (var name in new[] { "IncludedSites", "ExcludedSites", "IncludedSiteTemplates", "ExcludedSiteTemplates", "PinnedLocations", "FolderRedirection", "DriveMappings" })
         {
             Unreadable(name, Raw(name, out _) is string or string[], "a list", "the default");
         }

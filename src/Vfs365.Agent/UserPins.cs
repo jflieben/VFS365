@@ -33,7 +33,9 @@ static class UserPins
             return false;
         }
         Directory.CreateDirectory(DiscoveryStore.DataDirectory);
-        File.WriteAllText(FilePath, JsonSerializer.Serialize(updated, new JsonSerializerOptions { WriteIndented = true }));
+        var temporary = FilePath + ".tmp";
+        File.WriteAllText(temporary, JsonSerializer.Serialize(updated, new JsonSerializerOptions { WriteIndented = true }));
+        File.Move(temporary, FilePath, overwrite: true);
         return true;
     }
 }

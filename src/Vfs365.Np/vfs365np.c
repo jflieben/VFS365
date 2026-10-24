@@ -1,6 +1,8 @@
 // VFS365 network provider (vfs365np.dll): lets the Windows shell resolve typed \\VFS365\<share> paths, as in Explorer's
 // address bar, file dialogs and Run. WinFsp's own provider doesn't implement NPGetResourceInformation, which the shell
-// needs for that. File I/O doesn't pass through here: it goes through WinFsp's redirector.
+// needs for that. It also names the drive letters the agent gives folders inside the volume (policy DriveMappings), which
+// WinFsp's provider doesn't know: without that, Explorer shows them as disconnected. File I/O doesn't pass through here: it
+// goes through WinFsp's redirector.
 // MPR loads this DLL into every process that resolves network names, so anything not \\VFS365 is declined at once.
 // Built with Zig (zig cc) by build.ps1, without a C runtime: kernel32 and advapi32 only.
 
@@ -12,6 +14,8 @@
 #define WNNC_SPEC_VERSION51 0x00050001
 #define WNNC_NET_TYPE 0x00000002
 #define WNNC_DRIVER_VERSION 0x00000003
+#define WNNC_CONNECTION 0x00000006
+#define WNNC_CON_GETCONNECTIONS 0x00000004
 #define WNNC_DIALOG 0x00000008
 #define WNNC_START 0x0000000C
 #define WNNC_DLG_GETRESOURCEPARENT 0x00000200
@@ -158,6 +162,8 @@ EXPORT DWORD WINAPI NPGetCaps(DWORD index)
         return NET_TYPE;
     case WNNC_DRIVER_VERSION:
         return 1;
+    case WNNC_CONNECTION:
+        return WNNC_CON_GETCONNECTIONS;
     case WNNC_DIALOG:
         return WNNC_DLG_GETRESOURCEINFORMATION | WNNC_DLG_GETRESOURCEPARENT;
     case WNNC_START:
@@ -202,6 +208,33 @@ EXPORT DWORD WINAPI NPGetResourceInformation(LPNETRESOURCEW resource, LPVOID buf
     BOOL below = shareEnd + 1 < length;
     return Fill(buffer, size, name, shareEnd, RESOURCEDISPLAYTYPE_SHARE, RESOURCEUSAGE_CONNECTABLE, RESOURCETYPE_DISK,
         below ? name + shareEnd : NULL, below ? length - shareEnd : 0, system);
+}
+
+// The agent's drive letters for folders inside the volume are DOS devices of the user's sign-in that point to \??\UNC\VFS365\...:
+// such a letter is connected to \\VFS365\... (bufferLength in characters). WinFsp's provider answers for the drive's own letter.
+EXPORT DWORD WINAPI NPGetConnection(LPWSTR localName, LPWSTR remoteName, LPDWORD bufferLength)
+{
+    static const WCHAR Device[] = L"\\??\\UNC\\VFS365\\";
+    const int deviceLength = (int)(sizeof(Device) / sizeof(WCHAR)) - 1;
+    if (!localName || !bufferLength || lstrlenW(localName) != 2 || localName[1] != L':')
+        return WN_NOT_CONNECTED;
+    WCHAR target[MAX_PATH + 16];
+    DWORD read = QueryDosDeviceW(localName, target, MAX_PATH + 16);
+    if (read == 0 || CompareStringOrdinal(target, deviceLength, Device, deviceLength, TRUE) != CSTR_EQUAL)
+        return WN_NOT_CONNECTED;
+
+    // \??\UNC\VFS365\x becomes \\VFS365\x: the device without its first 6 characters (\??\UN), C replaced by a backslash
+    int length = lstrlenW(target) - 6;
+    if (*bufferLength < (DWORD)length + 1)
+    {
+        *bufferLength = (DWORD)length + 1;
+        return WN_MORE_DATA;
+    }
+    if (!remoteName)
+        return WN_BAD_VALUE;
+    lstrcpynW(remoteName, target + 6, length + 1);
+    remoteName[0] = L'\\';
+    return WN_SUCCESS;
 }
 
 // A share's parent is the server, the server's parent the network itself

@@ -991,9 +991,11 @@ public static class AgentCommands
             }
 
             // A new agent with the same arguments waits for this one to upload what is pending and unmount, then mounts
+            var restarting = false;
             void RestartAgent(string why)
             {
                 say($"Restarting: {why}");
+                restarting = true; // redirected folders stay where they are: the new agent takes them over
                 // Without --child (and the last crash's --restarted) the new process is a supervisor of its own; this one's ends with it
                 var arguments = Environment.GetCommandLineArgs().Skip(1)
                     .Where(a => !a.Equals(AgentSupervisor.ChildFlag, StringComparison.OrdinalIgnoreCase)).ToList();
@@ -1011,6 +1013,123 @@ public static class AgentCommands
                 }
                 Process.Start(start)?.Dispose();
                 stop.Set();
+            }
+
+            // Folder redirection and drive letters for folders (policies FolderRedirection, DriveMappings): after the mount, after each
+            // discovery (targets in libraries known only then), hourly and after resume (a letter taken, a folder moved back). One run at a time.
+            var layoutProblems = new List<string>();
+            var redirectRules = RedirectRule.Parse(settings.FolderRedirection, layoutProblems);
+            var mappings = DriveMapping.Parse(settings.DriveMappings, letter.KeepLetter ? letter.MountPoint : null, layoutProblems);
+            foreach (var problem in layoutProblems)
+            {
+                say($"Warning:    {problem}");
+            }
+            var redirection = new FolderRedirection(new ShellKnownFolders(), Path.Combine(DiscoveryStore.DataDirectory, "redirection.json"),
+                path => VolumePaths.OnVolume(path, unc, drive?.DriveLetter));
+            var letters = new SessionDriveLetters();
+            var layoutGate = new SemaphoreSlim(1, 1);
+            var layoutReported = new HashSet<string>(StringComparer.Ordinal);
+            void LayoutProblem(string problem)
+            {
+                if (layoutReported.Add(problem))
+                {
+                    say($"Warning:    {problem}");
+                    monitoring?.Error("redirection", problem);
+                }
+            }
+            async Task ApplyLayoutAsync()
+            {
+                if (redirectRules.Count == 0 && mappings.Count == 0 || drive is not { } mounted || !await layoutGate.WaitAsync(0))
+                {
+                    return;
+                }
+                try
+                {
+                    RequestPriority.MarkBackground();
+                    // The signed-in account names folders too (%UPN%, %UPNNAME%); a warm start has no token yet
+                    if (tokens.LastResult is null && redirectRules.Select(r => r.Target).Concat(mappings.Select(m => m.Target)).Any(t => t.Contains("%UPN", StringComparison.OrdinalIgnoreCase)))
+                    {
+                        try
+                        {
+                            await tokens.GetAccessTokenAsync(M365Client.GraphResource, default);
+                        }
+                        catch (Exception e) when (e is not OutOfMemoryException)
+                        {
+                        }
+                    }
+                    var upn = tokens.LastResult?.Username;
+                    var values = new Dictionary<string, string?> { ["UPN"] = upn, ["UPNNAME"] = upn?.Split('@')[0] };
+                    async Task<(string? Path, string? Problem)> Resolve(string what, string template)
+                    {
+                        var expanded = FolderTargets.Expand(template, values);
+                        var relative = expanded is null ? null : VolumePaths.Relative(expanded, unc, mounted.DriveLetter);
+                        if (relative is null)
+                        {
+                            return (null, expanded is null ? $"{what}: '{template}' names a value that isn't known (yet)"
+                                : $"{what}: '{expanded}' is not in VFS365; give a path in it, like OneDrive\\Documents");
+                        }
+                        var (path, problem) = await FolderTargets.ResolveAsync(engine, relative, create: true, default);
+                        return (path, problem is null ? null : $"{what}: {problem}");
+                    }
+
+                    foreach (var mapping in mappings)
+                    {
+                        var (path, problem) = await Resolve($"DriveMappings {mapping.Letter}", mapping.Target);
+                        if (path is not null)
+                        {
+                            var folder = VolumePaths.Windows(path, unc, null);
+                            problem = letters.Define(mapping.Letter, folder, mapping.Label, out var replaced);
+                            if (replaced is not null)
+                            {
+                                say($"Drive:      {mapping.Letter} was a SharePoint WebDAV mapping to {replaced}; it is now {folder}");
+                            }
+                        }
+                        if (problem is not null)
+                        {
+                            LayoutProblem(problem);
+                        }
+                    }
+
+                    var targets = new List<(RedirectRule, string)>();
+                    foreach (var rule in redirectRules)
+                    {
+                        var (path, problem) = await Resolve($"FolderRedirection {rule.Folder}", rule.Target);
+                        if (path is null)
+                        {
+                            LayoutProblem(problem!);
+                        }
+                        else
+                        {
+                            targets.Add((rule, VolumePaths.Windows(path, unc, mounted.DriveLetter)));
+                        }
+                    }
+                    var (done, left, moves) = redirection.Apply(targets, redirectRules);
+                    foreach (var line in done)
+                    {
+                        say($"Redirected: {line}");
+                    }
+                    foreach (var line in left)
+                    {
+                        LayoutProblem(line);
+                    }
+                    foreach (var (from, to) in moves)
+                    {
+                        var stayed = FolderRedirection.MoveContents(from, to);
+                        say($"Redirected: moved what {from} held into {to}{(stayed.Count == 0 ? "" : $", except {stayed.Count} item(s) (see the log)")}");
+                        foreach (var item in stayed.Take(20))
+                        {
+                            log($"redirection: {item}");
+                        }
+                    }
+                }
+                catch (Exception e) when (e is not OutOfMemoryException)
+                {
+                    LayoutProblem($"folder redirection and drive mappings: {e.Message}");
+                }
+                finally
+                {
+                    layoutGate.Release();
+                }
             }
 
             // Another account signed in than the one whose OneDrive this engine shows: start again cleanly; its cache goes at unmount
@@ -1074,6 +1193,7 @@ public static class AgentCommands
                             return null;
                         }
                         engine.SetLibraries(keeper.Current.Libraries);
+                        _ = Task.Run(ApplyLayoutAsync); // targets in libraries that only now are known
                         var shown = keeper.Current.Libraries.Select(l => l.Key).ToHashSet(StringComparer.OrdinalIgnoreCase);
                         foreach (var gone in before.Libraries.Where(l => l.DriveId is not null && !shown.Contains(l.Key)))
                         {
@@ -1093,7 +1213,7 @@ public static class AgentCommands
                 }
                 catch (Exception e) when (e is not OutOfMemoryException) // nothing cancels discovery: a timeout or a cancellation is a failure too
                 {
-                    return DiscoveryFailed(e.Message, e.Message, e is HttpRequestException or TaskCanceledException or TimeoutException);
+                    return DiscoveryFailed(e.Message, e.Message, PlainCause.IsNetwork(e));
                 }
                 finally
                 {
@@ -1196,7 +1316,7 @@ public static class AgentCommands
                 }
 
                 // What Windows tells Explorer about the drive: checked now and every 5 minutes, logged when it changes
-                if (DriveLetterReport.ProviderProblem(DriveLetterReport.ProviderOrder()) is { } providerProblem)
+                if (NetworkProviderOrder.Problem(NetworkProviderOrder.Current()) is { } providerProblem)
                 {
                     say($"Warning:    {providerProblem}");
                 }
@@ -1233,6 +1353,7 @@ public static class AgentCommands
                     }
                 }
                 _ = Task.Run(CheckDriveLetter);
+                _ = Task.Run(ApplyLayoutAsync);
 
                 // \\VFS365 must not resolve on the network: whoever answers gets the paths apps kept, while the drive isn't mounted
                 _ = Task.Run(async () =>
@@ -1309,6 +1430,7 @@ public static class AgentCommands
                             engine.NetworkRestored();
                             push.Sync();
                             await engine.PollActiveAsync();
+                            await ApplyLayoutAsync();
                         }
                         catch (Exception e) when (e is not OutOfMemoryException)
                         {
@@ -1434,6 +1556,10 @@ public static class AgentCommands
                             {
                                 CheckSettings();
                             }
+                            if (tick % 3600 == 1800)
+                            {
+                                _ = Task.Run(ApplyLayoutAsync);
+                            }
                             if (DateTimeOffset.UtcNow >= nextDiscovery && !refreshing)
                             {
                                 // Daily, so a PC that sleeps instead of signing out still sees new and removed libraries
@@ -1460,6 +1586,20 @@ public static class AgentCommands
 
                 stop.WaitOne();
                 powerChanged = null;
+                // Before the unmount: redirected folders go back (not on a restart: the new agent takes them over), the extra letters go
+                layoutGate.Wait(TimeSpan.FromSeconds(5));
+                try
+                {
+                    foreach (var line in restarting ? Array.Empty<string>() : redirection.RestoreAll())
+                    {
+                        say($"Redirected: {line}");
+                    }
+                    letters.RemoveAll();
+                }
+                catch (Exception e) when (e is System.Runtime.InteropServices.COMException or IOException or UnauthorizedAccessException)
+                {
+                    say($"Warning:    could not put redirected folders back or remove drive letters: {e.Message}");
+                }
                 if (navigationPane)
                 {
                     Explorer("remove the navigation pane entry", ExplorerLocation.Unregister);

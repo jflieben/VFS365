@@ -244,10 +244,10 @@ public sealed partial class DriveEngine
     }
 
     /// <summary>
-    /// The change feed or a download saw <paramref name="current"/>: another version than this engine saved or replaced is newer, so
-    /// handles on older versions no longer follow to the save.
+    /// The change feed saw <paramref name="current"/> (called by <see cref="ApplyCore"/>): another version than this engine saved or
+    /// replaced is newer, so handles on older versions no longer follow to the save.
     /// </summary>
-    internal void SeenVersion(DriveItemInfo current)
+    void SeenVersion(DriveItemInfo current)
     {
         if (saved.TryGetValue(current.Id, out var known) && (current.CTag ?? current.ETag) is { } tag && tag != (known.Item.CTag ?? known.Item.ETag)
             && !known.Replaced.Contains(tag) && tag != known.Item.ETag)
@@ -1636,17 +1636,25 @@ public sealed partial class DriveEngine
     TimeSpan RetryDelay(int failures) =>
         TimeSpan.FromTicks(Math.Min(TimeSpan.FromMinutes(15).Ticks, options.RetryInterval.Ticks << Math.Clamp(failures - 1, 0, 10)));
 
+    /// <summary>A <see cref="RemoteError.ReadOnly"/> in words, for the log and notices.</summary>
+    const string ReadOnlyCause = "SharePoint has the library read-only for now (maintenance or a site move)";
+
     /// <summary>What went wrong, in words a user or admin can act on.</summary>
     static string Short(Exception e) => e switch
     {
-        RemoteException { Error: RemoteError.ReadOnly } => "SharePoint has the library read-only for now (maintenance or a site move)",
+        RemoteException { Error: RemoteError.ReadOnly } => ReadOnlyCause,
         RemoteException { Error: RemoteError.Rejected } => $"Microsoft 365 refuses the name or the request ({e.Message})",
         _ => e.Message,
     };
 
-    /// <summary>Worth retrying: network and sign-in errors (the token source's own exceptions, timeouts) and service states that pass.</summary>
-    static bool IsTransient(Exception e) =>
-        e is RemoteException remote ? remote.Error is RemoteError.Throttled or RemoteError.Unavailable or RemoteError.ReadOnly : e is not FsException;
+    /// <summary>
+    /// Worth retrying: network and sign-in errors (the token source's own exceptions, timeouts) and service states that pass; a
+    /// read-only library only with <paramref name="readOnlyCounts"/>.
+    /// </summary>
+    static bool IsTransient(Exception e, bool readOnlyCounts = true) =>
+        e is RemoteException remote
+            ? remote.Error is RemoteError.Throttled or RemoteError.Unavailable || readOnlyCounts && remote.Error == RemoteError.ReadOnly
+            : e is not FsException;
 
     static void TryDelete(string path)
     {

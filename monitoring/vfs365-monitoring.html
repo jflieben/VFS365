@@ -83,7 +83,7 @@ select, input[type=search] { border: 1px solid var(--ring); background: var(--su
 .delta-good { color: var(--good-ink); } .delta-bad { color: var(--critical-ink); }
 .insights { margin-top: 12px; }
 .insight { display: flex; gap: 10px; align-items: flex-start; padding: 8px 0; border-top: 1px solid var(--grid); }
-.insight:first-of-type { border-top: 0; }
+.card-head + .insight { border-top: 0; }
 .insight .icon { flex: none; width: 18px; height: 18px; margin-top: 1px; }
 .insight .text { flex: 1; }
 .insight .label { font-weight: 650; margin-right: 6px; }
@@ -457,7 +457,7 @@ const deviceOf = r => String(r.DeviceName || r.EntraDeviceId || r["DeviceId"] ||
 const upnOf = new Map();
 const upnKey = r => deviceOf(r) + "|" + String(r.WindowsUser || "").toLowerCase();
 const userOf = r => r.User || upnOf.get(upnKey(r)) || r.WindowsUser || "(unknown)";
-/* Sources the agent reports, each with a fixed color (8 at most); the rarer ones (drive letter, security, agent) and unknown ones are "other" */
+/* Sources the agent reports, each with a fixed color (8 at most); the rarer ones (drive letter, security, agent, redirection) and unknown ones are "other" */
 const SOURCE_COLOR = { upload: "--s1", "conflict copy": "--s2", "sign-in": "--s3", "file system": "--s4", discovery: "--s5", start: "--s6", delete: "--s7", crash: "--s8" };
 const KNOWN_SOURCES = Object.keys(SOURCE_COLOR);
 const clip = (text, n) => { const t = String(text || ""); return t.length > n ? t.slice(0, n - 1) + "…" : t; };
@@ -698,7 +698,6 @@ function legend(series, line, always) {
   if (series.length < 2 && !always) return null;
   return h("div", { class: "legend" }, series.map(sr => h("span", {}, h("span", { class: line ? "key-line" : "key-rect", style: `background:${css(sr.color)}` }), sr.label)));
 }
-/* Columns (stacked) or lines over days, one y-axis. series: [{label, color (css var), values[]}], format(v) */
 /* "Last 30 days", or "Since 7 Oct, the first report" when monitoring began within the period */
 function periodText(m) {
   return m.firstDay && m.firstDay > localDay(m.start) ? `Since ${shortDay(m.firstDay)}, the first report` : `Last ${m.range} days`;
@@ -1047,7 +1046,7 @@ function render() {
     kpi("Error reports", fmtInt(t.errors), m.earlierData
       ? h("span", {}, h("span", { class: errorsDelta > 0 ? "delta-bad" : errorsDelta < 0 ? "delta-good" : "" }, `${errorsDelta > 0 ? "+" : ""}${fmtInt(errorsDelta)}`), ` vs the ${m.range} days before${t.crashes ? `, ${t.crashes} crash(es)` : ""}${counted}`)
       : `no earlier reports to compare${t.crashes ? `; ${t.crashes} crash(es)` : ""}${counted}`, m.days.map(d => Object.values(perDay(d).errors).reduce((a, b) => a + b, 0)),
-      "Rows in the errors table: at most 20 an hour per user, and the same error once an hour. The daily statistics count every error."),
+      "Rows in the errors table, throttling rows left out: at most 20 an hour per user, and the same error once an hour. The daily statistics count every error."),
     kpi("API requests", compact(t.graph + t.sp), `${compact(t.ru)} resource units${t.userDays ? `, ${compact(t.ru / t.userDays)} per user-day` : ""}`, m.statDays.map(d => perDay(d).graph + perDay(d).sp), "Graph and SharePoint requests; Microsoft limits resource units per app per tenant"),
     kpi("Throttled", fmtInt(th.responses), th.responses
       ? `${th.held != null ? `${duration(th.held)} held back` : `waits add up to ${duration(t.throttledSec)}`}, ${fmtInt(th.users.length)} user(s)` : "Microsoft didn't throttle",
