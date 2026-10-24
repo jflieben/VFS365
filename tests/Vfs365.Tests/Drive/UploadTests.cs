@@ -188,6 +188,84 @@ public sealed class UploadTests : IDisposable
     }
 
     [Fact]
+    public async Task A_folder_renamed_while_its_new_files_wait_to_upload_takes_them_along()
+    {
+        var engine = Create(background: true);
+        await engine.CreateAsync(Root + "docs", true, default);
+        api.Add("docs/old.txt", content: "old");
+        api.FailUpload = _ => new RemoteException(RemoteError.Unavailable, "503");
+        for (var i = 0; i < 8; i++)
+        {
+            await WriteNewAsync(engine, $"docs\\f{i}.txt", $"content {i}");
+        }
+        await engine.WaitForUploadsAsync();
+        Assert.Equal(8, engine.WaitingToUpload());
+
+        await engine.RenameAsync(Root + "docs", Root + "archive", false, default);
+        api.FailUpload = null;
+        now += TimeSpan.FromMinutes(1);
+        await engine.ProcessDueAsync(false, default);
+        await engine.WaitForUploadsAsync();
+
+        Assert.Equal(["archive", .. Enumerable.Range(0, 8).Select(i => $"archive/f{i}.txt"), "archive/old.txt"], api.Paths);
+        Assert.Equal("content 5", api.ContentOf("archive/f5.txt"));
+        Assert.Empty(engine.Unsaved());
+        var listed = await engine.ListAsync((await engine.GetEntryAsync(Root + "archive", default))!, default);
+        Assert.Equal(9, listed.Count);
+        Assert.Null(await engine.GetEntryAsync(Root + "docs\\f7.txt", default));
+    }
+
+    const int MiB = 1024 * 1024;
+
+    /// <summary>Writes a new file the way Windows' copy engine does: its size first, then front to back in 1 MiB writes.</summary>
+    async Task<byte[]> CopyInAsync(DriveEngine engine, string name, int length)
+    {
+        var data = new byte[length];
+        new Random(365).NextBytes(data);
+        var entry = await engine.CreateAsync(Root + name, false, default);
+        using var staging = File.OpenHandle(entry.StagingPath!, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite | FileShare.Delete);
+        RandomAccess.SetLength(staging, length);
+        engine.SizeSet(entry, length);
+        for (var offset = 0; offset < length; offset += MiB)
+        {
+            var chunk = Math.Min(MiB, length - offset);
+            RandomAccess.Write(staging, data.AsSpan(offset, chunk), offset);
+            engine.MarkDirty(entry);
+            await engine.WrittenAsync(entry, offset, chunk, default);
+        }
+        return data;
+    }
+
+    [Fact]
+    public async Task A_fragment_that_times_out_never_fails_a_write_and_the_file_uploads_whole()
+    {
+        var engine = Create();
+        api.FailFragment = offset => offset == 0 ? new TaskCanceledException("no progress for 60 s") : null;
+
+        var data = await CopyInAsync(engine, "copy.bin", 23 * MiB);
+        await engine.CommitAsync(Root + "copy.bin", default);
+
+        Assert.Equal(data, api.BytesOf("copy.bin"));
+        Assert.True(Assert.Single(api.Uploads).Whole);
+        Assert.Equal(1, api.CancelledSessions);
+        Assert.Empty(engine.Unsaved());
+    }
+
+    [Fact]
+    public async Task A_fragment_failing_at_the_close_uploads_the_file_whole_at_once()
+    {
+        var engine = Create();
+        api.FailFragment = offset => offset >= 20 * MiB ? new TaskCanceledException("no progress for 60 s") : null;
+
+        var data = await CopyInAsync(engine, "copy.bin", 23 * MiB);
+        await engine.CommitAsync(Root + "copy.bin", default);
+
+        Assert.Equal(data, api.BytesOf("copy.bin"));
+        Assert.True(Assert.Single(api.Uploads).Whole);
+        Assert.Equal(0, engine.WaitingToUpload());
+    }
+
+    [Fact]
     public async Task Files_created_in_a_folder_the_drive_made_need_no_lookups()
     {
         var engine = Create(background: true);

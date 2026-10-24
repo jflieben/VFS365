@@ -204,6 +204,32 @@ sealed class FakeDriveApi : IDriveApi
         return Task.FromResult(Find(path) is { } node ? node.Item with { ParentId = path.Length == 0 ? null : ParentIdOf(path) } : null);
     }
 
+    public Task<DriveItemInfo?> GetItemByIdAsync(string driveId, string itemId, CancellationToken ct)
+    {
+        Interlocked.Increment(ref GetCalls);
+        lock (nodes)
+        {
+            return Task.FromResult(nodes.GetValueOrDefault(itemId) is { } node ? node.Item with { ParentId = node.Path.Length == 0 ? null : ParentIdOf(node.Path) } : null);
+        }
+    }
+
+    /// <summary>A change made elsewhere to metadata only (a column, a label, a Document ID): a new eTag, the same cTag and content.</summary>
+    public void RemoteMetadataEdit(string path)
+    {
+        lock (nodes)
+        {
+            var node = Find(path)!;
+            node.Item = node.Item with { ETag = $"e{++version}" };
+            Changed(node);
+        }
+    }
+
+    /// <summary>Held at the start of each delete, to test what happens meanwhile.</summary>
+    public Func<Task>? BeforeDelete { get; set; }
+
+    /// <summary>Bytes SharePoint adds to each uploaded file (properties written into Office files): the item is listed this much longer.</summary>
+    public int GrowOnUpload { get; set; }
+
     /// <summary>Bytes the engine actually pulled from download streams.</summary>
     public long BytesStreamed => Interlocked.Read(ref bytesStreamed);
 
@@ -304,10 +330,17 @@ sealed class FakeDriveApi : IDriveApi
         return Task.FromResult(session);
     }
 
+    /// <summary>Fails fragments by their offset (a timeout, a dropped connection).</summary>
+    public Func<long, Exception?>? FailFragment { get; set; }
+
     public async Task<DriveItemInfo?> UploadFragmentAsync(UploadSession session, string sourceFile, long offset, long length, long totalSize, CancellationToken ct)
     {
         Interlocked.Increment(ref Fragments);
         await Task.Delay(5, ct);
+        if (FailFragment?.Invoke(offset) is { } failure)
+        {
+            throw failure;
+        }
         var bytes = new byte[length];
         using (var file = File.OpenHandle(sourceFile, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
         {
@@ -363,7 +396,7 @@ sealed class FakeDriveApi : IDriveApi
                 throw new RemoteException(RemoteError.Conflict, "412 eTag mismatch");
             }
             node.Content = bytes;
-            node.Item = node.Item with { Size = bytes.Length, ETag = $"e{++version}", CTag = $"c{version}" };
+            node.Item = node.Item with { Size = bytes.Length + GrowOnUpload, ETag = $"e{++version}", CTag = $"c{version}" };
             Changed(node);
             Uploads.Add((id, node.Item.Name, target.IfMatch, whole));
             return node.Item;
@@ -390,36 +423,45 @@ sealed class FakeDriveApi : IDriveApi
     public Task<DriveItemInfo> MoveAsync(string driveId, string itemId, string newParentId, string newName, CancellationToken ct)
     {
         Interlocked.Increment(ref Moves);
-        var node = nodes[itemId];
-        var newPath = Join(nodes[newParentId].Path, newName);
-        if (Find(newPath) is { } other && other != node)
+        lock (nodes)
         {
-            throw new RemoteException(RemoteError.Conflict, "409 nameAlreadyExists");
+            var node = nodes[itemId];
+            var newPath = Join(nodes[newParentId].Path, newName);
+            if (Find(newPath) is { } other && other != node)
+            {
+                throw new RemoteException(RemoteError.Conflict, "409 nameAlreadyExists");
+            }
+            foreach (var child in nodes.Values.Where(n => n.Path.StartsWith(node.Path + "/", StringComparison.OrdinalIgnoreCase)))
+            {
+                child.Path = newPath + child.Path[node.Path.Length..];
+            }
+            node.Path = newPath;
+            node.Item = node.Item with { Name = newName, ETag = $"e{++version}" };
+            Changed(node);
+            return Task.FromResult(node.Item);
         }
-        foreach (var child in nodes.Values.Where(n => n.Path.StartsWith(node.Path + "/", StringComparison.OrdinalIgnoreCase)))
-        {
-            child.Path = newPath + child.Path[node.Path.Length..];
-        }
-        node.Path = newPath;
-        node.Item = node.Item with { Name = newName, ETag = $"e{++version}" };
-        Changed(node);
-        return Task.FromResult(node.Item);
     }
 
-    public Task DeleteAsync(string driveId, string itemId, CancellationToken ct)
+    public async Task DeleteAsync(string driveId, string itemId, CancellationToken ct)
     {
+        if (BeforeDelete is { } hold)
+        {
+            await hold();
+        }
         if (FailDelete?.Invoke(itemId) is { } refused)
         {
             throw refused;
         }
         Interlocked.Increment(ref Deletes);
-        var node = nodes.GetValueOrDefault(itemId) ?? throw new RemoteException(RemoteError.NotFound, "404 itemNotFound");
-        foreach (var key in nodes.Where(n => n.Value == node || n.Value.Path.StartsWith(node.Path + "/", StringComparison.OrdinalIgnoreCase)).Select(n => n.Key).ToList())
+        lock (nodes)
         {
-            Changed(nodes[key], deleted: true);
-            nodes.Remove(key);
+            var node = nodes.GetValueOrDefault(itemId) ?? throw new RemoteException(RemoteError.NotFound, "404 itemNotFound");
+            foreach (var key in nodes.Where(n => n.Value == node || n.Value.Path.StartsWith(node.Path + "/", StringComparison.OrdinalIgnoreCase)).Select(n => n.Key).ToList())
+            {
+                Changed(nodes[key], deleted: true);
+                nodes.Remove(key);
+            }
         }
-        return Task.CompletedTask;
     }
 
     Node? Find(string path)

@@ -44,7 +44,10 @@ public sealed record DeltaPage(IReadOnlyList<DriveChange> Changes, string? NextL
 /// <summary>Upload into an existing item (keeps its ID, versions and sharing) or as a new file that must not exist yet.</summary>
 public sealed record UploadTarget(string? ItemId, string? IfMatch, string? ParentPath, string? Name)
 {
-    public static UploadTarget Existing(DriveItemInfo item) => new(item.Id, item.ETag, null, null);
+    /// <summary>The cTag of the version the upload replaces: before the last fragment of a session, an item with other content fails it.</summary>
+    public string? ContentTag { get; init; }
+
+    public static UploadTarget Existing(DriveItemInfo item) => new(item.Id, item.ETag, null, null) { ContentTag = item.CTag };
 
     public static UploadTarget New(string parentPath, string name) => new(null, null, parentPath, name);
 }
@@ -54,8 +57,15 @@ public sealed record UploadSession(Uri UploadUrl)
 {
     public const int FragmentSize = 16 * 320 * 1024; // 5 MiB
 
+    /// <summary>Fragments are multiples of this, except the last.</summary>
+    public const int FragmentUnit = 320 * 1024;
+
     /// <summary>Smaller files go up in one request.</summary>
     public const long SimpleUploadLimit = 4 * 1024 * 1024;
+
+    /// <summary>Where the session uploads to, for the check before its last fragment.</summary>
+    public string? DriveId { get; init; }
+    public UploadTarget? Target { get; init; }
 }
 
 /// <summary>Drive calls the engine needs. Paths are relative to the drive root, '/'-separated, "" for the root. Implemented in Vfs365.Graph.</summary>
@@ -73,6 +83,9 @@ public interface IDriveApi
     /// <summary>Null when nothing exists at the path. "" returns the root folder.</summary>
     Task<DriveItemInfo?> GetItemAsync(string driveId, string path, CancellationToken ct);
 
+    /// <summary>The item as it is now, wherever it is; null when it was deleted.</summary>
+    Task<DriveItemInfo?> GetItemByIdAsync(string driveId, string itemId, CancellationToken ct);
+
     /// <summary>
     /// Content from <paramref name="offset"/> to the end, as it arrives, of the version <paramref name="contentTag"/> names (null: any).
     /// Throws <see cref="ContentChangedException"/> when the item now holds another version (<see cref="ContentTags.Differs"/>) or the
@@ -85,7 +98,10 @@ public interface IDriveApi
 
     Task<UploadSession> CreateUploadSessionAsync(string driveId, UploadTarget target, CancellationToken ct);
 
-    /// <summary>Uploads bytes [offset, offset + length) of the file; returns the item after the last fragment.</summary>
+    /// <summary>
+    /// Uploads bytes [offset, offset + length) of the file; returns the item after the last fragment. Before the last one an item
+    /// whose content changed since the session began fails it (Conflict; NotFound when deleted).
+    /// </summary>
     Task<DriveItemInfo?> UploadFragmentAsync(UploadSession session, string sourceFile, long offset, long length, long totalSize, CancellationToken ct);
 
     Task CancelUploadSessionAsync(UploadSession session, CancellationToken ct);

@@ -96,10 +96,13 @@ sealed class Tray : IDisposable
         set => actions = value;
     }
 
-    /// <summary>A notification; a click on it runs <paramref name="clicked"/>.</summary>
+    /// <summary>
+    /// A notification; a click on it runs <paramref name="clicked"/>. Windows doesn't say which notification was clicked, so one without
+    /// an action of its own keeps the last one's while a sign-in is still needed: a later toast never takes Sign in away.
+    /// </summary>
     public void Notify(string title, string text, Action? clicked = null)
     {
-        notificationClicked = clicked;
+        notificationClicked = clicked ?? (actions.SignInNeeded?.Invoke() == true ? notificationClicked : null);
         var data = Data(NifInfo);
         data.szInfoTitle = Trim(title, 63);
         data.szInfo = Trim(text, 255);

@@ -31,7 +31,7 @@ public sealed class DiscoveryService(ISharePointDiscoveryApi api, DiscoveryOptio
         }
         tenantId ??= previous?.TenantId;
 
-        var (hits, searchError) = await SearchAsync(tenantRoot, ct);
+        var (hits, searchError, searchNote) = await SearchAsync(tenantRoot, ct);
         var sameRules = previous?.RulesVersion == LibraryRules.Version;
         var now = options.Clock();
         var metadataAt = previous?.MetadataAt ?? default;
@@ -127,7 +127,28 @@ public sealed class DiscoveryService(ISharePointDiscoveryApi api, DiscoveryOptio
                 .Select(p => p.WebUrl));
         }
 
+        // A site that fails, a timeout included, is that site's error: its libraries keep their last entries and the other sites go on.
+        // Failures are told from cancellation by the caller's token, not by the exception's type.
         await Parallel.ForEachAsync(plans, new ParallelOptions { MaxDegreeOfParallelism = options.MaxParallelSites, CancellationToken = ct }, async (plan, token) =>
+        {
+            try
+            {
+                await ReadSiteAsync(plan, token);
+            }
+            catch (Exception e) when (!ct.IsCancellationRequested)
+            {
+                foreach (var library in plan.New.Concat(plan.Expired))
+                {
+                    errors.Add(SkippedLibrary.For(library, $"Site: {e.Message}"));
+                }
+                foreach (var library in plan.Fresh)
+                {
+                    Reuse(library, plan.Template);
+                }
+            }
+        });
+
+        async Task ReadSiteAsync(SitePlan plan, CancellationToken token)
         {
             var due = deferred.Contains(plan.WebUrl) ? plan.New : [.. plan.New, .. plan.Expired];
             if (due.Count == 0)
@@ -144,7 +165,7 @@ public sealed class DiscoveryService(ISharePointDiscoveryApi api, DiscoveryOptio
             {
                 siteMetadata = await api.GetSiteAsync(plan.WebUrl, token);
             }
-            catch (Exception e) when (e is not OperationCanceledException)
+            catch (Exception e) when (!ct.IsCancellationRequested)
             {
                 foreach (var library in due)
                 {
@@ -174,7 +195,7 @@ public sealed class DiscoveryService(ISharePointDiscoveryApi api, DiscoveryOptio
                         }
                     }
                 }
-                catch (Exception e) when (e is not OperationCanceledException)
+                catch (Exception) when (!ct.IsCancellationRequested)
                 {
                 }
             }
@@ -198,7 +219,7 @@ public sealed class DiscoveryService(ISharePointDiscoveryApi api, DiscoveryOptio
                             list = await api.GetListAsync(library.SiteCollectionUrl, library.ListId, token);
                         }
                     }
-                    catch (Exception e) when (e is not OperationCanceledException)
+                    catch (Exception e) when (!ct.IsCancellationRequested)
                     {
                         errors.Add(SkippedLibrary.For(library, $"Library: {e.Message}"));
                         continue;
@@ -231,7 +252,7 @@ public sealed class DiscoveryService(ISharePointDiscoveryApi api, DiscoveryOptio
                 found.Add(new LibraryEntry(library.Key, library.SiteId, library.WebId, library.ListId, plan.WebUrl, library.SiteTitle, title, readOnly, list.ItemCount,
                     knownDrives.GetValueOrDefault(library.Key), list.InternalName, checkedAt, plan.Template));
             }
-        });
+        }
 
         // Pinned locations (admin policy, user pins): shown whatever search finds; site patterns don't apply
         var pinned = new Dictionary<string, IReadOnlyList<string>>(StringComparer.OrdinalIgnoreCase);
@@ -292,7 +313,7 @@ public sealed class DiscoveryService(ISharePointDiscoveryApi api, DiscoveryOptio
                 }
                 pinned[url] = keys;
             }
-            catch (Exception e) when (e is not OperationCanceledException)
+            catch (Exception e) when (!ct.IsCancellationRequested)
             {
                 // Its libraries from the last run stay, like any library that fails a run
                 foreach (var key in (IEnumerable<string>?)knownKeys ?? [$"pinned|{url}"])
@@ -320,7 +341,9 @@ public sealed class DiscoveryService(ISharePointDiscoveryApi api, DiscoveryOptio
             .OrderBy(library => library.SiteTitle, StringComparer.OrdinalIgnoreCase)
             .ThenBy(library => library.LibraryTitle, StringComparer.OrdinalIgnoreCase)
             .ToList();
-        var state = new DiscoveryState(now, tenantRoot, visible, new Dictionary<string, string>(staticExclusions), LibraryRules.Version, oneDrive,
+        // A failed search keeps the time of the last run whose search completed, so a restart doesn't take this run as a recent one
+        var runAt = searchError is null ? now : previous?.RunAt ?? DateTimeOffset.MinValue;
+        var state = new DiscoveryState(runAt, tenantRoot, visible, new Dictionary<string, string>(staticExclusions), LibraryRules.Version, oneDrive,
             visible.Count == 0 ? now : visible.Min(l => l.CheckedAt ?? now), previous?.TenantHint, pinned, tenantId, reconciliation.Misses,
             new Dictionary<string, CheckedExclusion>(exclusions), emptyPins);
 
@@ -333,7 +356,8 @@ public sealed class DiscoveryService(ISharePointDiscoveryApi api, DiscoveryOptio
             hits.Count,
             searchError,
             reconciliation.HidingSkippedReason,
-            state);
+            state,
+            searchNote);
     }
 
     /// <summary>By tenant ID when both sides have one, else by SharePoint root.</summary>
@@ -355,12 +379,18 @@ public sealed class DiscoveryService(ISharePointDiscoveryApi api, DiscoveryOptio
 
     /// <summary>
     /// All pages, in DocId order: each page starts after the last DocId of the one before (Microsoft's advice for deep paging; stable
-    /// while the index changes). A page without DocIds continues the same query by row number.
+    /// while the index changes). A page without DocIds continues the same query by row number. When the DocIds don't hold up (out of
+    /// order, before the last page's, seen before, or from more than one geo), pages after a DocId could skip rows: search goes on by
+    /// row number of the plain query, from the start if it had paged by DocId, and Note says so. Error: why the hits are incomplete,
+    /// when they are (a failed page included).
     /// </summary>
-    async Task<(List<DiscoveredLibrary> Hits, string? Error)> SearchAsync(string tenantRoot, CancellationToken ct)
+    async Task<(List<DiscoveredLibrary> Hits, string? Error, string? Note)> SearchAsync(string tenantRoot, CancellationToken ct)
     {
         var hits = new List<DiscoveredLibrary>();
+        var seen = new HashSet<long>();
+        var geos = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var (afterDocId, startRow) = (0L, 0);
+        string? note = null;
         for (var pages = 1; ; pages++)
         {
             SearchPage page;
@@ -368,21 +398,33 @@ public sealed class DiscoveryService(ISharePointDiscoveryApi api, DiscoveryOptio
             {
                 page = await api.SearchDocumentLibrariesAsync(tenantRoot, afterDocId, startRow, SearchPageSize, ct);
             }
-            catch (Exception e) when (e is not OperationCanceledException)
+            catch (Exception e) when (!ct.IsCancellationRequested)
             {
-                return (hits, $"Search failed after {hits.Count} rows: {e.Message}");
+                return (hits, $"Search failed after {hits.Count} rows: {e.Message}", note);
             }
 
             hits.AddRange(page.Libraries);
-            if (page.RowCount < SearchPageSize)
+            var restart = false;
+            if (note is null && DocIdProblem(page, afterDocId, seen, geos) is { } problem)
             {
-                return (hits, null);
+                // Row numbers of the plain query from now on; it starts over unless this page already was the plain query
+                note = $"Search paged by row number: {problem} on page {pages}";
+                restart = afterDocId > 0;
+            }
+            if (page.RowCount < SearchPageSize && !restart)
+            {
+                return (hits, null, note);
             }
             if (pages == MaxSearchPages)
             {
-                return (hits, $"Search stopped after {pages} pages");
+                return (hits, $"Search stopped after {pages} pages", note);
             }
-            if (page.LastDocId is { } last && last > afterDocId)
+            if (restart)
+            {
+                hits.Clear();
+                (afterDocId, startRow) = (0, 0);
+            }
+            else if (note is null && page.LastDocId is { } last && last > afterDocId)
             {
                 (afterDocId, startRow) = (last, 0);
             }
@@ -391,5 +433,29 @@ public sealed class DiscoveryService(ISharePointDiscoveryApi api, DiscoveryOptio
                 startRow += SearchPageSize;
             }
         }
+    }
+
+    /// <summary>Why paging after this page's last DocId could skip rows; null when its DocIds rise, follow <paramref name="afterDocId"/> and are new.</summary>
+    static string? DocIdProblem(SearchPage page, long afterDocId, HashSet<long> seen, HashSet<string> geos)
+    {
+        var previous = afterDocId;
+        foreach (var docId in page.DocIds ?? (page.LastDocId is { } last ? [last] : []))
+        {
+            if (docId is not { } id)
+            {
+                continue;
+            }
+            if (!seen.Add(id))
+            {
+                return $"DocId {id} twice";
+            }
+            if (id <= previous)
+            {
+                return $"DocId {id} after {previous}";
+            }
+            previous = id;
+        }
+        geos.UnionWith(page.Geos ?? []);
+        return geos.Count > 1 ? "results from several geos" : null;
     }
 }

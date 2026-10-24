@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Net;
 using System.Net.Http.Headers;
+using System.Runtime.ExceptionServices;
 using System.Text.Json;
 using Vfs365.Core;
 
@@ -14,6 +15,7 @@ public sealed class M365RequestException(HttpStatusCode status, Uri uri, string 
     static RemoteError ToError(HttpStatusCode status, string detail) => (int)status switch
     {
         _ when detail.Contains("\"serviceReadOnly\"", StringComparison.OrdinalIgnoreCase) => RemoteError.ReadOnly,
+        400 => RemoteError.Rejected,
         404 => RemoteError.NotFound,
         410 => RemoteError.Gone,
         401 or 403 => RemoteError.AccessDenied,
@@ -25,8 +27,11 @@ public sealed class M365RequestException(HttpStatusCode status, Uri uri, string 
     };
 }
 
-/// <summary>A throttled response: when, its status (429 or 503), how long requests now wait, and what kind of request it was.</summary>
-public sealed record ThrottleNotice(DateTimeOffset At, int Status, TimeSpan Pause, bool Graph, bool Background);
+/// <summary>
+/// A throttled response: when, its status (429 or 503), how long requests now wait, and what kind of request it was. BackgroundPause:
+/// how long background requests now wait (<see cref="M365Client.ThrottlePause"/> with its jitter, at least Pause).
+/// </summary>
+public sealed record ThrottleNotice(DateTimeOffset At, int Status, TimeSpan Pause, bool Graph, bool Background, TimeSpan BackgroundPause = default);
 /// <summary>What a client did since it started, for statistics.</summary>
 public readonly record struct ClientUsage(long GraphRequests, long SharePointRequests, long ResourceUnits, long BytesReceived, long BytesSent,
     long Throttled, long ThrottledSeconds, long BudgetWaitForegroundSeconds, long BudgetWaitBackgroundSeconds)
@@ -44,13 +49,16 @@ public readonly record struct ClientUsage(long GraphRequests, long SharePointReq
 /// </summary>
 /// <remarks>
 /// Retries: reads (GET, HEAD) on 429, 503, 500, 502 and 504; writes only on 429 and 503 with Retry-After (the request wasn't run),
-/// since a write that failed with a 5xx may have been committed. Pauses and backoff get 0 to 50% random extra, so a tenant's agents
-/// don't come back at the same moment.
+/// since a write that failed with a 5xx may have been committed. Upload session fragments are retried by DriveApi, from the range the
+/// session expects next. Pauses and backoff get 0 to 50% random extra, so a tenant's agents don't come back at the same moment.
+/// Timeouts are this client's (the agent's HttpClient has none): <see cref="HeaderTimeout"/> and <see cref="StallTimeout"/>. They fail
+/// like HttpClient's own, as a TaskCanceledException while the caller's token is not cancelled.
 /// </remarks>
 public sealed class M365Client(HttpClient http, ITokenSource tokens, RequestBudget? budget = null)
 {
     public const string GraphResource = "https://graph.microsoft.com";
     const int MaxAttempts = 5;
+    static readonly TimeSpan MinRetryAfter = TimeSpan.FromSeconds(1);
     static readonly TimeSpan MaxRetryAfter = TimeSpan.FromMinutes(5);
     static readonly TimeSpan ForegroundRelease = TimeSpan.FromMilliseconds(100), BackgroundRelease = TimeSpan.FromMilliseconds(500);
 
@@ -83,6 +91,15 @@ public sealed class M365Client(HttpClient http, ITokenSource tokens, RequestBudg
 
     /// <summary>After a 429 or 503, background requests (<see cref="RequestPriority"/>) wait this long; foreground ones only for Retry-After.</summary>
     public TimeSpan ThrottlePause { get; set; } = TimeSpan.FromMinutes(15);
+
+    /// <summary>Response headers must arrive this long after a request is sent (a request body: after its last byte).</summary>
+    public TimeSpan HeaderTimeout { get; init; } = TimeSpan.FromSeconds(100);
+
+    /// <summary>
+    /// A read of a response body that gets nothing this long fails, and so does a request body that makes no progress this long: a dead
+    /// connection ends, a slow one that moves goes on however long it takes. Only time spent in a read counts.
+    /// </summary>
+    public TimeSpan StallTimeout { get; init; } = TimeSpan.FromSeconds(60);
 
     public long GraphRequests => Interlocked.Read(ref graphRequests);
 
@@ -137,9 +154,12 @@ public sealed class M365Client(HttpClient http, ITokenSource tokens, RequestBudg
         {
             return null;
         }
-        await using var stream = new CountingStream(await response.Content.ReadAsStreamAsync(ct), Received);
+        await using var stream = await BodyAsync(response, uri, ct);
         return await JsonDocument.ParseAsync(stream, cancellationToken: ct);
     }
+
+    async Task<Stream> BodyAsync(HttpResponseMessage response, Uri uri, CancellationToken ct) =>
+        new BodyStream(await response.Content.ReadAsStreamAsync(ct), Received, StallTimeout, uri.Host);
 
     /// <summary>
     /// Content from <paramref name="offset"/> to the end as a stream; dispose it to end the request. For pre-authenticated download URLs.
@@ -153,7 +173,7 @@ public sealed class M365Client(HttpClient http, ITokenSource tokens, RequestBudg
         {
             var partial = response.StatusCode == HttpStatusCode.PartialContent;
             var total = partial ? response.Content.Headers.ContentRange?.Length : response.Content.Headers.ContentLength;
-            var stream = new CountingStream(await response.Content.ReadAsStreamAsync(ct), Received);
+            var stream = await BodyAsync(response, uri, ct);
             if (offset > 0 && !partial && total <= offset)
             {
                 return (new ResponseStream(response, stream), total); // shorter than the offset: the caller sees Total
@@ -203,8 +223,9 @@ public sealed class M365Client(HttpClient http, ITokenSource tokens, RequestBudg
                 await WaitWhilePausedAsync(priority, ct); // a pause that began while this waited for the budget
             }
             Interlocked.Add(ref resourceUnits, cost);
-            using var request = new HttpRequestMessage(method, uri) { Content = content?.Invoke() };
-            Interlocked.Add(ref bytesSent, request.Content?.Headers.ContentLength ?? 0);
+            var body = content?.Invoke();
+            using var request = new HttpRequestMessage(method, uri);
+            Interlocked.Add(ref bytesSent, body?.Headers.ContentLength ?? 0);
             if (authenticate)
             {
                 var token = claims is null ? await tokens.GetAccessTokenAsync(resource, ct) : await tokens.GetAccessTokenAsync(resource, claims, ct);
@@ -230,7 +251,34 @@ public sealed class M365Client(HttpClient http, ITokenSource tokens, RequestBudg
             }
 
             var stopwatch = Stopwatch.StartNew();
-            var response = await http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, ct);
+            HttpResponseMessage response = null!;
+            ExceptionDispatchInfo? failed = null;
+            using (var deadline = new Deadline(ct, HeaderTimeout))
+            {
+                ProgressContent? progress = null;
+                if (body is not null)
+                {
+                    // Each write of the body sets the stall timeout again; the header timeout starts after the last
+                    request.Content = progress = new ProgressContent(body, () => deadline.Extend(StallTimeout), () => deadline.Extend(HeaderTimeout));
+                }
+                try
+                {
+                    response = await http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, deadline.Token);
+                }
+                catch (Exception e) when (!ct.IsCancellationRequested && e is OperationCanceledException or HttpRequestException)
+                {
+                    failed = ExceptionDispatchInfo.Capture(e is OperationCanceledException
+                        ? new TaskCanceledException(progress is { Sent: false }
+                            ? $"{method.Method} {uri.Host}{uri.AbsolutePath}: sending made no progress for {StallTimeout.TotalSeconds:N0} s (timed out)"
+                            : $"{method.Method} {uri.Host}{uri.AbsolutePath}: no answer within {HeaderTimeout.TotalSeconds:N0} s (timed out)", new TimeoutException())
+                        : e);
+                }
+            }
+            if (failed is not null)
+            {
+                Log?.Invoke($"{(failed.SourceException is TaskCanceledException ? "timeout" : "failed")} {method.Method} {uri.Host}{uri.AbsolutePath} {stopwatch.ElapsedMilliseconds} ms");
+                failed.Throw();
+            }
             Log?.Invoke($"{(int)response.StatusCode} {method.Method} {uri.Host}{uri.AbsolutePath} {stopwatch.ElapsedMilliseconds} ms");
             if (authenticate && HeaderNumber(response, "x-ms-resource-unit") is { } charged && charged != cost)
             {
@@ -267,8 +315,9 @@ public sealed class M365Client(HttpClient http, ITokenSource tokens, RequestBudg
                     LastThrottled = Clock();
                     Interlocked.Increment(ref throttledResponses);
                     Interlocked.Add(ref throttledTicks, pause.Ticks);
-                    Pause(pause, ThrottlePause > pause ? Jitter(ThrottlePause) : pause);
-                    Throttled?.Invoke(new ThrottleNotice(LastThrottled, status, pause, isGraph, priority?.IsBackground ?? false));
+                    var backgroundPause = ThrottlePause > pause ? Jitter(ThrottlePause) : pause;
+                    Pause(pause, backgroundPause);
+                    Throttled?.Invoke(new ThrottleNotice(LastThrottled, status, pause, isGraph, priority?.IsBackground ?? false, backgroundPause));
                 }
                 var retry = attempt < MaxAttempts && (throttled ? readOnly || retryAfter is not null : readOnly && status is 500 or 502 or 504);
                 if (!retry)
@@ -368,7 +417,10 @@ public sealed class M365Client(HttpClient http, ITokenSource tokens, RequestBudg
             && System.Text.RegularExpressions.Regex.Match(value, @"^\s*(\d+)") is { Success: true } match && long.TryParse(match.Groups[1].Value, out var number)
             ? number : null;
 
-    /// <summary>Retry-After as a delay from <paramref name="now"/>, between 0 and 5 minutes; null when the response has none.</summary>
+    /// <summary>
+    /// Retry-After as a delay from <paramref name="now"/>, between 1 second and 5 minutes (0 or a date in the past would retry back to
+    /// back); null when the response has none.
+    /// </summary>
     public static TimeSpan? RetryAfter(HttpResponseMessage response, DateTimeOffset now)
     {
         var delay = response.Headers.RetryAfter switch
@@ -377,7 +429,7 @@ public sealed class M365Client(HttpClient http, ITokenSource tokens, RequestBudg
             { Date: { } date } => date - now,
             _ => (TimeSpan?)null,
         };
-        return delay is { } value ? TimeSpan.FromTicks(Math.Clamp(value.Ticks, 0, MaxRetryAfter.Ticks)) : null;
+        return delay is { } value ? TimeSpan.FromTicks(Math.Clamp(value.Ticks, MinRetryAfter.Ticks, MaxRetryAfter.Ticks)) : null;
     }
 
     /// <summary>
@@ -427,15 +479,28 @@ public sealed class M365Client(HttpClient http, ITokenSource tokens, RequestBudg
         return null;
     }
 
-    static async Task<string> ReadDetailAsync(HttpResponseMessage response, CancellationToken ct)
+    /// <summary>The start of an error response's body; a body that doesn't arrive leaves the status to speak for itself.</summary>
+    async Task<string> ReadDetailAsync(HttpResponseMessage response, CancellationToken ct)
     {
-        var body = await response.Content.ReadAsStringAsync(ct);
-        return body.Length > 300 ? body[..300] : body;
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        deadline.CancelAfter(StallTimeout);
+        try
+        {
+            var body = await response.Content.ReadAsStringAsync(deadline.Token);
+            return body.Length > 300 ? body[..300] : body;
+        }
+        catch (Exception e) when (!ct.IsCancellationRequested && e is OperationCanceledException or HttpRequestException or IOException)
+        {
+            return $"(no details: {e.Message})";
+        }
     }
 }
 
-/// <summary>Reports how many bytes were read through it.</summary>
-sealed class CountingStream(Stream inner, Action<long> counted) : Stream
+/// <summary>
+/// A response body: reports how many bytes were read through it, and a read that gets nothing for <paramref name="stall"/> fails
+/// with a TaskCanceledException (a timeout), however long the whole body takes.
+/// </summary>
+sealed class BodyStream(Stream inner, Action<long> counted, TimeSpan stall, string host) : Stream
 {
     public override bool CanRead => true;
     public override bool CanSeek => false;
@@ -443,9 +508,23 @@ sealed class CountingStream(Stream inner, Action<long> counted) : Stream
     public override long Length => throw new NotSupportedException();
     public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
 
-    public override int Read(byte[] buffer, int offset, int count) => Count(inner.Read(buffer, offset, count));
+    public override int Read(byte[] buffer, int offset, int count) => ReadAsync(buffer.AsMemory(offset, count)).AsTask().GetAwaiter().GetResult();
 
-    public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken ct = default) => Count(await inner.ReadAsync(buffer, ct));
+    public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken ct = default)
+    {
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        deadline.CancelAfter(stall);
+        try
+        {
+            var read = await inner.ReadAsync(buffer, deadline.Token);
+            counted(read);
+            return read;
+        }
+        catch (OperationCanceledException e) when (!ct.IsCancellationRequested)
+        {
+            throw new TaskCanceledException($"{host}: no data for {stall.TotalSeconds:N0} s (timed out)", new TimeoutException(e.Message));
+        }
+    }
 
     public override Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken ct) => ReadAsync(buffer.AsMemory(offset, count), ct).AsTask();
 
@@ -453,12 +532,6 @@ sealed class CountingStream(Stream inner, Action<long> counted) : Stream
     public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
     public override void SetLength(long value) => throw new NotSupportedException();
     public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
-
-    int Count(int read)
-    {
-        counted(read);
-        return read;
-    }
 
     protected override void Dispose(bool disposing)
     {
@@ -471,8 +544,11 @@ sealed class CountingStream(Stream inner, Action<long> counted) : Stream
 }
 
 /// <summary>A response body that ends its request when disposed.</summary>
-sealed class ResponseStream(HttpResponseMessage response, Stream inner) : Stream
+sealed class ResponseStream(HttpResponseMessage response, Stream inner) : Stream, IServedVersion
 {
+    /// <summary>The response's ETag, when the server sent one.</summary>
+    public string? ETag => response.Headers.ETag?.Tag;
+
     public override bool CanRead => true;
     public override bool CanSeek => false;
     public override bool CanWrite => false;
@@ -480,6 +556,7 @@ sealed class ResponseStream(HttpResponseMessage response, Stream inner) : Stream
     public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
     public override int Read(byte[] buffer, int offset, int count) => inner.Read(buffer, offset, count);
     public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken ct = default) => inner.ReadAsync(buffer, ct);
+    public override Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken ct) => inner.ReadAsync(buffer, offset, count, ct);
     public override void Flush() { }
     public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
     public override void SetLength(long value) => throw new NotSupportedException();
@@ -491,6 +568,94 @@ sealed class ResponseStream(HttpResponseMessage response, Stream inner) : Stream
         {
             inner.Dispose();
             response.Dispose();
+        }
+        base.Dispose(disposing);
+    }
+}
+
+/// <summary>A token that cancels when the time set last runs out. Disposing it ends it without cancelling; later extensions do nothing.</summary>
+sealed class Deadline : IDisposable
+{
+    readonly CancellationTokenSource source;
+    readonly Lock gate = new();
+    bool disposed;
+
+    public Deadline(CancellationToken ct, TimeSpan after)
+    {
+        source = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        source.CancelAfter(after);
+    }
+
+    public CancellationToken Token => source.Token;
+
+    public void Extend(TimeSpan after)
+    {
+        lock (gate)
+        {
+            if (!disposed)
+            {
+                source.CancelAfter(after);
+            }
+        }
+    }
+
+    public void Dispose()
+    {
+        lock (gate)
+        {
+            disposed = true;
+        }
+        source.Dispose();
+    }
+}
+
+/// <summary>A request body sent in small writes: <c>progressed</c> after each, <c>sent</c> after the last.</summary>
+sealed class ProgressContent : HttpContent
+{
+    const int Chunk = 16 * 1024;
+    readonly HttpContent inner;
+    readonly Action progressed;
+    readonly Action sent;
+
+    public ProgressContent(HttpContent inner, Action progressed, Action sent)
+    {
+        (this.inner, this.progressed, this.sent) = (inner, progressed, sent);
+        foreach (var header in inner.Headers.Where(h => !h.Key.Equals("Content-Length", StringComparison.OrdinalIgnoreCase)))
+        {
+            Headers.TryAddWithoutValidation(header.Key, header.Value);
+        }
+    }
+
+    /// <summary>Whether the whole body was written.</summary>
+    public bool Sent { get; private set; }
+
+    protected override Task SerializeToStreamAsync(Stream stream, TransportContext? context) => SerializeToStreamAsync(stream, context, CancellationToken.None);
+
+    protected override async Task SerializeToStreamAsync(Stream stream, TransportContext? context, CancellationToken ct)
+    {
+        await using var source = await inner.ReadAsStreamAsync(ct);
+        var buffer = new byte[Chunk];
+        int read;
+        while ((read = await source.ReadAsync(buffer, ct)) > 0)
+        {
+            await stream.WriteAsync(buffer.AsMemory(0, read), ct);
+            progressed();
+        }
+        Sent = true;
+        sent();
+    }
+
+    protected override bool TryComputeLength(out long length)
+    {
+        length = inner.Headers.ContentLength ?? -1;
+        return length >= 0;
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing)
+        {
+            inner.Dispose();
         }
         base.Dispose(disposing);
     }

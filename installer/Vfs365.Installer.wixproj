@@ -11,12 +11,19 @@
     <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
     <!-- The setup project in bundle\ leaves .wxl files in its obj folder; they must not be globbed into the MSI -->
     <DefaultItemExcludes>$(DefaultItemExcludes);bundle\**</DefaultItemExcludes>
-    <!-- These expect Start menu shortcuts in the user's profile with an HKCU key path; this per-machine package uses the all-users one -->
-    <SuppressIces>ICE38;ICE43;ICE57</SuppressIces>
+    <!-- ICE38, 43, 57 expect Start menu shortcuts in the user's profile with an HKCU key path; this per-machine package uses the all-users
+         one. ICE61: same-version upgrades are on purpose. ICE63: the only action before RemoveExistingProducts is the rollback restart
+         of agents, which must be there to run after the older version is put back. -->
+    <SuppressIces>ICE38;ICE43;ICE57;ICE61;ICE63</SuppressIces>
   </PropertyGroup>
 
   <ItemGroup>
     <Compile Include="Package.wxs" />
+  </ItemGroup>
+
+  <!-- WixQuietExec runs the custom actions without a console window -->
+  <ItemGroup>
+    <PackageReference Include="WixToolset.Util.wixext" Version="5.0.2" />
   </ItemGroup>
 
   <!-- Signing: build.ps1 passes SignOutput=true when signing is configured and signs through its sign task. The cab is embedded. -->

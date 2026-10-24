@@ -14,6 +14,7 @@ public sealed class ReadOnlyLibraryTests : IDisposable
     readonly List<string> log = [];
     readonly List<EngineNotice> notices = [];
     DateTimeOffset now = new(2026, 10, 7, 13, 0, 0, TimeSpan.Zero);
+    double random = 0.5; // no jitter
 
     const string Root = "\\OneDrive\\";
 
@@ -25,6 +26,7 @@ public sealed class ReadOnlyLibraryTests : IDisposable
             {
                 StagingDirectory = Path.Combine(directory, "staging"),
                 Clock = () => now,
+                Random = () => random,
                 Log = line => { lock (log) { log.Add(line); } },
                 Notice = notice => { lock (notices) { notices.Add(notice); } },
             });
@@ -74,6 +76,51 @@ public sealed class ReadOnlyLibraryTests : IDisposable
         Assert.Equal(calls + 2, api.DeltaCalls);
         Assert.Equal(1, Logged("works again"));
         Assert.Contains(log, line => line.Contains("\\OneDrive (drive b!me)"));
+    }
+
+    [Theory]
+    [InlineData(0.0, 44, 46)]
+    [InlineData(1.0, 74, 76)]
+    public async Task Change_feed_retries_wait_a_quarter_more_or_less_at_random(double chance, int notYet, int due)
+    {
+        random = chance;
+        var engine = Create();
+        await engine.PollAsync("b!me");
+        api.DeltaUnavailable = true;
+        await engine.PollAsync("b!me"); // fails: the next read waits a minute, give or take 15 s
+        var calls = api.DeltaCalls;
+
+        now += TimeSpan.FromSeconds(notYet);
+        await engine.PollAsync("b!me");
+        Assert.Equal(calls, api.DeltaCalls);
+        now += TimeSpan.FromSeconds(due - notYet);
+        await engine.PollAsync("b!me");
+        Assert.Equal(calls + 1, api.DeltaCalls);
+    }
+
+    [Fact]
+    public async Task When_the_network_returns_change_feeds_are_read_again_soon()
+    {
+        var engine = Create();
+        await engine.PollAsync("b!me");
+        api.DeltaUnavailable = true;
+        for (var i = 0; i < 4; i++)
+        {
+            await engine.PollAsync("b!me"); // failures back off to 8 minutes
+            now += TimeSpan.FromMinutes(5);
+        }
+        api.DeltaUnavailable = false;
+        var calls = api.DeltaCalls;
+
+        engine.NetworkRestored(); // within 30 s at random: 15 s here
+        now += TimeSpan.FromSeconds(14);
+        await engine.PollAsync("b!me");
+        Assert.Equal(calls, api.DeltaCalls);
+        now += TimeSpan.FromSeconds(2);
+        await engine.PollAsync("b!me");
+
+        Assert.Equal(calls + 1, api.DeltaCalls);
+        Assert.Contains(log, line => line.Contains("works again"));
     }
 
     [Fact]

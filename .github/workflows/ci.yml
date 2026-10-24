@@ -1,5 +1,6 @@
-# Builds and tests every push and pull request, including the C network provider. Actions are pinned by commit (Dependabot keeps
-# them current); NuGet restores in locked mode (CI=true) against the packages.lock.json files.
+# Builds and tests every push and pull request, including the C network provider, and builds the MSIs and setups (unsigned, as a
+# release does) when something that goes into them changed. Actions are pinned by commit (Dependabot keeps them current); NuGet
+# restores in locked mode (CI=true) against the packages.lock.json files.
 name: CI
 
 on:
@@ -35,3 +36,42 @@ jobs:
       - name: Network provider
         shell: pwsh
         run: ./build.ps1 np
+
+  package:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      # Changes against the pull request's base or the push's previous commit; everything counts when there is none to compare with
+      - name: Changes
+        id: changes
+        shell: pwsh
+        env:
+          BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          $changed = if($env:BASE -and $env:BASE -notmatch '^0+$'){ git diff --name-only $env:BASE HEAD }
+          if($LASTEXITCODE -ne 0 -or -not $env:BASE -or $env:BASE -match '^0+$'){ $changed = @('src/') }
+          $package = [Bool]($changed | Where-Object { $_ -match '^(src/|installer/|build\.ps1$|global\.json$|Directory\.[^/]+\.props$)' })
+          "package=$($package.ToString().ToLower())" >> $env:GITHUB_OUTPUT
+          if(-not $package){ 'Nothing that goes into the MSIs changed; skipping them.' }
+          exit 0
+
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        if: steps.changes.outputs.package == 'true'
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Cache Zig
+        if: steps.changes.outputs.package == 'true'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~\AppData\Local\zig-portable
+          key: zig-${{ runner.os }}-${{ hashFiles('build.ps1') }}
+
+      - name: MSIs and setups
+        if: steps.changes.outputs.package == 'true'
+        shell: pwsh
+        run: ./build.ps1 release -NoTest

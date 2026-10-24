@@ -38,7 +38,25 @@ internal sealed class PendingFile(string driveId, string drivePath, string stagi
     /// <summary>From the journal of an earlier run: the upload may have gone through before the crash.</summary>
     public bool Recovered { get; set; }
 
-    /// <summary>Staged from a renamed-away original (<see cref="AliasItem"/>); deleting it follows the alias rules.</summary>
+    /// <summary>
+    /// Recovered from a journal that never said its content was on disk: after a power loss it may hold zeros, so it uploads only as
+    /// a "(recovered)" copy next to the file, never into the item.
+    /// </summary>
+    public bool RecoverAsCopy { get; set; }
+
+    /// <summary>The staged content was forced to disk and the journal says so. The next write clears both first.</summary>
+    public bool Flushed { get; set; }
+
+    /// <summary>A new file under a temp-like name: since when (its close, or the rename to the name). It uploads minutes after that.</summary>
+    public DateTimeOffset? TempSince { get; set; }
+
+    /// <summary>SharePoint refused the name or request (400): not retried until the file is closed or renamed again.</summary>
+    public bool Rejected { get; set; }
+
+    /// <summary>
+    /// Staged from a renamed-away original (<see cref="AliasItem"/>), or renamed away to a temp name with unsaved changes; deleting it
+    /// follows the alias rules, and unclaimed it goes back to the original's path when the alias expires.
+    /// </summary>
     public AliasItem? Alias { get; set; }
 
     /// <summary>The item this content went into (a conflict copy included) and its path, once uploaded. Handles follow it.</summary>
@@ -132,7 +150,9 @@ internal sealed class AliasItem(string driveId, string drivePath, DriveItemInfo 
     : LocalState(driveId, drivePath)
 {
     public DriveItemInfo Item { get; } = item;
-    public string OriginalPath { get; } = originalPath;
+
+    /// <summary>Where the item is on the server; changes only when a folder above it moves.</summary>
+    public string OriginalPath { get; set; } = originalPath;
     public DateTimeOffset Deadline { get; } = deadline;
     public bool Claimed { get; set; }
 }

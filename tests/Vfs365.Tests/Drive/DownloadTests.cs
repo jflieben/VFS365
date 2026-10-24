@@ -27,7 +27,9 @@ public sealed class DownloadTests : IDisposable
         return bytes;
     }
 
-    async Task<byte[]> ReadAllAsync(string path)
+    Task<byte[]> ReadAllAsync(string path) => ReadAllAsync(engine, path);
+
+    static async Task<byte[]> ReadAllAsync(DriveEngine engine, string path)
     {
         var file = (await engine.GetEntryAsync(path, default))!;
         using var source = await engine.OpenContentAsync(file, default);
@@ -130,6 +132,37 @@ public sealed class DownloadTests : IDisposable
 
         Assert.Equal(data.Length, read);
         Assert.Equal(data, buffer);
+    }
+
+    [Fact]
+    public async Task After_a_restart_a_cached_file_has_the_length_it_was_served_with()
+    {
+        // SharePoint writes properties into Office files as it serves them: the served length isn't the listed size
+        var cipher = new CacheCipher(System.Security.Cryptography.RandomNumberGenerator.GetBytes(32));
+        DriveEngine Start() => new(DriveNamespace.Build(new MyDrive("b!me", "https://x-my.sharepoint.com/personal/u"), [], (_, _) => Task.FromResult("b!x")),
+            api, new ContentCache(Path.Combine(directory, "sealed"), api, new ContentCacheOptions { Cipher = cipher }),
+            new DriveEngineOptions { StagingDirectory = Path.Combine(directory, "staging") });
+        api.Add("plan.docx", Data(200_000));
+        var first = Start();
+        var file = (await first.GetEntryAsync("\\OneDrive\\plan.docx", default))!;
+        var served = Data(150_000, seed: 7);
+        api.ServeOtherContent("plan.docx", served);
+        using (var source = await first.OpenContentAsync(file, default))
+        {
+            await Assert.ThrowsAsync<ContentChangedException>(() => source.ReadAsync(0, new byte[4096], default).AsTask());
+        }
+        Assert.Equal(served, await ReadAllAsync(first, "\\OneDrive\\plan.docx"));
+        var downloads = api.Downloads;
+
+        var second = Start(); // Graph lists the item with its own size again
+        var again = (await second.GetEntryAsync("\\OneDrive\\plan.docx", default))!;
+        using var cached = await second.OpenContentAsync(again, default);
+
+        Assert.Equal(200_000, api.ItemAt("plan.docx")!.Size);
+        Assert.Equal(150_000, again.Size);
+        Assert.Equal(150_000, cached.Length);
+        Assert.Equal(served, await ReadAllAsync(second, "\\OneDrive\\plan.docx"));
+        Assert.Equal(downloads, api.Downloads);
     }
 
     public void Dispose()

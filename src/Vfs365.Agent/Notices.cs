@@ -1,6 +1,5 @@
 using System.Globalization;
 using System.Text.RegularExpressions;
-using Microsoft.Identity.Client;
 using Vfs365.Core.Drive;
 
 namespace Vfs365.Agent;
@@ -33,7 +32,7 @@ public static partial class PlainCause
             };
         }
         if (message.Contains("AADSTS", StringComparison.Ordinal) || message.Contains("sign-in", StringComparison.OrdinalIgnoreCase)
-            || message.Contains("interaction_required", StringComparison.Ordinal) || message.Contains("MSAL", StringComparison.Ordinal))
+            || message.Contains("interaction_required", StringComparison.Ordinal) || message.Contains("WAM", StringComparison.Ordinal))
         {
             return Cause.SignedOut;
         }
@@ -58,7 +57,7 @@ public static partial class PlainCause
     private static partial Regex HostAndPort();
 }
 
-/// <summary>A sign-in problem in plain words: the common AADSTS codes and MSAL errors, else a generic "sign-in failed".</summary>
+/// <summary>A sign-in problem in plain words: the common AADSTS codes and sign-in errors, else a generic "sign-in failed".</summary>
 public static class SignInText
 {
     static readonly (string[] Codes, string Key)[] Known =
@@ -68,8 +67,8 @@ public static class SignInText
         (["AADSTS53003", "AADSTS53000", "AADSTS53001", "AADSTS53002"], "Aad.Blocked"),
         (["AADSTS65001", "AADSTS90094", "AADSTS90095", "AADSTS700016"], "Aad.Consent"),
         (["AADSTS50057"], "Aad.Disabled"),
-        (["AADSTS50020", "guest_account"], "Aad.Guest"),
-        ([MsalError.AuthenticationCanceledError], "Aad.Cancelled"),
+        (["AADSTS50020", SignInException.Guest], "Aad.Guest"),
+        ([SignInException.Cancelled], "Aad.Cancelled"),
     ];
 
     public static string Of(Exception e, CultureInfo? culture = null) => UiText.Get(culture, Key(Message(e)));
@@ -78,7 +77,7 @@ public static class SignInText
     public static bool Permanent(Exception e) =>
         Key(Message(e)) is "Aad.Consent" or "Aad.Guest" or "Aad.Blocked" or "Aad.Disabled" || Message(e).Contains("AADSTS50194", StringComparison.Ordinal);
 
-    static string Message(Exception e) => e is MsalException msal ? $"{msal.ErrorCode} {msal.Message}" : e.Message;
+    static string Message(Exception e) => e is SignInException signIn ? $"{signIn.Code} {signIn.Message}" : e.Message;
 
     static string Key(string message) =>
         Known.FirstOrDefault(known => known.Codes.Any(code => message.Contains(code, StringComparison.Ordinal))).Key ?? "Aad.Other";
@@ -94,8 +93,8 @@ public sealed record StartProblem(StartWait Wait, string Reason)
 {
     public static StartProblem Of(Exception e, bool offline = false, CultureInfo? culture = null) => e switch
     {
-        MsalException when SignInText.Permanent(e) => new(StartWait.Retry, SignInText.Of(e, culture)),
-        MsalException => new(StartWait.SignIn, SignInText.Of(e, culture)),
+        SignInException when SignInText.Permanent(e) => new(StartWait.Retry, SignInText.Of(e, culture)),
+        SignInException => new(StartWait.SignIn, SignInText.Of(e, culture)),
         HttpRequestException or TaskCanceledException or TimeoutException or System.Net.Sockets.SocketException =>
             new(StartWait.Network, PlainCause.Text(Cause.Offline, culture)),
         _ when PlainCause.Of(e.Message, offline) is var cause && cause is Cause.Offline or Cause.Throttled or Cause.Unavailable =>
@@ -104,17 +103,35 @@ public sealed record StartProblem(StartWait Wait, string Reason)
     };
 }
 
+/// <summary>Plain words for a start problem that <see cref="StartProblem"/> only knows by its exception text: the drive, WinFsp, the profile's files.</summary>
+public static class StartText
+{
+    public static string Plain(Exception e, CultureInfo? culture = null) => e switch
+    {
+        Vfs365.Drive.WinFsp.MountConflictException => UiText.Get(culture, "Start.Mounted"),
+        DllNotFoundException or BadImageFormatException => UiText.Get(culture, "Start.WinFsp"),
+        IOException when e.Message.StartsWith("WinFsp", StringComparison.Ordinal) => UiText.Get(culture, "Start.WinFsp"),
+        IOException or UnauthorizedAccessException => UiText.Get(culture, "Start.Files"),
+        _ => PlainCause.Text(PlainCause.Of(e.Message), culture),
+    };
+}
+
 /// <summary>
 /// Notifications about uploads and conflict copies, grouped: what arrives within Window shows as one toast per kind ("27 files are
-/// waiting to upload: offline") instead of one per file. "Uploaded" toasts can be muted (policy NotifyUploads).
+/// waiting to upload: offline") instead of one per file, and a kind shows again only after Cooldown, with what arrived meanwhile, so a
+/// slow trickle doesn't give a toast every few seconds. "Uploaded" toasts can be muted (policy NotifyUploads).
 /// </summary>
 public sealed class NoticeBatcher(bool notifyUploads = true)
 {
-    public static readonly TimeSpan Window = TimeSpan.FromSeconds(4);
+    public static readonly TimeSpan Window = TimeSpan.FromSeconds(4), Cooldown = TimeSpan.FromMinutes(1);
+
+    static readonly NoticeKind[] Kinds = [NoticeKind.ConflictCopy, NoticeKind.NotDeleted, NoticeKind.UploadWaiting, NoticeKind.UploadDone];
 
     readonly Lock gate = new();
-    readonly List<(EngineNotice Notice, Cause Cause)> pending = [];
-    DateTimeOffset firstAt;
+    readonly List<(EngineNotice Notice, Cause Cause, DateTimeOffset At)> pending = [];
+    readonly Dictionary<NoticeKind, DateTimeOffset> shown = [];
+
+    static string NameOf(EngineNotice notice) => notice.Path ?? notice.Name;
 
     public void Add(EngineNotice notice, Cause cause, DateTimeOffset now)
     {
@@ -124,38 +141,39 @@ public sealed class NoticeBatcher(bool notifyUploads = true)
         }
         lock (gate)
         {
-            if (pending.Count == 0)
-            {
-                firstAt = now;
-            }
-            pending.Add((notice, cause));
+            pending.Add((notice, cause, now));
         }
     }
 
-    /// <summary>The toasts (title, text) for notices that arrived more than Window ago; empty until then.</summary>
+    /// <summary>
+    /// The toasts (title, text) for notices that arrived more than Window ago, per kind at most once per Cooldown; empty until then.
+    /// The window counts from the first notice of the kinds that may show now, so a burst of one kind isn't split by another kind waiting.
+    /// </summary>
     public IReadOnlyList<(string Title, string Text)> Due(DateTimeOffset now, CultureInfo? culture = null)
     {
-        List<(EngineNotice Notice, Cause Cause)> batch;
+        var batches = new List<(NoticeKind Kind, List<(EngineNotice Notice, Cause Cause)> Items)>();
         lock (gate)
         {
-            if (pending.Count == 0 || now - firstAt < Window)
+            // A file that uploaded after it was waiting needs no "waiting" toast
+            var done = pending.Where(n => n.Notice.Kind == NoticeKind.UploadDone).GroupBy(n => NameOf(n.Notice), StringComparer.OrdinalIgnoreCase)
+                .ToDictionary(g => g.Key, g => g.Max(n => n.At), StringComparer.OrdinalIgnoreCase);
+            pending.RemoveAll(n => n.Notice.Kind == NoticeKind.UploadWaiting && done.TryGetValue(NameOf(n.Notice), out var at) && at >= n.At);
+            var ready = Kinds.Where(kind => !(shown.TryGetValue(kind, out var last) && now - last < Cooldown) && pending.Any(n => n.Notice.Kind == kind)).ToList();
+            if (ready.Count == 0 || now - pending.Where(n => ready.Contains(n.Notice.Kind)).Min(n => n.At) < Window)
             {
                 return [];
             }
-            batch = [.. pending];
-            pending.Clear();
+            foreach (var kind in ready)
+            {
+                batches.Add((kind, pending.Where(n => n.Notice.Kind == kind).Select(n => (n.Notice, n.Cause)).ToList()));
+                pending.RemoveAll(n => n.Notice.Kind == kind);
+                shown[kind] = now;
+            }
         }
         var toasts = new List<(string, string)>();
-        foreach (var kind in new[] { NoticeKind.ConflictCopy, NoticeKind.NotDeleted, NoticeKind.UploadWaiting, NoticeKind.UploadDone })
+        foreach (var (kind, batch) in batches)
         {
-            // A file that waited and uploaded within the same window needs no "waiting" toast
-            var done = batch.Where(n => n.Notice.Kind == NoticeKind.UploadDone).Select(n => n.Notice.Path ?? n.Notice.Name).ToHashSet(StringComparer.OrdinalIgnoreCase);
-            var items = batch.Where(n => n.Notice.Kind == kind && (kind != NoticeKind.UploadWaiting || !done.Contains(n.Notice.Path ?? n.Notice.Name)))
-                .DistinctBy(n => n.Notice.Path ?? n.Notice.Name, StringComparer.OrdinalIgnoreCase).ToList();
-            if (items.Count == 0)
-            {
-                continue;
-            }
+            var items = batch.DistinctBy(n => NameOf(n.Notice), StringComparer.OrdinalIgnoreCase).ToList();
             var first = items[0].Notice;
             var cause = PlainCause.Text(items.GroupBy(n => n.Cause).OrderByDescending(g => g.Count()).First().Key, culture);
             toasts.Add(kind switch
@@ -163,7 +181,7 @@ public sealed class NoticeBatcher(bool notifyUploads = true)
                 NoticeKind.ConflictCopy => (UiText.Get(culture, "Copy.Title"),
                     items.Count == 1 ? UiText.Get(culture, "Copy.One", first.Name, first.Detail) : UiText.Get(culture, "Copy.Many", items.Count)),
                 NoticeKind.NotDeleted => (UiText.Get(culture, "NotDeleted.Title"),
-                    items.Count == 1 ? UiText.Get(culture, "NotDeleted.One", first.Name, first.Detail) : UiText.Get(culture, "NotDeleted.Many", items.Count)),
+                    items.Count == 1 ? UiText.Get(culture, "NotDeleted.One", first.Name, cause) : UiText.Get(culture, "NotDeleted.Many", items.Count)),
                 NoticeKind.UploadWaiting => (UiText.Get(culture, "Waiting.Title"),
                     items.Count == 1 ? UiText.Get(culture, "Waiting.One", first.Name, cause) : UiText.Get(culture, "Waiting.Many", items.Count, cause)),
                 _ => (UiText.Get(culture, "Uploaded.Title"),

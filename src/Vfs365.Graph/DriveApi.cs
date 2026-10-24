@@ -4,6 +4,7 @@ using System.Net.Http.Headers;
 using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.Json;
+using Vfs365.Core;
 using Vfs365.Core.Drive;
 
 namespace Vfs365.Graph;
@@ -76,33 +77,43 @@ public sealed partial class DriveApi(M365Client client) : IDriveApi
         return doc is null ? null : Parse(doc.RootElement);
     }
 
+    public async Task<DriveItemInfo?> GetItemByIdAsync(string driveId, string itemId, CancellationToken ct)
+    {
+        using var doc = await client.GetJsonAsync(new Uri($"{DriveUrl(driveId)}/items/{itemId}?$select={ItemSelect}"), ct, notFoundAsNull: true);
+        return doc is null ? null : Parse(doc.RootElement);
+    }
+
     /// <summary>
     /// Item fields for a download plus the pre-authenticated URL. Graph returns the URL under $select only when it is named; an answer
     /// without it switches to reading the whole item.
     /// </summary>
     const string DownloadSelect = Select + ",@microsoft.graph.downloadUrl";
 
-    /// <summary>A download URL is reused this long for the same item version (it is valid for about an hour); never stored or logged.</summary>
-    static readonly TimeSpan DownloadUrlReuse = TimeSpan.FromMinutes(2);
+    /// <summary>
+    /// A download URL is reused this briefly for the same item version (it is valid for about an hour), so the range streams of one
+    /// download share it, while a later one reads the item again and so sees a colleague's new version. Never stored or logged.
+    /// </summary>
+    static readonly TimeSpan DownloadUrlReuse = TimeSpan.FromSeconds(20);
 
     readonly System.Collections.Concurrent.ConcurrentDictionary<string, (string Url, DriveItemInfo Item, DateTimeOffset At)> downloadUrls = new(StringComparer.Ordinal);
     volatile bool selectDropsDownloadUrl;
 
     /// <summary>
     /// Streams the version <paramref name="contentTag"/> names. The item is read first (unless a download URL for that version was read
-    /// in the last minutes), so a changed file fails with <see cref="ContentChangedException"/> instead of mixing versions in one download.
+    /// seconds ago), so a changed file fails with <see cref="ContentChangedException"/> instead of mixing versions in one download; so
+    /// does a download whose ETag names another version.
     /// </summary>
     public async Task<Stream> OpenReadAsync(string driveId, string itemId, string? contentTag, long offset, long length, CancellationToken ct)
     {
         var key = $"{driveId}|{itemId}";
-        if (contentTag is not null && downloadUrls.TryGetValue(key, out var known) && DateTimeOffset.UtcNow - known.At < DownloadUrlReuse
+        if (contentTag is not null && downloadUrls.TryGetValue(key, out var known) && client.Clock() - known.At < DownloadUrlReuse
             && (contentTag == known.Item.CTag || contentTag == known.Item.ETag))
         {
             try
             {
                 return await DownloadAsync(known.Url, known.Item, offset, length, ct);
             }
-            catch (Exception e) when (e is not OperationCanceledException)
+            catch (Exception) when (!ct.IsCancellationRequested)
             {
                 downloadUrls.TryRemove(key, out _); // expired, or the file changed: read the item again
             }
@@ -116,13 +127,21 @@ public sealed partial class DriveApi(M365Client client) : IDriveApi
         }
         if (downloadUrls.Count > 256)
         {
-            foreach (var old in downloadUrls.Where(d => DateTimeOffset.UtcNow - d.Value.At >= DownloadUrlReuse).Select(d => d.Key).ToList())
+            foreach (var old in downloadUrls.Where(d => client.Clock() - d.Value.At >= DownloadUrlReuse).Select(d => d.Key).ToList())
             {
                 downloadUrls.TryRemove(old, out _);
             }
         }
-        downloadUrls[key] = (url, current, DateTimeOffset.UtcNow);
-        return await DownloadAsync(url, current, offset, length, ct);
+        downloadUrls[key] = (url, current, client.Clock());
+        try
+        {
+            return await DownloadAsync(url, current, offset, length, ct);
+        }
+        catch (ContentChangedException)
+        {
+            downloadUrls.TryRemove(key, out _);
+            throw;
+        }
     }
 
     async Task<(string Url, DriveItemInfo Item)> DownloadUrlAsync(string driveId, string itemId, CancellationToken ct)
@@ -154,6 +173,11 @@ public sealed partial class DriveApi(M365Client client) : IDriveApi
         {
             throw new ContentChangedException(current, length); // the offset is past the end of what is there now
         }
+        if (download.Content is IServedVersion { ETag: { } tag } && ContentTags.Differs(tag, current))
+        {
+            await download.Content.DisposeAsync();
+            throw new ContentChangedException(current, length, otherVersion: true);
+        }
         if (download.Total is { } served && served != length)
         {
             await download.Content.DisposeAsync();
@@ -172,13 +196,45 @@ public sealed partial class DriveApi(M365Client client) : IDriveApi
             return Parse(doc!.RootElement)!;
         }
 
-        var session = await CreateUploadSessionAsync(driveId, target, ct);
-        for (long offset = 0; ; offset += UploadSession.FragmentSize)
+        for (var attempt = 1; ; attempt++)
         {
-            if (await UploadFragmentAsync(session, sourceFile, offset, Math.Min(UploadSession.FragmentSize, length - offset), length, ct) is { } item)
+            var session = await CreateUploadSessionAsync(driveId, target, ct);
+            try
+            {
+                return await SendFragmentsAsync(session, sourceFile, length, ct);
+            }
+            catch (UploadSessionGoneException) when (attempt < 2 && !ct.IsCancellationRequested)
+            {
+                // Expired on the server (a long stall or sleep): a new session starts over
+            }
+            catch (Exception)
+            {
+                await CancelQuietlyAsync(session);
+                throw;
+            }
+        }
+    }
+
+    /// <summary>A fragment slower than this halves the next one (down to 320 KiB); one faster than a quarter of it doubles it again.</summary>
+    static readonly TimeSpan SlowFragment = TimeSpan.FromSeconds(30);
+
+    /// <summary>Sends the whole file through the session, fragment by fragment, smaller ones while the uplink is slow.</summary>
+    async Task<DriveItemInfo> SendFragmentsAsync(UploadSession session, string sourceFile, long length, CancellationToken ct)
+    {
+        var size = UploadSession.FragmentSize;
+        for (long offset = 0; ;)
+        {
+            var fragment = Math.Min(size, length - offset);
+            var started = client.Clock();
+            if (await UploadFragmentAsync(session, sourceFile, offset, fragment, length, ct) is { } item)
             {
                 return item;
             }
+            offset += fragment;
+            var took = client.Clock() - started;
+            size = took > SlowFragment ? Math.Max(UploadSession.FragmentUnit, size / 2 / UploadSession.FragmentUnit * UploadSession.FragmentUnit)
+                : took < SlowFragment / 4 ? Math.Min(UploadSession.FragmentSize, size * 2)
+                : size;
         }
     }
 
@@ -189,23 +245,117 @@ public sealed partial class DriveApi(M365Client client) : IDriveApi
             ["item"] = new Dictionary<string, object> { ["@microsoft.graph.conflictBehavior"] = target.ItemId is null ? "fail" : "replace" },
         };
         using var session = await client.SendJsonAsync(HttpMethod.Post, new Uri($"{TargetUrl(driveId, target)}/createUploadSession"), Json(body), ct, target.IfMatch);
-        return new UploadSession(new Uri(session!.RootElement.GetProperty("uploadUrl").GetString()!));
+        return new UploadSession(new Uri(session!.RootElement.GetProperty("uploadUrl").GetString()!)) { DriveId = driveId, Target = target };
     }
 
+    /// <summary>A fragment PUT that failed on the way (network, timeout, 5xx) is sent again this often, from where the session says it is.</summary>
+    const int FragmentRetries = 4;
+
+    /// <summary>
+    /// Sends one fragment. A failure on the way is retried with back-off from the session's nextExpectedRanges (a fragment that
+    /// arrived is not sent again). A session gone on the server (expired) throws <see cref="UploadSessionGoneException"/>.
+    /// </summary>
     public async Task<DriveItemInfo?> UploadFragmentAsync(UploadSession session, string sourceFile, long offset, long length, long totalSize, CancellationToken ct)
     {
-        using var response = await client.SendJsonAsync(HttpMethod.Put, session.UploadUrl, () =>
+        var end = offset + length;
+        var last = end >= totalSize;
+        if (last)
         {
-            var fragment = FileContent(sourceFile, offset, length);
-            fragment.Headers.ContentRange = new ContentRangeHeaderValue(offset, offset + length - 1, totalSize);
-            return fragment;
-        }, ct, authenticate: false);
-        return offset + length >= totalSize ? Parse(response!.RootElement) : null;
+            await CheckUnchangedAsync(session, ct);
+        }
+        var bytes = ReadFragment(sourceFile, offset, length);
+        for (long from = offset, failures = 0; ;)
+        {
+            try
+            {
+                var start = from;
+                using var response = await client.SendJsonAsync(HttpMethod.Put, session.UploadUrl, () =>
+                {
+                    var fragment = new ByteArrayContent(bytes, (int)(start - offset), (int)(end - start));
+                    fragment.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
+                    fragment.Headers.ContentRange = new ContentRangeHeaderValue(start, end - 1, totalSize);
+                    return fragment;
+                }, ct, authenticate: false);
+                return last ? Parse(response!.RootElement) : null;
+            }
+            catch (M365RequestException e) when (e.Status is HttpStatusCode.NotFound or HttpStatusCode.Gone)
+            {
+                throw new UploadSessionGoneException($"The upload session ended on the server: {e.Message}");
+            }
+            catch (Exception e) when (!ct.IsCancellationRequested && Resumable(e) && ++failures <= FragmentRetries)
+            {
+                await client.Delay(TimeSpan.FromSeconds(1 << (int)failures), ct);
+                var next = await NextExpectedAsync(session, ct);
+                if (next >= end && !last)
+                {
+                    return null; // it arrived, only the answer got lost
+                }
+                if (next < offset || next >= end)
+                {
+                    throw;
+                }
+                from = next;
+            }
+        }
+    }
+
+    /// <summary>Network trouble, timeouts, 5xx and throttling without Retry-After, a range the session didn't expect: worth resuming.</summary>
+    static bool Resumable(Exception e) => e switch
+    {
+        M365RequestException request => request.Error is RemoteError.Unavailable or RemoteError.Throttled || request.Status == HttpStatusCode.RequestedRangeNotSatisfiable,
+        RemoteException => false,
+        _ => e is HttpRequestException or IOException or OperationCanceledException,
+    };
+
+    /// <summary>The first byte the session still expects (nextExpectedRanges).</summary>
+    async Task<long> NextExpectedAsync(UploadSession session, CancellationToken ct)
+    {
+        using var status = await client.SendJsonAsync(HttpMethod.Get, session.UploadUrl, null, ct, notFoundAsNull: true, authenticate: false)
+            ?? throw new UploadSessionGoneException("The upload session ended on the server");
+        if (status.RootElement.TryGetProperty("nextExpectedRanges", out var ranges) && ranges.ValueKind == JsonValueKind.Array
+            && ranges.EnumerateArray().FirstOrDefault().GetString() is { } range
+            && long.TryParse(range.Split('-')[0], NumberStyles.None, CultureInfo.InvariantCulture, out var next))
+        {
+            return next;
+        }
+        throw new IOException("The upload session didn't say what it expects next");
+    }
+
+    /// <summary>
+    /// Before the fragment that completes an upload into an existing item: the session checked If-Match only when it began, so an item
+    /// whose content changed (or that was deleted) since fails it instead of being replaced; the caller cancels the session. A change
+    /// of metadata only passes.
+    /// </summary>
+    async Task CheckUnchangedAsync(UploadSession session, CancellationToken ct)
+    {
+        if (session is not { DriveId: { } driveId, Target: { ItemId: { } itemId, IfMatch: { } ifMatch } target })
+        {
+            return;
+        }
+        var current = await GetItemByIdAsync(driveId, itemId, ct);
+        if (current is not null && (current.ETag == ifMatch || (target.ContentTag is not null && current.CTag == target.ContentTag)))
+        {
+            return;
+        }
+        throw current is null
+            ? new RemoteException(RemoteError.NotFound, $"Item {itemId} was deleted in Microsoft 365 during the upload")
+            : new RemoteException(RemoteError.Conflict, $"412 item {itemId} changed in Microsoft 365 during the upload");
     }
 
     public async Task CancelUploadSessionAsync(UploadSession session, CancellationToken ct)
     {
         using var _ = await client.SendJsonAsync(HttpMethod.Delete, session.UploadUrl, null, ct, authenticate: false, notFoundAsNull: true);
+    }
+
+    async Task CancelQuietlyAsync(UploadSession session)
+    {
+        try
+        {
+            await CancelUploadSessionAsync(session, CancellationToken.None);
+        }
+        catch (Exception)
+        {
+        }
     }
 
     static string TargetUrl(string driveId, UploadTarget target) =>
@@ -263,23 +413,26 @@ public sealed partial class DriveApi(M365Client client) : IDriveApi
 
     static ByteArrayContent FileContent(string path, long offset, long length)
     {
-        var bytes = new byte[length];
-        using (var handle = File.OpenHandle(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
-        {
-            var read = 0;
-            while (read < length)
-            {
-                var n = RandomAccess.Read(handle, bytes.AsSpan(read), offset + read);
-                if (n == 0)
-                {
-                    throw new IOException($"{path} shrank while uploading");
-                }
-                read += n;
-            }
-        }
-        var content = new ByteArrayContent(bytes);
+        var content = new ByteArrayContent(ReadFragment(path, offset, length));
         content.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
         return content;
+    }
+
+    static byte[] ReadFragment(string path, long offset, long length)
+    {
+        var bytes = new byte[length];
+        using var handle = File.OpenHandle(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+        var read = 0;
+        while (read < length)
+        {
+            var n = RandomAccess.Read(handle, bytes.AsSpan(read), offset + read);
+            if (n == 0)
+            {
+                throw new IOException($"{path} shrank while uploading");
+            }
+            read += n;
+        }
+        return bytes;
     }
 
     public static DriveItemInfo? Parse(JsonElement item)
@@ -308,4 +461,13 @@ public sealed partial class DriveApi(M365Client client) : IDriveApi
 
     static DateTimeOffset? Time(JsonElement element, string name) =>
         Str(element, name) is { } text && DateTimeOffset.TryParse(text, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal, out var time) ? time : null;
+}
+
+/// <summary>An upload session SharePoint no longer knows (expired): the upload starts over. Not a deleted item.</summary>
+public sealed class UploadSessionGoneException(string message) : RemoteException(RemoteError.Unavailable, message);
+
+/// <summary>A download stream that knows the ETag its response named, when the server sent one.</summary>
+internal interface IServedVersion
+{
+    string? ETag { get; }
 }

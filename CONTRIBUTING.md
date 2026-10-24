@@ -24,7 +24,7 @@ Thanks for helping. VFS365 is maintained by JSolve B.V. Bug reports, fixes and w
 - Dependencies must be under an OSI-approved licence compatible with GPLv3 and get a line in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md). No proprietary components, ever: WinFsp is bundled under its FLOSS exception, which depends on that.
 - Style: match the code around your change; concise comments that say what and how, and why only where it isn't obvious.
 
-CI builds and tests every pull request. A maintainer reviews it; changes that don't fit the product's direction may be declined, even when they are good code.
+CI builds and tests every pull request, and builds the MSIs and setups (unsigned) when it changes what goes into them. A maintainer reviews it; changes that don't fit the product's direction may be declined, even when they are good code.
 
 ## Licence of contributions
 
@@ -32,4 +32,4 @@ VFS365 is licensed under the GNU GPL version 3. By submitting a pull request you
 
 ## Releases
 
-Maintainers release by raising `VERSION` on `main` (`./build.ps1 bump`) together with its `CHANGELOG.md` entry. GitHub Actions then builds the setup programs and MSIs and publishes the release.
+Maintainers release by raising `VERSION` on `main` (`./build.ps1 bump`) together with its `CHANGELOG.md` entry. GitHub Actions then builds the setup programs and MSIs, signs them and publishes the release; only `main` can release.

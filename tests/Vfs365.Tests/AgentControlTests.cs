@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Security.Principal;
 using Vfs365.Agent;
 
 namespace Vfs365.Tests;
@@ -25,5 +26,22 @@ public sealed class AgentControlTests
 
         Assert.True(EventWaitHandle.TryOpenExisting($@"Global\Session\{session}\{name}", out var opened));
         opened.Dispose();
+    }
+
+    [Fact]
+    public void Another_session_s_event_is_set_only_when_the_agent_s_user_owns_it()
+    {
+        // Never the real name: an agent may run in this session
+        var name = $@"Local\VFS365.Test.{Guid.NewGuid():N}";
+        using var stop = new EventWaitHandle(false, EventResetMode.ManualReset, name);
+        // The token's default owner: the user, or Administrators in an elevated test run
+        var owner = (SecurityIdentifier)stop.GetAccessControl().GetOwner(typeof(SecurityIdentifier))!;
+
+        Assert.False(AgentControl.SetIfOwnedBy(name, new SecurityIdentifier("S-1-5-21-1-2-3-1001")));
+        Assert.False(AgentControl.SetIfOwnedBy(name, new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null)));
+        Assert.False(stop.WaitOne(0));
+        Assert.True(AgentControl.SetIfOwnedBy(name, owner));
+        Assert.True(stop.WaitOne(0));
+        Assert.False(AgentControl.SetIfOwnedBy($@"Local\VFS365.Test.{Guid.NewGuid():N}", owner));
     }
 }

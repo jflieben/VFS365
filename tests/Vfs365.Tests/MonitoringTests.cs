@@ -50,6 +50,55 @@ public sealed class MonitoringTests : IDisposable
         Assert.Null(problem);
     }
 
+    const string Account = "https://contoso.table.core.windows.net/";
+
+    [Theory]
+    // The portal's account SAS with Table, Object and Add, and a table SAS (Storage Explorer) with Add
+    [InlineData("?sv=2022-11-02&ss=t&srt=o&sp=a&se=2027-10-24T16:00:00Z&st=2026-10-24T08:00:00Z&spr=https&sig=abc%3D")]
+    [InlineData("?sv=2019-02-02&tn=errors&sp=a&se=2027-10-24T16:00:00Z&sig=abc%3D")]
+    // Extra rights that can't read or change rows: creating tables, more resource types
+    [InlineData("?sv=2022-11-02&ss=t&srt=sco&sp=ac&se=2027-10-24T16:00:00Z&spr=https&sig=abc%3D")]
+    public void An_add_only_table_sas_is_used(string query) => Assert.NotNull(MonitoringTarget.Parse(Account + query, out _));
+
+    [Theory]
+    // The portal's default account SAS: every service, type and permission
+    [InlineData("?sv=2022-11-02&ss=bfqt&srt=sco&sp=rwdlacupiytfx&se=2027-10-24T16:00:00Z&st=2026-10-24T08:00:00Z&spr=https&sig=abc%3D", "sp=rwdlacupiytfx")]
+    // Table only, but without objects, or reading too (the dashboard's SAS)
+    [InlineData("?sv=2022-11-02&ss=t&srt=c&sp=a&se=2027-10-24T16:00:00Z&spr=https&sig=abc%3D", "srt=c")]
+    [InlineData("?sv=2022-11-02&ss=t&srt=co&sp=rl&se=2027-10-24T16:00:00Z&spr=https&sig=abc%3D", "sp=rl")]
+    [InlineData("?sv=2022-11-02&ss=bt&srt=o&sp=a&se=2027-10-24T16:00:00Z&spr=https&sig=abc%3D", "ss=bt")]
+    // A blob container SAS, a table SAS that can read and delete, and one whose rights are in a stored access policy
+    [InlineData("?sp=racwdl&st=2026-10-24T08:00:00Z&se=2027-10-24T16:00:00Z&spr=https&sv=2022-11-02&sr=c&sig=abc%3D", "sr=c")]
+    [InlineData("?sv=2019-02-02&tn=errors&sp=raud&se=2027-10-24T16:00:00Z&sig=abc%3D", "sp=raud")]
+    [InlineData("?sv=2019-02-02&tn=errors&si=monitoring&sig=abc%3D", "no sp")]
+    public void A_sas_that_can_do_more_than_add_rows_is_refused_and_says_why(string query, string named)
+    {
+        Assert.Null(MonitoringTarget.Parse(Account + query, out var problem));
+        Assert.Contains(named, problem);
+        Assert.Contains("ss=t, srt=o, sp=a", problem);
+        Assert.DoesNotContain("sig=", problem);
+    }
+
+    [Fact]
+    public async Task A_changed_monitoring_policy_applies_at_once()
+    {
+        var monitoring = Create();
+        monitoring.Retarget(MonitoringTarget.Parse($"http://127.0.0.1:{server.Port}/devstoreaccount1?sv=2019-02-02&ss=t&srt=o&sp=a&sig=renewed", out _),
+            MonitoringDetail.NoPaths);
+        monitoring.Error("upload", @"\OneDrive\secret.docx: offline", @"\OneDrive\secret.docx");
+        await monitoring.FlushAsync(TimeSpan.FromSeconds(10));
+
+        var request = Assert.Single(server.Requests);
+        Assert.Contains("sig=renewed", request.Line);
+        Assert.DoesNotContain("secret", request.Body);
+
+        monitoring.Retarget(null, MonitoringDetail.Full); // MonitoringUrl removed
+        monitoring.Error("upload", "two");
+        await monitoring.FlushAsync(TimeSpan.FromSeconds(10));
+        Assert.Single(server.Requests);
+        Assert.Equal("Monitoring: off", monitoring.Started);
+    }
+
     [Fact]
     public void Entities_carry_odata_types_for_long_numbers_and_times()
     {
@@ -96,9 +145,9 @@ public sealed class MonitoringTests : IDisposable
         var start = new DateTimeOffset(2026, 10, 14, 7, 0, 0, TimeSpan.Zero);
         episodes.Add(new ThrottleNotice(start, 429, TimeSpan.FromSeconds(60), Graph: false, Background: true));
         episodes.Add(new ThrottleNotice(start.AddSeconds(30), 503, TimeSpan.FromSeconds(120), Graph: true, Background: false));
-        Assert.Null(episodes.Ended(start.AddMinutes(3))); // the last pause ends at 7:02:30, then 2 quiet minutes
-        var episode = episodes.Ended(start.AddMinutes(5))!;
-        Assert.Null(episodes.Ended(start.AddMinutes(6)));
+        Assert.Empty(episodes.Ended(start.AddMinutes(3))); // the last pause ends at 7:02:30, then 2 quiet minutes
+        var episode = Assert.Single(episodes.Ended(start.AddMinutes(5)));
+        Assert.Empty(episodes.Ended(start.AddMinutes(6)));
 
         var monitoring = Create();
         monitoring.Throttling(episode);
@@ -114,8 +163,27 @@ public sealed class MonitoringTests : IDisposable
         Assert.Equal(1, row.GetProperty("BackgroundResponses").GetInt32());
         Assert.Equal(1, row.GetProperty("GraphResponses").GetInt32());
         Assert.Equal(120, row.GetProperty("LongestWaitSeconds").GetInt32());
-        Assert.Contains("for 3 min: 2 response(s) (429 x1, 503 x1)", row.GetProperty("Message").GetString());
+        Assert.Contains("for 3 min (the pause it asked for; background work waits longer): 2 response(s) (429 x1, 503 x1)", row.GetProperty("Message").GetString());
         Assert.Equal(0, monitoring.Errors);
+    }
+
+    [Fact]
+    public void A_throttled_response_after_the_quiet_time_starts_a_new_episode_even_when_a_tick_came_late()
+    {
+        var episodes = new ThrottleEpisodes();
+        var start = new DateTimeOffset(2026, 10, 14, 7, 0, 0, TimeSpan.Zero);
+        episodes.Add(new ThrottleNotice(start, 429, TimeSpan.FromSeconds(30), Graph: true, Background: true));
+        // Asleep: nobody asked for the ended episode before the next throttled response, 20 minutes on
+        episodes.Add(new ThrottleNotice(start.AddMinutes(20), 503, TimeSpan.FromSeconds(10), Graph: false, Background: false));
+
+        var ended = episodes.Ended(start.AddMinutes(21));
+        var first = Assert.Single(ended);
+        Assert.Equal((start, 1, TimeSpan.FromSeconds(30)), (first.From, first.Responses, first.Held));
+
+        // A stop ends the one still going on
+        var last = Assert.Single(episodes.Ended(DateTimeOffset.MaxValue));
+        Assert.Equal((start.AddMinutes(20), 1, 1), (last.From, last.Responses, last.Status503));
+        Assert.Empty(episodes.Ended(DateTimeOffset.MaxValue));
     }
     [Fact]
     public async Task A_failure_is_logged_once_with_a_hint()
@@ -138,7 +206,7 @@ public sealed class MonitoringTests : IDisposable
     [Fact]
     public async Task An_expired_sas_sends_nothing()
     {
-        var monitoring = Create("?sv=2019-02-02&se=2020-01-01T00:00:00Z&sig=abc");
+        var monitoring = Create("?sv=2019-02-02&ss=t&srt=o&sp=a&se=2020-01-01T00:00:00Z&sig=abc");
         monitoring.Error("a", "one");
         await monitoring.DeviceAsync("install", null);
         await monitoring.FlushAsync(TimeSpan.FromSeconds(10));
@@ -250,7 +318,7 @@ public sealed class MonitoringTests : IDisposable
     [Fact]
     public async Task No_paths_applies_to_error_rows()
     {
-        var monitoring = new Monitoring(MonitoringTarget.Parse($"http://127.0.0.1:{server.Port}/devstoreaccount1?sv=1&sig=abc", out _)!,
+        var monitoring = new Monitoring(MonitoringTarget.Parse($"http://127.0.0.1:{server.Port}/devstoreaccount1?sv=1&ss=t&srt=o&sp=a&sig=abc", out _)!,
             new DeviceInfo("PC1", "device-1", null), _ => { }) { Detail = MonitoringDetail.NoPaths };
         monitoring.Error("upload", @"\OneDrive\Plans\takeover.docx: 503 ServiceUnavailable", @"\OneDrive\Plans\takeover.docx", "takeover.docx");
         await monitoring.FlushAsync(TimeSpan.FromSeconds(10));
@@ -272,6 +340,109 @@ public sealed class MonitoringTests : IDisposable
         var day = UsageStatistics.Load(statisticsFile).Days["2026-10-06"];
         Assert.Equal("ann@contoso.com", day.User);
         Assert.Equal("0.4.0", day.Version);
+    }
+
+    static readonly DeviceInfo HostA = new("AVD-A", "guid-a", "entra-a"), HostB = new("AVD-B", "guid-b", "entra-b");
+
+    [Fact]
+    public async Task A_roaming_day_is_sent_as_the_host_it_was_used_on()
+    {
+        // Pooled AVD: statistics.json is in the profile, so the day used on host A is sent from host B the next day
+        var onA = UsageStatistics.Load(statisticsFile);
+        onA.Fold(new ClientUsage(7, 0, 7, 0, 0, 0, 0, 0, 0), 0, new DateTime(2026, 10, 6, 9, 0, 0), "ann@contoso.com", "0.4.2", HostA);
+        onA.Save();
+
+        var onB = UsageStatistics.Load(statisticsFile);
+        var now = new DateTime(2026, 10, 7, 9, 0, 0);
+        onB.Fold(new ClientUsage(2, 0, 2, 0, 0, 0, 0, 0, 0), 0, now, "ann@contoso.com", "0.4.2", HostB);
+        var monitoring = Create();
+        var sentAs = new List<(string Day, string Device)>();
+        Assert.Equal(0, await onB.SendCompletedAsync(now, (day, usage) =>
+        {
+            sentAs.Add((day, usage.DeviceOr(HostB).Name));
+            return monitoring.StatisticsAsync(day, UsageStatistics.Values(day, usage), usage.User, usage.Version, usage.DeviceOr(HostB), usage.Salt);
+        }));
+
+        Assert.Equal([("2026-10-06", "AVD-A")], sentAs);
+        using var body = JsonDocument.Parse(Assert.Single(server.Requests).Body);
+        var row = body.RootElement;
+        Assert.Equal("2026-10-06", row.GetProperty("PartitionKey").GetString());
+        Assert.Equal(("AVD-A", "guid-a", "entra-a"), (row.GetProperty("DeviceName").GetString(), row.GetProperty("DeviceId").GetString(), row.GetProperty("EntraDeviceId").GetString()));
+        Assert.StartsWith("guid-a_", row.GetProperty("RowKey").GetString());
+        Assert.EndsWith("_" + onA.Days["2026-10-06|guid-a"].Salt, row.GetProperty("RowKey").GetString());
+        Assert.Equal("7", row.GetProperty("GraphRequests").GetString());
+        Assert.True(onB.Days.ContainsKey("2026-10-07|guid-b")); // today's, on B, stays
+    }
+
+    [Fact]
+    public async Task A_statistics_file_of_an_earlier_version_still_works()
+    {
+        File.WriteAllText(statisticsFile, """{"2026-10-05":{"GraphRequests":3,"User":"ann@contoso.com"},"2026-10-06":{"GraphRequests":4}}""");
+        var statistics = UsageStatistics.Load(statisticsFile);
+        // Today's own day of the earlier version becomes this device's, still without a salt (its row key as it was)
+        statistics.Fold(new ClientUsage(1, 0, 1, 0, 0, 0, 0, 0, 0), 0, new DateTime(2026, 10, 6, 12, 0, 0), null, null, HostB);
+        Assert.Equal(["2026-10-05", "2026-10-06|guid-b"], statistics.Days.Keys.Order(StringComparer.Ordinal));
+        Assert.Null(statistics.Days["2026-10-06|guid-b"].Salt);
+        Assert.Equal(5, statistics.Days["2026-10-06|guid-b"].GraphRequests);
+        Assert.Equal("ann@contoso.com", statistics.LastUser());
+
+        var sent = new List<(string Day, string Device, string? Salt)>();
+        await statistics.SendCompletedAsync(new DateTime(2026, 10, 7, 9, 0, 0), (day, usage) =>
+        {
+            sent.Add((day, usage.DeviceOr(HostB).Id, usage.Salt));
+            return Task.FromResult(true);
+        });
+        Assert.Equal([("2026-10-05", "guid-b", null), ("2026-10-06", "guid-b", null)], sent);
+    }
+
+    [Fact]
+    public async Task A_day_from_before_a_long_time_off_is_still_sent()
+    {
+        var statistics = UsageStatistics.Load(statisticsFile);
+        statistics.Fold(new ClientUsage(5, 0, 5, 0, 0, 0, 0, 0, 0), 0, new DateTime(2026, 10, 1, 17, 0, 0), null, null, HostA);
+        // Ten days later (holiday): the first fold of the start comes before the first send
+        var back = new DateTime(2026, 10, 11, 9, 0, 0);
+        statistics.Fold(new ClientUsage(6, 0, 6, 0, 0, 0, 0, 0, 0), 0, back, null, null, HostA);
+
+        var sent = new List<string>();
+        await statistics.SendCompletedAsync(back, (day, _) =>
+        {
+            sent.Add(day);
+            return Task.FromResult(true);
+        });
+        Assert.Equal(["2026-10-01"], sent);
+    }
+
+    [Fact]
+    public async Task A_day_whose_sends_fail_for_a_week_is_dropped()
+    {
+        var statistics = UsageStatistics.Load(statisticsFile);
+        statistics.Fold(new ClientUsage(1, 0, 1, 0, 0, 0, 0, 0, 0), 0, new DateTime(2026, 10, 1, 17, 0, 0), null, null, HostA);
+        var firstTry = new DateTime(2026, 10, 2, 9, 0, 0);
+        Assert.Equal(1, await statistics.SendCompletedAsync(firstTry, (_, _) => Task.FromResult(false)));
+        Assert.Equal(1, await statistics.SendCompletedAsync(firstTry.AddDays(6), (_, _) => Task.FromResult(false)));
+        Assert.Single(UsageStatistics.Load(statisticsFile).Completed(firstTry.AddDays(6)));
+
+        Assert.Equal(1, await statistics.SendCompletedAsync(firstTry + UsageStatistics.KeepTrying, (_, _) => Task.FromResult(false)));
+        Assert.Empty(UsageStatistics.Load(statisticsFile).Completed(firstTry.AddDays(8)));
+    }
+
+    [Fact]
+    public async Task A_day_created_again_after_a_time_zone_change_gets_a_row_of_its_own()
+    {
+        var statistics = UsageStatistics.Load(statisticsFile);
+        statistics.Fold(new ClientUsage(1, 0, 1, 0, 0, 0, 0, 0, 0), 0, new DateTime(2026, 10, 6, 22, 0, 0), null, null, HostA);
+        var first = statistics.Days["2026-10-06|guid-a"].Salt;
+        await statistics.SendCompletedAsync(new DateTime(2026, 10, 7, 0, 30, 0), (_, _) => Task.FromResult(true));
+
+        // Flown west: the local clock is back on the 6th
+        statistics.Fold(new ClientUsage(2, 0, 2, 0, 0, 0, 0, 0, 0), 0, new DateTime(2026, 10, 6, 20, 0, 0), null, null, HostA);
+        var again = statistics.Days["2026-10-06|guid-a"].Salt;
+
+        Assert.NotNull(first);
+        Assert.NotNull(again);
+        Assert.NotEqual(first, again); // a new row key: the add isn't taken for a re-send (409) and dropped
+        Assert.Equal(16, first!.Length); // random: nobody can add the day's row first
     }
     public void Dispose()
     {

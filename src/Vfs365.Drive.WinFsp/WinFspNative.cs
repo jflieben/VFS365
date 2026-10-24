@@ -53,6 +53,25 @@ static unsafe class WinFspNative
     public static IntPtr FileSystemOf(FileSystemHost host) =>
         (IntPtr)typeof(FileSystemHost).GetField("_FileSystemPtr", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!.GetValue(host)!;
 
+    /// <summary>
+    /// Sets VolumeParams.IrpTimeout (milliseconds; WinFsp accepts 1 to 10 minutes, otherwise uses its default), which the .NET layer
+    /// doesn't expose. Before mounting; false when this winfsp.net build has no such field.
+    /// </summary>
+    public static bool SetIrpTimeout(FileSystemHost host, TimeSpan timeout)
+    {
+        const System.Reflection.BindingFlags Instance = System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance;
+        var paramsField = typeof(FileSystemHost).GetField("_VolumeParams", Instance);
+        var timeoutField = paramsField?.FieldType.GetField("IrpTimeout", Instance);
+        if (paramsField is null || timeoutField is null || timeoutField.FieldType != typeof(uint))
+        {
+            return false;
+        }
+        var volumeParams = paramsField.GetValue(host)!; // a boxed copy of the struct
+        timeoutField.SetValue(volumeParams, (uint)timeout.TotalMilliseconds);
+        paramsField.SetValue(host, volumeParams);
+        return true;
+    }
+
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     static extern IntPtr GetModuleHandle(string moduleName);
 }

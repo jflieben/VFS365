@@ -10,8 +10,13 @@ public sealed record DiscoveredLibrary(string SiteId, string WebId, string ListI
     public string Key => LibraryKey.Of(SiteId, WebId, ListId);
 }
 
-/// <summary>LastDocId: the DocId of the page's last row, which the next page starts after; null when search didn't return it.</summary>
-public sealed record SearchPage(IReadOnlyList<DiscoveredLibrary> Libraries, int RowCount, long? LastDocId = null);
+/// <summary>
+/// LastDocId: the DocId of the page's last row, which the next page starts after; null when search didn't return it. DocIds: every
+/// row's DocId in row order (null for a row without), to check the order paging relies on. Geos: the GeoLocationSource values of the
+/// rows, when search reports them (multi-geo tenants).
+/// </summary>
+public sealed record SearchPage(IReadOnlyList<DiscoveredLibrary> Libraries, int RowCount, long? LastDocId = null, IReadOnlyList<long?>? DocIds = null,
+    IReadOnlyList<string>? Geos = null);
 
 public sealed record MyDrive(string DriveId, string WebUrl);
 
@@ -66,9 +71,10 @@ public sealed record CheckedExclusion(string Reason, DateTimeOffset CheckedAt);
 /// <summary>
 /// Kept between runs: the visible set (for the hiding safety check and to mount before discovery runs), libraries that never need
 /// another lookup, and the oldest time a shown library's metadata was read (the fallback for entries without CheckedAt).
+/// RunAt: when the last run whose search completed ended; a run whose search failed keeps the time before it (MinValue for none).
 /// TenantId: the signed-in tenant, when the caller passed it. Misses: shown libraries search didn't return, with the number of runs in
-/// a row (hidden at the second). Exclusions: libraries left out for a reason that can change (hidden, offline clients excluded).
-/// EmptyPins: pinned URLs where nothing was found or nothing is shown.
+/// a row (hidden at the second, or the third while the set shrank by more than the safety ratio). Exclusions: libraries left out for a
+/// reason that can change (hidden, offline clients excluded). EmptyPins: pinned URLs where nothing was found or nothing is shown.
 /// </summary>
 public sealed record DiscoveryState(
     DateTimeOffset RunAt,
@@ -85,6 +91,10 @@ public sealed record DiscoveryState(
     IReadOnlyDictionary<string, CheckedExclusion>? Exclusions = null,
     IReadOnlyDictionary<string, CheckedExclusion>? EmptyPins = null);
 
+/// <summary>
+/// SearchError: why search was incomplete (a page failed, too many pages); non-null means the run failed, though libraries from the
+/// last run stay. SearchNote: how search paged when DocId order didn't hold, for diagnostics.
+/// </summary>
 public sealed record DiscoveryResult(
     MyDrive OneDrive,
     string TenantRoot,
@@ -94,7 +104,8 @@ public sealed record DiscoveryResult(
     int SearchHits,
     string? SearchError,
     string? HidingSkippedReason,
-    DiscoveryState State);
+    DiscoveryState State,
+    string? SearchNote = null);
 
 public static class LibraryKey
 {

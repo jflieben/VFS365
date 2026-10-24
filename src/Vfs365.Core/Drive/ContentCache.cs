@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Security.Cryptography;
 using System.Text;
 using Microsoft.Win32.SafeHandles;
@@ -11,6 +12,9 @@ public sealed record ContentCacheOptions
 
     /// <summary>Encrypts content at rest; null keeps it plain (tests).</summary>
     public CacheCipher? Cipher { get; init; }
+
+    /// <summary>A download stream that brings no bytes for this long is given up (a failed attempt), and so is a read waiting for it.</summary>
+    public TimeSpan NoProgressTimeout { get; init; } = TimeSpan.FromSeconds(90);
 }
 
 /// <summary>
@@ -22,10 +26,14 @@ public sealed class ContentCache
 {
     const string KeyMarker = "key";
 
-    /// <summary>A complete cache file: size on disk, when this run completed it (earlier runs: MinValue) and when it was last used.</summary>
-    sealed class Entry(long length, DateTime completedAt, DateTime usedAt)
+    /// <summary>
+    /// A complete cache file: size on disk, the content length it holds (-1 when its size fits no content length), when this run
+    /// completed it (earlier runs: MinValue) and when it was last used.
+    /// </summary>
+    sealed class Entry(long length, long contentLength, DateTime completedAt, DateTime usedAt)
     {
         public long Length { get; } = length;
+        public long ContentLength { get; } = contentLength;
         public DateTime CompletedAt { get; } = completedAt;
         public DateTime UsedAt { get; set; } = usedAt;
     }
@@ -34,10 +42,14 @@ public sealed class ContentCache
     readonly IDriveApi api;
     readonly ContentCacheOptions options;
     readonly Dictionary<string, StreamingContent> streaming = new(StringComparer.OrdinalIgnoreCase);
+    readonly ConcurrentDictionary<string, string> driveFolders = new(StringComparer.Ordinal);
 
     /// <summary>Lock order: streaming before sizeGate, never the other way round.</summary>
     readonly Lock sizeGate = new();
     readonly Dictionary<string, Entry> files = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>The complete files of each item (by the path up to the version), so finding an item's versions needs no disk scan.</summary>
+    readonly Dictionary<string, HashSet<string>> versions = new(StringComparer.OrdinalIgnoreCase);
     long total;
 
     public ContentCache(string directory, IDriveApi api, ContentCacheOptions? options = null)
@@ -91,11 +103,24 @@ public sealed class ContentCache
                     return cached;
                 }
                 download = new StreamingContent(api, driveId, itemId, contentTag, length, path, NameOf(path), options.Cipher,
-                    finished => Completed(path, finished), gaveUp => Failed(path, gaveUp), changed);
+                    finished => Completed(path, finished), gaveUp => Failed(path, gaveUp), changed, options.NoProgressTimeout);
                 streaming[path] = download;
             }
             download.References++;
             return new Reference(this, path, download);
+        }
+    }
+
+    /// <summary>
+    /// The length of the complete cached content of this version, null when it isn't cached. Reads of it serve that many bytes, which
+    /// can differ from the size Graph lists (SharePoint writes properties into Office files as it serves them).
+    /// </summary>
+    public long? LengthOf(string driveId, string itemId, string? contentTag)
+    {
+        var path = PathFor(driveId, itemId, contentTag);
+        lock (sizeGate)
+        {
+            return files.TryGetValue(path, out var entry) && entry.ContentLength >= 0 ? entry.ContentLength : null;
         }
     }
 
@@ -193,7 +218,7 @@ public sealed class ContentCache
                 File.Move(temp, path, overwrite: true);
                 File.Delete(file);
             }
-            Added(path, length);
+            Added(path, DateTime.UtcNow);
         }
         catch (IOException)
         {
@@ -203,16 +228,28 @@ public sealed class ContentCache
         }
     }
 
-    /// <summary>Removes every cached version of an item (deleted, or no longer accessible).</summary>
+    /// <summary>Removes every cached version of an item (deleted, or no longer accessible); a download of it still running is dropped when it ends.</summary>
     public void ForgetItem(string driveId, string itemId)
     {
-        var folder = Path.Combine(directory, Hash(driveId));
-        if (Directory.Exists(folder))
+        var item = ItemOf(PathFor(driveId, itemId, null));
+        lock (streaming)
         {
-            foreach (var file in new DirectoryInfo(folder).EnumerateFiles($"{Hash(itemId)}-*").Where(f => f.Extension != ".part"))
+            foreach (var (path, download) in streaming)
             {
-                Remove(file.FullName);
+                if (ItemOf(path).Equals(item, StringComparison.OrdinalIgnoreCase))
+                {
+                    download.Forgotten = true;
+                }
             }
+        }
+        List<string> cached;
+        lock (sizeGate)
+        {
+            cached = versions.TryGetValue(item, out var known) ? [.. known] : [];
+        }
+        foreach (var path in cached)
+        {
+            Remove(path);
         }
     }
 
@@ -261,18 +298,41 @@ public sealed class ContentCache
         lock (sizeGate)
         {
             files.Clear();
+            versions.Clear();
             foreach (var file in new DirectoryInfo(directory).EnumerateDirectories().SelectMany(d => d.EnumerateFiles()).Where(f => f.Extension != ".part"))
             {
-                files[file.FullName] = new Entry(file.Length, DateTime.MinValue, file.LastAccessTimeUtc);
+                Track(file.FullName, new Entry(file.Length, ContentLengthOf(file.Length), DateTime.MinValue, file.LastAccessTimeUtc));
             }
             total = files.Values.Sum(f => f.Length);
         }
     }
 
-    string PathFor(string driveId, string itemId, string? contentTag) =>
-        Path.Combine(directory, Hash(driveId), $"{Hash(itemId)}-{Hash(contentTag ?? "")}");
+    /// <summary>Records a complete file. Called under sizeGate; the total is the caller's.</summary>
+    void Track(string path, Entry entry)
+    {
+        files[path] = entry;
+        var item = ItemOf(path);
+        if (!versions.TryGetValue(item, out var known))
+        {
+            versions[item] = known = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        }
+        known.Add(path);
+    }
 
-    static string Hash(string text) => Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(text)))[..16];
+    long ContentLengthOf(long stored) => options.Cipher is null ? stored : CacheCipher.ContentLength(stored);
+
+    string PathFor(string driveId, string itemId, string? contentTag) =>
+        Path.Combine(directory, driveFolders.GetOrAdd(driveId, Hash), $"{Hash(itemId)}-{Hash(contentTag ?? "")}");
+
+    /// <summary>A cache file's path up to its version: the same for every cached version of the item.</summary>
+    static string ItemOf(string path) => path[..(path.LastIndexOf('-') + 1)];
+
+    static string Hash(string text)
+    {
+        Span<byte> hash = stackalloc byte[SHA256.HashSizeInBytes];
+        SHA256.HashData(Encoding.UTF8.GetBytes(text), hash);
+        return Convert.ToHexString(hash[..8]);
+    }
 
     /// <summary>A cache file's name with its drive folder: what its encrypted chunks are bound to.</summary>
     static string NameOf(string path) => $"{Path.GetFileName(Path.GetDirectoryName(path))}/{Path.GetFileName(path)}";
@@ -318,6 +378,11 @@ public sealed class ContentCache
                 streaming.Remove(path);
             }
         }
+        if (finished.Forgotten)
+        {
+            TryDelete(path); // the item was deleted while it downloaded; readers keep their open handle
+            return;
+        }
         Added(path, finished.StartedAt);
     }
 
@@ -333,12 +398,9 @@ public sealed class ContentCache
         }
     }
 
-    /// <summary>A file adopted now: it is the newest version.</summary>
-    void Added(string path, long length) => Added(path, DateTime.UtcNow);
-
     /// <summary>
-    /// A new complete file, asked for at <paramref name="requestedAt"/>. Versions of the item completed before then are older and go;
-    /// one completed later may be newer and stays. Then the cache is trimmed, keeping this file.
+    /// A new complete file, asked for at <paramref name="requestedAt"/> (an adopted upload: now). Versions of the item completed before
+    /// then are older and go; one completed later may be newer and stays. Then the cache is trimmed, keeping this file.
     /// </summary>
     void Added(string path, DateTime requestedAt)
     {
@@ -348,28 +410,27 @@ public sealed class ContentCache
             return;
         }
         var now = DateTime.UtcNow;
+        var older = new List<string>();
         lock (sizeGate)
         {
             if (files.TryGetValue(path, out var replaced))
             {
                 total -= replaced.Length;
             }
-            files[path] = new Entry(info.Length, now, now);
+            Track(path, new Entry(info.Length, ContentLengthOf(info.Length), now, now));
             total += info.Length;
+            foreach (var other in versions[ItemOf(path)])
+            {
+                if (!other.Equals(path, StringComparison.OrdinalIgnoreCase) && !(files.TryGetValue(other, out var entry) && entry.CompletedAt >= requestedAt))
+                {
+                    older.Add(other);
+                }
+            }
         }
         Touch(path);
-        var item = info.Name[..info.Name.IndexOf('-')];
-        foreach (var other in info.Directory!.EnumerateFiles($"{item}-*").Where(f => f.Name != info.Name && f.Extension != ".part").Select(f => f.FullName).ToList())
+        foreach (var other in older)
         {
-            bool newer;
-            lock (sizeGate)
-            {
-                newer = files.TryGetValue(other, out var entry) && entry.CompletedAt >= requestedAt;
-            }
-            if (!newer)
-            {
-                Remove(other);
-            }
+            Remove(other);
         }
         Evict(path);
     }
@@ -388,35 +449,48 @@ public sealed class ContentCache
         {
             busy = new HashSet<string>(streaming.Keys, StringComparer.OrdinalIgnoreCase);
         }
+        // Chosen under the lock, deleted after it: reads of the cache don't wait for the disk
+        var victims = new List<string>();
         lock (sizeGate)
         {
             var target = options.MaxBytes / 10 * 9;
-            foreach (var path in files.OrderBy(f => f.Value.UsedAt).Select(f => f.Key).ToList())
+            var left = total;
+            foreach (var (path, entry) in files.OrderBy(f => f.Value.UsedAt))
             {
-                if (total <= target)
+                if (left <= target)
                 {
-                    return;
+                    break;
                 }
                 if (!path.Equals(keep, StringComparison.OrdinalIgnoreCase) && !busy.Contains(path))
                 {
-                    Remove(path);
+                    victims.Add(path);
+                    left -= entry.Length;
                 }
             }
+        }
+        foreach (var path in victims)
+        {
+            Remove(path);
         }
     }
 
     /// <summary>Deletes a complete file; the total drops only when this call removed it.</summary>
     void Remove(string path)
     {
+        if (File.Exists(path) && !TryDelete(path))
+        {
+            return;
+        }
         lock (sizeGate)
         {
-            if (File.Exists(path) && !TryDelete(path))
-            {
-                return;
-            }
             if (files.Remove(path, out var entry))
             {
                 total -= entry.Length;
+            }
+            var item = ItemOf(path);
+            if (versions.TryGetValue(item, out var known) && known.Remove(path) && known.Count == 0)
+            {
+                versions.Remove(item);
             }
         }
     }

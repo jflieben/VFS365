@@ -11,7 +11,7 @@ public sealed class ChangeFeedTests : IDisposable
 
     readonly List<string> log = [];
 
-    DriveEngine Create(FakeDriveApi api, int maxCachedItems = 250_000) =>
+    DriveEngine Create(IDriveApi api, int maxCachedItems = 250_000) =>
         new(DriveNamespace.Build(new MyDrive("b!me", "https://x-my.sharepoint.com/personal/u"), [], (_, _) => Task.FromResult("unused"), DriveScope.OneDrive),
             api,
             new ContentCache(Path.Combine(directory, "cache"), api),
@@ -418,6 +418,252 @@ public sealed class ChangeFeedTests : IDisposable
         api.Add("docs/b.txt");
         await engine.PollAsync("b!me");
         Assert.NotEqual(version, engine.MetadataVersion);
+    }
+
+    /// <summary>Clients\Acme\2026\order.xlsx, where the user may list 2026 but not the folders above it (broken inheritance).</summary>
+    static (FakeDriveApi Fake, StallingDriveApi Api) ClientFolders(bool listable)
+    {
+        var fake = new FakeDriveApi();
+        fake.Add("Clients", folder: true);
+        fake.Add("Clients/Acme", folder: true);
+        fake.Add("Clients/Acme/2026", folder: true);
+        fake.Add("Clients/Acme/2026/order.xlsx");
+        var api = new StallingDriveApi(fake);
+        if (!listable)
+        {
+            api.Unlistable.UnionWith(["Clients", "Clients/Acme"]);
+        }
+        return (fake, api);
+    }
+
+    [Fact]
+    public async Task A_rename_of_a_folder_above_a_cached_listing_is_seen_when_that_folder_is_not_cached()
+    {
+        var (fake, api) = ClientFolders(listable: false);
+        var engine = Create(api);
+        await engine.PollAsync("b!me");
+        Assert.Equal(["order.xlsx"], await Names(engine, "\\Clients\\Acme\\2026"));
+
+        // A colleague archives Acme and starts a new one
+        fake.RemoteMove("Clients/Acme", "Clients/Acme (archive)");
+        fake.Add("Clients/Acme", folder: true);
+        await engine.PollAsync("b!me");
+
+        Assert.Null(await engine.GetEntryAsync("\\Clients\\Acme\\2026\\order.xlsx", default));
+        Assert.True(Saw("\\Clients\\Acme", ChangeKind.Removed));
+    }
+
+    [Fact]
+    public async Task Below_a_folder_that_is_not_cached_a_listing_answers_only_briefly()
+    {
+        var (fake, api) = ClientFolders(listable: false);
+        var engine = Create(api);
+        await engine.PollAsync("b!me");
+        Assert.Equal(["order.xlsx"], await Names(engine, "\\Clients\\Acme\\2026"));
+
+        // Two levels up, where nothing is cached: the feed can't tell the listing moved
+        fake.RemoteMove("Clients", "Old clients");
+        await engine.PollAsync("b!me");
+        now += TimeSpan.FromSeconds(61);
+
+        Assert.Null(await engine.GetEntryAsync("\\Clients\\Acme\\2026\\order.xlsx", default));
+    }
+
+    [Fact]
+    public async Task A_folder_opened_by_path_gets_the_folders_above_it_listed_and_stays_current()
+    {
+        var (fake, api) = ClientFolders(listable: true);
+        var engine = Create(api);
+        await engine.PollAsync("b!me");
+        Assert.Equal(["order.xlsx"], await Names(engine, "\\Clients\\Acme\\2026"));
+        await Eventually(() => fake.ListCalls == 3); // Clients and Acme too, in the background
+        await Names(engine, "\\Clients\\Acme"); // joins those loads
+        await Names(engine, "\\Clients");
+
+        now += TimeSpan.FromHours(1);
+        var gets = fake.GetCalls;
+        Assert.NotNull(await engine.GetEntryAsync("\\Clients\\Acme\\2026\\order.xlsx", default));
+        Assert.Equal(gets, fake.GetCalls); // kept current by the feed: no lookup
+
+        fake.RemoteMove("Clients", "Old clients");
+        await engine.PollAsync("b!me");
+
+        Assert.Null(await engine.GetEntryAsync("\\Clients\\Acme\\2026\\order.xlsx", default));
+        Assert.True(Saw("\\Clients", ChangeKind.Removed));
+        Assert.Equal(["Clients/Acme/2026", "Clients/Acme", "Clients"], api.Listed.Order(StringComparer.Ordinal).Reverse());
+    }
+
+    [Fact]
+    public async Task A_listing_whose_refresh_finds_the_folder_gone_is_dropped()
+    {
+        var fake = new FakeDriveApi { DeltaUnavailable = true };
+        fake.Add("docs", folder: true);
+        fake.Add("docs/sub", folder: true);
+        fake.Add("docs/sub/a.txt");
+        var engine = Create(new StallingDriveApi(fake)); // answers 404 for a folder that isn't there, as Graph does
+        var sub = (await engine.GetEntryAsync("\\docs\\sub", default))!;
+        Assert.Equal(["a.txt"], (await engine.ListAsync(sub, default)).Select(e => e.Name));
+
+        fake.RemoteDelete("docs/sub"); // never seen: the feed doesn't work
+        now += TimeSpan.FromMinutes(2);
+        var stale = await engine.ListAsync(sub, default);
+        await Eventually(() => Saw("\\docs\\sub", ChangeKind.Removed));
+
+        Assert.Equal(["a.txt"], stale.Select(e => e.Name));
+        var gone = await Assert.ThrowsAsync<Vfs365.Core.RemoteException>(() => engine.ListAsync(sub, default));
+        Assert.Equal(Vfs365.Core.RemoteError.NotFound, gone.Error);
+    }
+
+    [Fact]
+    public async Task A_file_opened_after_the_drive_was_idle_is_the_version_now_in_Microsoft_365()
+    {
+        var api = new FakeDriveApi();
+        api.Add("docs", folder: true);
+        api.Add("docs/a.txt", content: "one");
+        var engine = Create(api);
+        await engine.PollAsync("b!me");
+        await Names(engine, "\\docs");
+
+        now += TimeSpan.FromMinutes(15); // nothing read the feed meanwhile
+        api.RemoteEdit("docs/a.txt", "two two");
+
+        Assert.Equal(7, (await engine.GetEntryAsync("\\docs\\a.txt", default))!.Size);
+    }
+
+    [Fact]
+    public async Task A_file_opened_right_after_a_restart_is_the_version_now_in_Microsoft_365()
+    {
+        var api = new FakeDriveApi();
+        api.Add("docs", folder: true);
+        api.Add("docs/a.txt", content: "one");
+        var first = Create(api);
+        await first.PollAsync("b!me");
+        await Names(first, "\\");
+        await Names(first, "\\docs");
+        var snapshots = first.ExportSnapshots(100);
+
+        api.RemoteEdit("docs/a.txt", "two two");
+        var second = Create(api);
+        second.ImportSnapshots(snapshots);
+
+        Assert.Equal(7, (await second.GetEntryAsync("\\docs\\a.txt", default))!.Size);
+    }
+
+    [Fact]
+    public async Task A_file_saved_while_its_folder_loads_stays_in_the_listing()
+    {
+        var api = new FakeDriveApi { PageSize = 2 };
+        api.Add("docs", folder: true);
+        for (var i = 1; i <= 5; i++)
+        {
+            api.Add($"docs/f{i}.txt");
+        }
+        var engine = Create(api);
+        await engine.PollAsync("b!me");
+        var rest = new TaskCompletionSource();
+        api.BeforeNextPage = () => rest.Task;
+        var loading = engine.ListAsync((await engine.GetEntryAsync("\\docs", default))!, default);
+
+        await engine.CreateAsync("\\docs\\new.txt", false, default);
+        await engine.CommitAsync("\\docs\\new.txt", default); // the listing's pages were read before
+        rest.SetResult();
+        await loading;
+        var lists = api.ListCalls;
+
+        Assert.Contains("new.txt", await Names(engine, "\\docs"));
+        Assert.Equal(lists, api.ListCalls);
+    }
+
+    [Fact]
+    public async Task A_file_saved_while_its_folder_is_read_again_stays_in_the_listing()
+    {
+        var api = new FakeDriveApi { PageSize = 2 };
+        api.Add("docs", folder: true);
+        for (var i = 1; i <= 5; i++)
+        {
+            api.Add($"docs/f{i}.txt");
+        }
+        var engine = Create(api);
+        await engine.PollAsync("b!me");
+        await Names(engine, "\\docs");
+        api.AddUnnoticed("docs/elsewhere.txt"); // only the refresh brings this one
+        engine.ExpireListings();
+        var (reading, rest) = (new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously), new TaskCompletionSource());
+        api.BeforeNextPage = () =>
+        {
+            reading.TrySetResult();
+            return rest.Task;
+        };
+
+        await Names(engine, "\\docs"); // answers from the stale listing; the refresh holds after its first page
+        await reading.Task;
+        await engine.CreateAsync("\\docs\\new.txt", false, default);
+        await engine.CommitAsync("\\docs\\new.txt", default);
+        rest.SetResult();
+        await Eventually(() => Saw("\\docs\\elsewhere.txt", ChangeKind.Added));
+
+        Assert.Contains("new.txt", await Names(engine, "\\docs"));
+        Assert.False(Saw("\\docs\\new.txt", ChangeKind.Removed));
+    }
+
+    [Fact]
+    public async Task A_change_read_before_a_save_does_not_put_back_the_older_version()
+    {
+        var fake = new FakeDriveApi();
+        fake.Add("docs", folder: true);
+        fake.Add("docs/a.txt", content: "v1");
+        var api = new StallingDriveApi(fake) { GraphTags = true };
+        var engine = Create(api);
+        await engine.PollAsync("b!me");
+        await Names(engine, "\\docs");
+        await SaveAsync(engine, "\\docs\\a.txt", "v2");
+
+        // A feed read that brings v2 back is held until v3 is saved
+        var (read, held) = (new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously), new TaskCompletionSource());
+        api.AfterDeltaRead = () =>
+        {
+            read.TrySetResult();
+            return held.Task;
+        };
+        var polling = engine.PollAsync("b!me");
+        await read.Task;
+        api.AfterDeltaRead = null;
+        await SaveAsync(engine, "\\docs\\a.txt", "v3");
+        held.SetResult();
+        await polling;
+        await SaveAsync(engine, "\\docs\\a.txt", "v4");
+
+        Assert.Equal("v4", fake.ContentOf("docs/a.txt"));
+        Assert.DoesNotContain(fake.Paths, path => path.Contains("conflict"));
+    }
+
+    static async Task SaveAsync(DriveEngine engine, string path, string text)
+    {
+        var entry = (await engine.GetEntryAsync(path, default))!;
+        var staging = await engine.OpenForWriteAsync(entry, truncate: true, default);
+        await File.WriteAllTextAsync(staging, text);
+        engine.MarkDirty((await engine.GetEntryAsync(path, default))!);
+        await engine.CommitAsync(path, default);
+    }
+
+    [Fact]
+    public async Task A_drive_whose_change_feed_fails_gets_no_push_channel()
+    {
+        var api = new FakeDriveApi { DeltaUnavailable = true };
+        api.Add("docs", folder: true);
+        var engine = Create(api);
+
+        await Names(engine, "\\docs");
+        await Eventually(() =>
+        {
+            lock (log)
+            {
+                return log.Any(line => line.Contains("change feed of"));
+            }
+        });
+
+        Assert.Equal(["b!me"], engine.ActiveDrives());
+        Assert.Empty(engine.PushDrives());
     }
 
     public void Dispose()

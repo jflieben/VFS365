@@ -328,7 +328,9 @@ public sealed class WriteIntegrityTests : IDisposable
     {
         api.Add("notes.txt", content: "v1");
         var engine = Create();
-        await SaveAsync(engine, "notes.txt", "mine", close: false);
+        api.FailUpload = _ => new RemoteException(RemoteError.Unavailable, "503");
+        await SaveAsync(engine, "notes.txt", "mine");
+        api.FailUpload = null;
         api.RemoteEdit("notes.txt", "them");
 
         var restarted = Create();
@@ -337,6 +339,344 @@ public sealed class WriteIntegrityTests : IDisposable
 
         Assert.Equal("them", api.ContentOf("notes.txt"));
         Assert.Equal("mine", api.ContentOf(Assert.Single(api.Paths, p => p.Contains("(conflict", StringComparison.Ordinal))));
+    }
+
+    [Fact]
+    public async Task A_recovered_file_that_was_never_flushed_goes_only_into_a_recovered_copy()
+    {
+        var original = api.Add("notes.txt", content: "v1");
+        var engine = Create();
+        await SaveAsync(engine, "notes.txt", "maybe zeros", close: false);
+        await WriteNewAsync(engine, "new.txt", "new, maybe zeros", close: false);
+
+        var restarted = Create();
+        Assert.Equal(2, restarted.Recover());
+        await DueAsync(restarted, TimeSpan.Zero);
+
+        Assert.Equal("v1", api.ContentOf("notes.txt"));
+        Assert.Equal(original.Id, api.ItemAt("notes.txt")!.Id);
+        Assert.Equal("maybe zeros", api.ContentOf(Assert.Single(api.Paths, p => p.StartsWith("notes (recovered ", StringComparison.Ordinal))));
+        Assert.Equal("new, maybe zeros", api.ContentOf(Assert.Single(api.Paths, p => p.StartsWith("new (recovered ", StringComparison.Ordinal))));
+        Assert.DoesNotContain("new.txt", api.Paths);
+        Assert.Empty(restarted.Unsaved());
+        Assert.Equal(2, notices.Count(n => n.Kind == NoticeKind.ConflictCopy));
+    }
+
+    [Fact]
+    public async Task A_journal_from_before_the_flushed_marker_recovers_into_its_item()
+    {
+        // 0.4.x flushed staging at every close and wrote no Flushed field: after the upgrade its saves go into their items
+        var original = api.Add("notes.txt", content: "v1");
+        var engine = Create();
+        await SaveAsync(engine, "notes.txt", "saved offline", close: false);
+        foreach (var journal in Directory.EnumerateFiles(Staging, "*.staging.json"))
+        {
+            var record = System.Text.Json.Nodes.JsonNode.Parse(File.ReadAllText(journal))!.AsObject();
+            record.Remove("Flushed");
+            File.WriteAllText(journal, record.ToJsonString());
+        }
+
+        var restarted = Create();
+        Assert.Equal(1, restarted.Recover());
+        await DueAsync(restarted, TimeSpan.Zero);
+
+        Assert.Equal("saved offline", api.ContentOf("notes.txt"));
+        Assert.Equal(original.Id, api.ItemAt("notes.txt")!.Id);
+        Assert.DoesNotContain(api.Paths, p => p.Contains("(recovered ", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task Own_save_then_a_colleagues_save_shows_theirs_and_the_next_save_builds_on_it()
+    {
+        // P1: Alice saves, Bob saves later, Alice opens: she reads Bob's version, not hers, and her next save goes on top of it
+        api.Add("plan.txt", content: "v1");
+        var engine = Create();
+        await engine.PollAsync("b!me");
+        await engine.ListAsync((await engine.GetEntryAsync("\\OneDrive", default))!, default);
+        await SaveAsync(engine, "plan.txt", "alice");
+        now += TimeSpan.FromMinutes(20);
+        api.RemoteEdit("plan.txt", "bob");
+        await engine.PollAsync("b!me");
+
+        var opened = (await engine.GetEntryAsync(Root + "plan.txt", default))!;
+        Assert.Equal("bob", await ReadAllAsync(engine, opened));
+
+        var staged = await engine.StageAsync(opened, truncate: false, default);
+        await File.AppendAllTextAsync(staged.StagingPath!, " + alice again");
+        engine.MarkDirty(staged);
+        await engine.CommitAsync(Root + "plan.txt", default);
+
+        Assert.Equal("bob + alice again", api.ContentOf("plan.txt"));
+        Assert.Equal(["plan.txt"], api.Paths);
+    }
+
+    [Fact]
+    public async Task A_handle_on_an_own_save_that_writes_after_a_colleagues_save_ends_in_a_conflict_copy()
+    {
+        api.Add("plan.txt", content: "v1");
+        var engine = Create();
+        await engine.PollAsync("b!me");
+        await engine.ListAsync((await engine.GetEntryAsync("\\OneDrive", default))!, default);
+        await SaveAsync(engine, "plan.txt", "alice");
+        var handle = (await engine.GetEntryAsync(Root + "plan.txt", default))!;
+        Assert.Equal("alice", await ReadAllAsync(engine, handle));
+        api.RemoteEdit("plan.txt", "bob");
+        await engine.PollAsync("b!me");
+
+        // The handle read Alice's version: its in-place write never lands in Bob's
+        var staged = await engine.StageAsync(engine.Follow(handle), truncate: false, default);
+        Assert.Equal("alice", await File.ReadAllTextAsync(staged.StagingPath!));
+        await File.AppendAllTextAsync(staged.StagingPath!, " edited");
+        engine.MarkDirty(staged);
+        await engine.CommitAsync(Root + "plan.txt", default);
+
+        Assert.Equal("bob", api.ContentOf("plan.txt"));
+        Assert.Equal("alice edited", api.ContentOf(Assert.Single(api.Paths, p => p.Contains("(conflict", StringComparison.Ordinal))));
+    }
+
+    [Fact]
+    public async Task A_handle_on_a_version_before_a_colleagues_save_never_writes_into_theirs()
+    {
+        api.Add("plan.txt", content: "v1");
+        var engine = Create();
+        await engine.PollAsync("b!me");
+        await engine.ListAsync((await engine.GetEntryAsync("\\OneDrive", default))!, default);
+        var handle = (await engine.GetEntryAsync(Root + "plan.txt", default))!;
+        Assert.Equal("v1", await ReadAllAsync(engine, handle));
+        api.RemoteEdit("plan.txt", "bob");
+        await engine.PollAsync("b!me");
+
+        var staged = await engine.StageAsync(handle, truncate: false, default);
+        await File.AppendAllTextAsync(staged.StagingPath!, " edited");
+        engine.MarkDirty(staged);
+        await engine.CommitAsync(Root + "plan.txt", default);
+
+        Assert.Equal("bob", api.ContentOf("plan.txt"));
+        Assert.Equal("v1 edited", api.ContentOf(Assert.Single(api.Paths, p => p.Contains("(conflict", StringComparison.Ordinal))));
+        Assert.DoesNotContain(api.Uploads, u => u.IfMatch is { } ifMatch && ifMatch.StartsWith("c", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task A_metadata_change_on_the_server_does_not_end_a_save_in_a_conflict_copy()
+    {
+        var original = api.Add("log.txt", content: "v1");
+        var engine = Create();
+        await SaveAsync(engine, "log.txt", "v2", close: false);
+        api.RemoteMetadataEdit("log.txt"); // a column or Document ID: new eTag, same content
+
+        await engine.CommitAsync(Root + "log.txt", default);
+
+        Assert.Equal("v2", api.ContentOf("log.txt"));
+        Assert.Equal(original.Id, api.ItemAt("log.txt")!.Id);
+        Assert.DoesNotContain(api.Paths, p => p.Contains("(conflict", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task An_upload_Microsoft_365_refuses_is_not_retried_and_stays_unsaved()
+    {
+        var engine = Create(background: true);
+        api.FailUpload = _ => new RemoteException(RemoteError.Rejected, "400 invalidRequest: the name isn't allowed");
+        await WriteNewAsync(engine, "report.txt", "x");
+        await engine.WaitForUploadsAsync();
+        var attempts = api.Uploads.Count;
+
+        await DueAsync(engine, TimeSpan.FromHours(1));
+        await DueAsync(engine, TimeSpan.FromHours(1));
+
+        Assert.Single(engine.Unsaved());
+        Assert.Equal(0, engine.WaitingToUpload());
+        Assert.Single(notices, n => n.Kind == NoticeKind.UploadWaiting);
+        Assert.Empty(api.Paths);
+
+        // Renamed, it is tried again
+        api.FailUpload = null;
+        await engine.RenameAsync(Root + "report.txt", Root + "report2.txt", false, default);
+        await engine.WaitForUploadsAsync();
+        Assert.Equal("x", api.ContentOf("report2.txt"));
+        Assert.Equal(attempts, api.Uploads.Count - 1);
+    }
+
+    [Fact]
+    public async Task A_rename_save_into_an_item_deleted_on_the_server_creates_it_anew()
+    {
+        api.Add("book.xlsx", content: "v1");
+        var engine = Create();
+        await WriteNewAsync(engine, "8A3F1C2D", "v2");
+        await engine.DeleteAsync(Root + "book.xlsx", default);
+        api.RemoteDelete("book.xlsx");
+
+        await engine.RenameAsync(Root + "8A3F1C2D", Root + "book.xlsx", false, default);
+
+        Assert.Equal("v2", api.ContentOf("book.xlsx"));
+        Assert.Equal(["book.xlsx"], api.Paths);
+    }
+
+    [Fact]
+    public async Task Changes_nobody_closed_upload_at_unmount()
+    {
+        api.Add("data.txt", content: "v1");
+        var engine = Create();
+        await SaveAsync(engine, "data.txt", "v2 open", close: false);
+
+        await engine.ProcessDueAsync(all: true, default);
+
+        Assert.Equal("v2 open", api.ContentOf("data.txt"));
+        Assert.Empty(engine.Unsaved());
+    }
+
+    [Fact]
+    public async Task Word_saving_a_file_with_changes_not_uploaded_yet_deletes_nothing()
+    {
+        // The last save waits for the repeat window, then Word saves again: the original with those changes steps aside and is deleted
+        var original = api.Add("report.docx", content: "v1");
+        var engine = Create(repeatWindow: TimeSpan.FromSeconds(30));
+        await SaveAsync(engine, "report.docx", "v2");
+        await SaveAsync(engine, "report.docx", "v3 waiting");
+        Assert.Single(engine.Unsaved());
+
+        await WriteNewAsync(engine, "~WRD0000.tmp", "v4");
+        await engine.RenameAsync(Root + "report.docx", Root + "~WRL0001.tmp", false, default);
+        Assert.Null(await engine.GetEntryAsync(Root + "report.docx", default));
+        await engine.RenameAsync(Root + "~WRD0000.tmp", Root + "report.docx", false, default);
+        await engine.DeleteAsync(Root + "~WRL0001.tmp", default);
+        await DueAsync(engine, TimeSpan.FromMinutes(1));
+        await DueAsync(engine, TimeSpan.FromMinutes(1));
+
+        Assert.Equal(0, api.Deletes);
+        Assert.Equal(original.Id, api.ItemAt("report.docx")!.Id);
+        Assert.Equal("v4", api.ContentOf("report.docx"));
+        Assert.Equal(["report.docx"], api.Paths);
+    }
+
+    [Fact]
+    public async Task A_file_with_changes_renamed_to_a_temp_name_and_left_there_goes_back_and_uploads()
+    {
+        var original = api.Add("notes.txt", content: "v1");
+        var engine = Create(repeatWindow: TimeSpan.FromSeconds(30));
+        await SaveAsync(engine, "notes.txt", "v2");
+        await SaveAsync(engine, "notes.txt", "v3 waiting");
+
+        await engine.RenameAsync(Root + "notes.txt", Root + "notes.tmp", false, default);
+        await DueAsync(engine, TimeSpan.FromSeconds(5));
+        Assert.Equal("v2", api.ContentOf("notes.txt"));
+
+        await DueAsync(engine, TimeSpan.FromMinutes(1));
+        await DueAsync(engine, TimeSpan.FromMinutes(1));
+        Assert.Equal("v3 waiting", api.ContentOf("notes.txt"));
+        Assert.Equal(original.Id, api.ItemAt("notes.txt")!.Id);
+        Assert.Equal(["notes.txt"], api.Paths);
+        Assert.Null(await engine.GetEntryAsync(Root + "notes.tmp", default));
+    }
+
+    [Fact]
+    public async Task A_file_with_changes_renamed_to_a_temp_name_goes_back_after_a_crash_and_its_temp_name_reaches_nothing()
+    {
+        var original = api.Add("notes.txt", content: "v1");
+        var engine = Create(repeatWindow: TimeSpan.FromSeconds(30));
+        await SaveAsync(engine, "notes.txt", "v2");
+        await SaveAsync(engine, "notes.txt", "v3 waiting");
+        await engine.RenameAsync(Root + "notes.txt", Root + "notes.tmp", false, default);
+
+        var restarted = Create();
+        Assert.Equal(1, restarted.Recover());
+        await DueAsync(restarted, TimeSpan.FromMinutes(1));
+        await DueAsync(restarted, TimeSpan.FromMinutes(1));
+
+        Assert.Equal("v3 waiting", api.ContentOf("notes.txt"));
+        Assert.Equal(original.Id, api.ItemAt("notes.txt")!.Id);
+        Assert.Null(await restarted.GetEntryAsync(Root + "notes.tmp", default));
+        await Assert.ThrowsAsync<FsException>(() => restarted.DeleteAsync(Root + "notes.tmp", default));
+        await DueAsync(restarted, TimeSpan.FromMinutes(1));
+        Assert.Equal(0, api.Deletes);
+    }
+
+    [Fact]
+    public async Task A_claimed_original_renamed_to_a_real_name_never_takes_the_save_along()
+    {
+        // Word's backup copy: the original steps aside, the save goes into its item, then the original is renamed to the backup name
+        var original = api.Add("report.docx", content: "v1");
+        var engine = Create();
+        await WriteNewAsync(engine, "~WRD0000.tmp", "v2");
+        await engine.RenameAsync(Root + "report.docx", Root + "~WRL0001.tmp", false, default);
+        await engine.RenameAsync(Root + "~WRD0000.tmp", Root + "report.docx", false, default);
+
+        // v1 isn't cached here: no backup can be made, the rename is refused
+        await Assert.ThrowsAsync<FsException>(() => engine.RenameAsync(Root + "~WRL0001.tmp", Root + "Backup of report.wbk", false, default));
+        await DueAsync(engine, TimeSpan.FromMinutes(1));
+
+        Assert.Equal(original.Id, api.ItemAt("report.docx")!.Id);
+        Assert.Equal("v2", api.ContentOf("report.docx"));
+        Assert.Equal(["report.docx"], api.Paths);
+        Assert.Equal(0, api.Moves + api.Deletes);
+    }
+
+    [Fact]
+    public async Task A_claimed_original_renamed_to_a_real_name_becomes_a_copy_of_the_version_before()
+    {
+        var original = api.Add("report.docx", content: "v1");
+        api.GrowOnUpload = 10; // SharePoint writes properties into Office files: v1 stays cached next to the upload
+        var engine = Create();
+        Assert.Equal("v1", await ReadAllAsync(engine, (await engine.GetEntryAsync(Root + "report.docx", default))!));
+        await WriteNewAsync(engine, "~WRD0000.tmp", "v2");
+        await engine.RenameAsync(Root + "report.docx", Root + "~WRL0001.tmp", false, default);
+        await engine.RenameAsync(Root + "~WRD0000.tmp", Root + "report.docx", false, default);
+
+        await engine.RenameAsync(Root + "~WRL0001.tmp", Root + "Backup of report.wbk", false, default);
+        await DueAsync(engine, TimeSpan.FromMinutes(1));
+
+        Assert.Equal(original.Id, api.ItemAt("report.docx")!.Id);
+        Assert.Equal("v2", api.ContentOf("report.docx"));
+        Assert.Equal("v1", api.ContentOf("Backup of report.wbk"));
+        Assert.Equal(0, api.Moves + api.Deletes);
+    }
+
+    [Fact]
+    public async Task Deleting_a_folder_after_its_files_sends_one_delete()
+    {
+        api.Add("old", folder: true);
+        for (var i = 0; i < 30; i++)
+        {
+            api.Add($"old/f{i}.txt");
+        }
+        var engine = Create();
+        foreach (var file in await engine.ListAsync((await engine.GetEntryAsync(Root + "old", default))!, default))
+        {
+            await engine.DeleteAsync(file.Path, default);
+        }
+        await engine.DeleteAsync(Root + "old", default);
+        await DueAsync(engine, TimeSpan.FromMinutes(1));
+
+        Assert.Equal(1, api.Deletes);
+        Assert.Empty(api.Paths);
+    }
+
+    [Fact]
+    public async Task A_bulk_delete_does_not_hold_up_saves()
+    {
+        for (var i = 0; i < 20; i++)
+        {
+            api.Add($"f{i}.txt");
+        }
+        api.Add("notes.txt", content: "v1");
+        var engine = Create();
+        for (var i = 0; i < 20; i++)
+        {
+            await engine.DeleteAsync(Root + $"f{i}.txt", default);
+        }
+        var network = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        api.BeforeDelete = () => network.Task;
+
+        now += TimeSpan.FromMinutes(1);
+        await engine.ProcessDueAsync(false, default);
+        await SaveAsync(engine, "notes.txt", "v2"); // while every delete is still waiting for the network
+
+        Assert.Equal("v2", api.ContentOf("notes.txt"));
+        Assert.Equal(0, api.Deletes);
+        Assert.Null(await engine.GetEntryAsync(Root + "f3.txt", default));
+        network.SetResult();
+        await engine.WaitForUploadsAsync();
+        Assert.Equal(20, api.Deletes);
+        Assert.Equal(["notes.txt"], api.Paths);
     }
 
     [Fact]
@@ -392,7 +732,7 @@ public sealed class WriteIntegrityTests : IDisposable
     }
 
     [Fact]
-    public async Task A_file_renamed_to_a_temp_name_after_its_close_never_uploads()
+    public async Task A_file_renamed_to_a_temp_name_after_its_close_uploads_only_when_still_there_minutes_later()
     {
         var engine = Create(background: true);
         api.FailUpload = _ => new RemoteException(RemoteError.Unavailable, "503");
@@ -402,11 +742,33 @@ public sealed class WriteIntegrityTests : IDisposable
 
         await engine.RenameAsync(Root + "draft.txt", Root + "draft.tmp", false, default);
         api.FailUpload = null;
-        await DueAsync(engine, TimeSpan.FromMinutes(5));
+        await DueAsync(engine, TimeSpan.FromMinutes(4));
 
         Assert.Empty(api.Paths);
         Assert.Equal(0, engine.WaitingToUpload());
+        Assert.Single(engine.Unsaved());
         Assert.NotNull(await engine.GetEntryAsync(Root + "draft.tmp", default));
+
+        await DueAsync(engine, TimeSpan.FromMinutes(2));
+        Assert.Equal("x", api.ContentOf("draft.tmp"));
+        Assert.Empty(engine.Unsaved());
+    }
+
+    [Fact]
+    public async Task A_new_file_renamed_to_a_temp_name_and_deleted_never_uploads()
+    {
+        var engine = Create(background: true);
+        api.FailUpload = _ => new RemoteException(RemoteError.Unavailable, "503");
+        await WriteNewAsync(engine, "draft.txt", "x");
+        await engine.WaitForUploadsAsync();
+
+        await engine.RenameAsync(Root + "draft.txt", Root + "draft.tmp", false, default);
+        await engine.DeleteAsync(Root + "draft.tmp", default);
+        api.FailUpload = null;
+        await DueAsync(engine, TimeSpan.FromMinutes(10));
+
+        Assert.Empty(api.Paths);
+        Assert.Empty(engine.Unsaved());
     }
 
     [Fact]

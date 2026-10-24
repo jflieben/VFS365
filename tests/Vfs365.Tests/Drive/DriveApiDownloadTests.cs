@@ -25,13 +25,21 @@ public sealed class DriveApiDownloadTests
         public bool SelectDropsUrl { get; set; }
         public byte[] Content { get; set; } = Encoding.UTF8.GetBytes("hello");
 
+        /// <summary>The ETag header downloads answer with; none when null.</summary>
+        public string? DownloadETag { get; set; }
+
         protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
         {
             if (request.RequestUri!.Host == "dl.test")
             {
                 Interlocked.Increment(ref Downloads);
                 Assert.Null(request.Headers.Authorization);
-                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent(Content) });
+                var download = new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent(Content) };
+                if (DownloadETag is { } tag)
+                {
+                    download.Headers.ETag = new System.Net.Http.Headers.EntityTagHeaderValue(tag);
+                }
+                return Task.FromResult(download);
             }
             var query = Uri.UnescapeDataString(request.RequestUri.Query);
             ItemRequests.Add(query);
@@ -62,6 +70,38 @@ public sealed class DriveApiDownloadTests
         Assert.Contains("$select=", request);
         Assert.Contains("@microsoft.graph.downloadUrl", request);
         Assert.Equal(2, server.Downloads);
+    }
+
+    [Fact]
+    public async Task A_reused_download_url_serving_another_version_fails_instead_of_mixing_versions()
+    {
+        var server = new Server { DownloadETag = "\"{AB12},3\"" };
+        var api = new DriveApi(new M365Client(new HttpClient(server), new Tokens()));
+        Assert.Equal("hello", await ReadAsync(api, server.CTag));
+
+        server.DownloadETag = "\"{AB12},4\"";
+        Assert.True((await Assert.ThrowsAsync<ContentChangedException>(() => ReadAsync(api, server.CTag))).OtherVersion);
+    }
+
+    [Fact]
+    public async Task A_download_url_is_reused_only_briefly_so_a_same_size_save_by_a_colleague_is_seen()
+    {
+        var server = new Server();
+        var now = new DateTimeOffset(2026, 10, 24, 12, 0, 0, TimeSpan.Zero);
+        var api = new DriveApi(new M365Client(new HttpClient(server), new Tokens()) { Clock = () => now });
+        var listed = server.CTag;
+        Assert.Equal("hello", await ReadAsync(api, listed));
+
+        // A colleague saves a new version of the same length
+        server.CTag = "\"c:{AB12},3\"";
+        server.ETag = "\"{AB12},4\"";
+        server.Content = Encoding.UTF8.GetBytes("HELLO");
+        now += TimeSpan.FromSeconds(30);
+
+        var changed = await Assert.ThrowsAsync<ContentChangedException>(() => ReadAsync(api, listed));
+        Assert.True(changed.OtherVersion);
+        Assert.Equal(1, server.Downloads);
+        Assert.Equal(2, server.ItemRequests.Count);
     }
 
     [Fact]

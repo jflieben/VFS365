@@ -47,6 +47,26 @@ public sealed class DatabaseFilesTests : IDisposable
     }
 
     [Fact]
+    public async Task A_rename_onto_a_database_name_is_refused_when_policy_keeps_them_read_only()
+    {
+        var api = new FakeDriveApi();
+        api.Add("orders.accdb", content: "database");
+        api.Add("notes.txt", content: "not a database");
+        var engine = Create(api, DatabaseFilePolicy.ReadOnly);
+        var temp = await engine.CreateAsync("\\new.tmp", false, default);
+        await File.WriteAllTextAsync(temp.StagingPath!, "replacement");
+        engine.MarkDirty(temp);
+
+        var fromServer = await Assert.ThrowsAsync<FsException>(() => engine.RenameAsync("\\notes.txt", "\\orders.accdb", true, default));
+        var fromLocal = await Assert.ThrowsAsync<FsException>(() => engine.RenameAsync("\\new.tmp", "\\orders.accdb", true, default));
+
+        Assert.Equal(FsError.ReadOnly, fromServer.Error);
+        Assert.Equal(FsError.ReadOnly, fromLocal.Error);
+        Assert.Equal("database", api.ContentOf("orders.accdb"));
+        Assert.Equal(["notes.txt", "orders.accdb"], api.Paths);
+    }
+
+    [Fact]
     public async Task Blocked_database_files_are_listed_but_marked()
     {
         var api = new FakeDriveApi();

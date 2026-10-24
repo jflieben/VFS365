@@ -46,7 +46,7 @@ static class DiscoveryStore
                 return File.Exists(RefreshedPath) && DateTimeOffset.TryParse(File.ReadAllText(RefreshedPath).Trim(), CultureInfo.InvariantCulture,
                     DateTimeStyles.AssumeUniversal, out var at) ? at : null;
             }
-            catch (IOException)
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException)
             {
                 return null;
             }
@@ -100,10 +100,14 @@ public static class RefreshRule
         at.ToLocalTime().Date == now.ToLocalTime().Date ? $"{at.ToLocalTime():HH:mm}" : UiText.Get(culture, "Tomorrow", $"{at.ToLocalTime():HH:mm}");
 }
 
-/// <summary>The mounted session's discovery state: replaced by background discovery, amended with drive IDs looked up on first use, saved when changed.</summary>
-sealed class DiscoveryStateKeeper(DiscoveryState initial)
+/// <summary>
+/// The mounted session's discovery state: replaced by background discovery, amended with drive IDs looked up on first use, saved when
+/// changed (to discovery.json, or with <paramref name="save"/>). A save that fails stays due and is tried again at the next SaveIfChanged.
+/// </summary>
+public sealed class DiscoveryStateKeeper(DiscoveryState initial, Action<DiscoveryState>? save = null)
 {
     readonly Lock gate = new();
+    readonly Action<DiscoveryState> save = save ?? DiscoveryStore.Save;
     DiscoveryState current = initial;
     bool dirty;
 
@@ -147,19 +151,32 @@ sealed class DiscoveryStateKeeper(DiscoveryState initial)
         }
     }
 
+    /// <summary>Throws what the save threw; the state is then still due.</summary>
     public void SaveIfChanged()
     {
-        DiscoveryState? save = null;
+        DiscoveryState? saving = null;
         lock (gate)
         {
             if (dirty)
             {
-                (save, dirty) = (current, false);
+                (saving, dirty) = (current, false);
             }
         }
-        if (save is not null)
+        if (saving is null)
         {
-            DiscoveryStore.Save(save);
+            return;
+        }
+        try
+        {
+            save(saving);
+        }
+        catch
+        {
+            lock (gate)
+            {
+                dirty = true;
+            }
+            throw;
         }
     }
 }

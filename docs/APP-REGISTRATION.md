@@ -26,12 +26,10 @@ Until then users see "Need admin approval" (user consent for these scopes is blo
 For tenants that only allow apps registered in their own directory, and for forks of VFS365.
 
 1. Entra admin center, App registrations, New registration. Name `VFS365`. Choose **Accounts in any organizational directory** (multi-tenant): devices that aren't Entra joined or registered then sign in without a forced tenant.
-2. Authentication, Add a platform, **Mobile and desktop applications**. Redirect URIs:
-   - `ms-appx-web://microsoft.aad.brokerplugin/<client id>` (Windows sign-in broker; fill in the Application ID after registering)
-   - `http://localhost` (browser fallback)
+2. Authentication, Add a platform, **Mobile and desktop applications**. Redirect URI: `ms-appx-web://Microsoft.AAD.BrokerPlugin/<client id>` (fill in the Application ID after registering). VFS365 signs in only through Windows' Web Account Manager, which needs this one.
 3. Authentication, **Allow public client flows**: Yes.
 4. API permissions: the delegated permissions above, then **Grant admin consent**.
-5. The **Application (client) ID** goes into the `ClientId` policy ([DEPLOYMENT.md](DEPLOYMENT.md)); for development into `vfs365.local.json` in the repo root (git-ignored): `{ "ClientId": "<application id>" }`.
+5. The **Application (client) ID** goes into the `ClientId` policy ([DEPLOYMENT.md](DEPLOYMENT.md)); for development into `vfs365.local.json` in the repo root (git-ignored): `{ "ClientId": "<application id>" }`. That file is read from the working directory by user commands only, never by `machine-*` commands or when running as SYSTEM or elevated; use `--config <file>` there.
 
 ## Tenant
 

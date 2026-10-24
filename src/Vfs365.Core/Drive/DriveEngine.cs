@@ -61,7 +61,8 @@ public sealed record DriveEngineOptions
 
     /// <summary>
     /// A drive used within HotWindow is read this often, push or not (zero: never); its changes show sooner than push brings them.
-    /// With push up, each read in a row that brings nothing doubles the wait, up to 8 times this; a change or a write resets it.
+    /// With push up, each read since this engine last wrote to the drive doubles the wait, up to 8 times this (push brings the
+    /// changes). Without push, each read in a row that brought no change doubles it, up to 4 times this.
     /// </summary>
     public TimeSpan HotPollInterval { get; init; } = TimeSpan.FromSeconds(20);
 
@@ -100,7 +101,16 @@ public sealed record DriveEngineOptions
     /// </summary>
     public int MaxCachedItems { get; init; } = 250_000;
 
+    /// <summary>
+    /// A change feed read, a listing page or a folder lookup for a listing is given up after this long without an answer and counts
+    /// as failed. A backstop: the HTTP client has shorter timeouts of its own.
+    /// </summary>
+    public TimeSpan CallTimeout { get; init; } = TimeSpan.FromMinutes(3);
+
     public Func<DateTimeOffset> Clock { get; init; } = () => DateTimeOffset.UtcNow;
+
+    /// <summary>Randomness (0 to 1) for jitter: back-offs, catch-up reads after push reconnects and network returns.</summary>
+    public Func<double> Random { get; init; } = System.Random.Shared.NextDouble;
 
     public Action<string>? Log { get; init; }
 
@@ -138,10 +148,13 @@ public sealed partial class DriveEngine(DriveNamespace ns, IDriveApi api, Conten
 {
     /// <summary>
     /// A folder's children. Loads page by page, readable while pages arrive. Kept current by the drive's change feed when it covers
-    /// it (FolderId known, requested after the feed's baseline), else read again in the background after ListingTtl.
+    /// it (<see cref="Maintained"/>), else read again in the background after ListingTtl. A load's requests run at Priority's level:
+    /// a load started in the background (ahead of a walk, for a burst of lookups) is promoted when a user waits for it.
     /// </summary>
-    sealed class Listing(DateTimeOffset requestedAt)
+    sealed class Listing(DateTimeOffset requestedAt, PriorityHolder? priority = null)
     {
+        public PriorityHolder Priority { get; } = priority ?? new PriorityHolder(RequestPriority.IsBackground);
+
         readonly Lock gate = new();
         readonly List<DriveItemInfo> arrived = [];
         readonly TaskCompletionSource loaded = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -455,10 +468,27 @@ public sealed partial class DriveEngine(DriveNamespace ns, IDriveApi api, Conten
 
     async Task<DriveItemInfo?> LookupAsync(string driveId, string drivePath, CancellationToken ct)
     {
-        if (drivePath.Length > 0 && TryGetCurrentListing(driveId, ParentOf(drivePath), out var parent))
+        Listing? stale = null;
+        if (drivePath.Length > 0)
         {
-            parent.LastUsed = Now;
-            return parent.Items.GetValueOrDefault(NameOf(drivePath));
+            var folder = ParentOf(drivePath);
+            var currency = CurrencyOf(driveId, folder, out var parent);
+            stale = parent is { IsLoaded: true } ? parent : null;
+            if (currency == Currency.FeedBehind)
+            {
+                // Kept by a feed not read lately (idle, asleep, just started): what changed meanwhile comes first, briefly
+                await CatchUpAsync(driveId);
+                currency = CurrencyOf(driveId, folder, out parent, caughtUp: true);
+            }
+            if (currency == Currency.Current)
+            {
+                parent.LastUsed = Now;
+                return parent.Items.GetValueOrDefault(NameOf(drivePath));
+            }
+            if (parent is { IsLoaded: true } && Now >= parent.RetryRefreshAt && parent.TryStartRefresh())
+            {
+                _ = RefreshAsync(driveId, folder, Key(driveId, folder), parent); // read again once, rather than a lookup per file meanwhile
+            }
         }
 
         var key = Key(driveId, drivePath);
@@ -471,21 +501,45 @@ public sealed partial class DriveEngine(DriveNamespace ns, IDriveApi api, Conten
         {
             NoteLookup(driveId, ParentOf(drivePath));
         }
-        var item = await api.GetItemAsync(driveId, drivePath, ct);
+        DriveItemInfo? item;
+        try
+        {
+            item = await api.GetItemAsync(driveId, drivePath, ct);
+        }
+        catch (Exception e) when (stale is not null && !ct.IsCancellationRequested
+            && (e is RemoteException { Error: RemoteError.Throttled or RemoteError.Unavailable } || e is not (RemoteException or FsException)))
+        {
+            // Offline or Microsoft 365 unreachable: the last known listing answers (cached files keep opening), until it can be read again
+            return stale.Items.GetValueOrDefault(NameOf(drivePath));
+        }
         lookups[key] = (item, Now);
         return item;
     }
 
+    enum Currency { No, Current, FeedBehind }
+
     /// <summary>
-    /// A listing that can answer lookups: fresh, or kept current by the change feed (however old, unless marked stale). Old
+    /// Whether a cached listing answers lookups. Current: fresh, or kept current by the change feed (however old, unless marked stale)
+    /// and the feed was read lately or <paramref name="caughtUp"/>. FeedBehind: maintained, but the feed wasn't read lately. Old
     /// maintained listings are still read again when opened, as a safety net.
     /// </summary>
-    bool TryGetCurrentListing(string driveId, string folderPath, out Listing listing) =>
-        listings.TryGetValue(Key(driveId, folderPath), out listing!) && listing.IsLoaded
-        && (IsFresh(driveId, listing) || (!listing.IsExpired && Maintained(driveId, listing)));
+    Currency CurrencyOf(string driveId, string folderPath, out Listing listing, bool caughtUp = false)
+    {
+        if (!listings.TryGetValue(Key(driveId, folderPath), out listing!) || !listing.IsLoaded)
+        {
+            return Currency.No;
+        }
+        if (!Maintained(driveId, folderPath, listing))
+        {
+            return Now - listing.FetchedAt < options.ListingTtl ? Currency.Current : Currency.No;
+        }
+        return listing.IsExpired ? Currency.No : caughtUp || FeedCurrent(driveId) ? Currency.Current : Currency.FeedBehind;
+    }
 
-    bool IsFresh(string driveId, Listing listing) =>
-        listing.IsLoaded && Now - listing.FetchedAt < (Maintained(driveId, listing) ? options.MaintainedListingMaxAge : options.ListingTtl);
+    bool TryGetCurrentListing(string driveId, string folderPath, out Listing listing) => CurrencyOf(driveId, folderPath, out listing) != Currency.No;
+
+    bool IsFresh(string driveId, string folderPath, Listing listing) =>
+        listing.IsLoaded && Now - listing.FetchedAt < (Maintained(driveId, folderPath, listing) ? options.MaintainedListingMaxAge : options.ListingTtl);
 
     const int LookupBurst = 5;
 
@@ -501,7 +555,7 @@ public sealed partial class DriveEngine(DriveNamespace ns, IDriveApi api, Conten
             return;
         }
         lookupBursts.TryRemove(key, out _);
-        var listing = new Listing(Now);
+        var listing = new Listing(Now, new PriorityHolder());
         if (listings.TryAdd(key, listing))
         {
             Log($"{LookupBurst} files looked up by path in '{folderPath}' on drive {driveId} within {options.WalkWindow.TotalSeconds:0} s: listing the folder");
@@ -511,7 +565,6 @@ public sealed partial class DriveEngine(DriveNamespace ns, IDriveApi api, Conten
 
     async Task LoadInBackgroundAsync(string driveId, string folderPath, string key, Listing listing)
     {
-        RequestPriority.MarkBackground();
         await Task.Yield();
         await LoadAsync(driveId, folderPath, key, listing);
     }
@@ -531,8 +584,12 @@ public sealed partial class DriveEngine(DriveNamespace ns, IDriveApi api, Conten
             if (current is not null && (current.IsLoading || current.IsLoaded))
             {
                 current.LastUsed = Now;
+                if (current.IsLoading && !RequestPriority.IsBackground)
+                {
+                    current.Priority.Promote(); // loading ahead or for lookups, and now someone waits for it
+                }
                 NoteWalker(driveId, folderPath, startedLoad: false);
-                if (current.IsLoaded && !IsFresh(driveId, current) && Now >= current.RetryRefreshAt && current.TryStartRefresh())
+                if (current.IsLoaded && !IsFresh(driveId, folderPath, current) && Now >= current.RetryRefreshAt && current.TryStartRefresh())
                 {
                     _ = RefreshAsync(driveId, folderPath, key, current);
                 }
@@ -552,10 +609,11 @@ public sealed partial class DriveEngine(DriveNamespace ns, IDriveApi api, Conten
 
     async Task LoadAsync(string driveId, string folderPath, string key, Listing listing)
     {
+        RequestPriority.Use(listing.Priority);
         try
         {
             var folder = FolderOrNullAsync(driveId, folderPath);
-            await foreach (var page in api.ListChildrenAsync(driveId, folderPath, CancellationToken.None))
+            await foreach (var page in PagesAsync(driveId, folderPath))
             {
                 listing.AddPage(page);
             }
@@ -567,28 +625,60 @@ public sealed partial class DriveEngine(DriveNamespace ns, IDriveApi api, Conten
                 listing.Finish(Now);
                 Replay(driveId, folderPath, listing);
             }
+            unlisted.TryRemove(key, out _);
             PrefetchChildren(driveId, folderPath, listing);
+            ListAncestors(driveId, folderPath);
         }
         catch (Exception e)
         {
+            unlisted[key] = Now;
             listings.TryRemove(new KeyValuePair<string, Listing>(key, listing));
             listing.Fail(e);
         }
     }
 
-    /// <summary>Reads a stale listing again while it keeps answering; swaps in the result and reports what changed.</summary>
+    /// <summary>Folders whose listing failed lately (no access to it, for one): not listed again as a folder above another for a while.</summary>
+    readonly ConcurrentDictionary<string, DateTimeOffset> unlisted = new(StringComparer.OrdinalIgnoreCase);
+
+    static readonly TimeSpan UnlistedRetry = TimeSpan.FromMinutes(10);
+
+    /// <summary>
+    /// Lists the folders above a listed one that aren't cached, in the background (an app opening files by path lists only the folder
+    /// it opens): only with them can the change feed see a rename or move above it, and keep it current without reading it again.
+    /// </summary>
+    void ListAncestors(string driveId, string folderPath)
+    {
+        for (var path = ParentOf(folderPath); path.Length > 0; path = ParentOf(path))
+        {
+            var key = Key(driveId, path);
+            if (listings.ContainsKey(key) || (unlisted.TryGetValue(key, out var failed) && Now - failed < UnlistedRetry))
+            {
+                continue;
+            }
+            var listing = new Listing(Now, new PriorityHolder());
+            if (listings.TryAdd(key, listing))
+            {
+                _ = LoadInBackgroundAsync(driveId, path, key, listing);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Reads a stale listing again while it keeps answering; swaps in the result and reports what changed. A folder no longer found
+    /// at its path (it, or a folder above it, was renamed, moved or deleted) loses its cached listings.
+    /// </summary>
     async Task RefreshAsync(string driveId, string folderPath, string key, Listing stale)
     {
         RequestPriority.MarkBackground();
         try
         {
             var requestedAt = Now;
-            // A folder the feed kept current is still the same folder (a move or rename would have dropped the listing)
-            var folder = stale.FolderId is not null && Maintained(driveId, stale)
+            // A folder the feed kept current is still the same folder (a move or rename of it or above it would have dropped the listing)
+            var folder = Maintained(driveId, folderPath, stale)
                 ? Task.FromResult<(string?, string?)>((stale.FolderId, stale.ParentId))
                 : FolderOrNullAsync(driveId, folderPath);
             var items = new List<DriveItemInfo>();
-            await foreach (var page in api.ListChildrenAsync(driveId, folderPath, CancellationToken.None))
+            await foreach (var page in PagesAsync(driveId, folderPath))
             {
                 items.AddRange(page);
             }
@@ -607,6 +697,24 @@ public sealed partial class DriveEngine(DriveNamespace ns, IDriveApi api, Conten
             }
             Interlocked.Increment(ref metadataVersion);
             ReportDifferences(driveId, folderPath, stale, fresh);
+            ListAncestors(driveId, folderPath);
+        }
+        catch (RemoteException e) when (e.Error == RemoteError.NotFound)
+        {
+            var dropped = false;
+            lock (feeds.GetOrAdd(driveId, _ => NewFeed()).ApplyGate)
+            {
+                if (listings.TryGetValue(key, out var cached) && cached == stale)
+                {
+                    DropBelow(driveId, folderPath);
+                    dropped = true;
+                }
+            }
+            if (dropped)
+            {
+                Log($"{folderPath} is no longer there (renamed, moved or deleted, or a folder above it was); its cached listing is dropped");
+                Report(driveId, folderPath, ChangeKind.Removed, true);
+            }
         }
         catch (Exception e)
         {
@@ -626,26 +734,71 @@ public sealed partial class DriveEngine(DriveNamespace ns, IDriveApi api, Conten
         {
             if (folderPath.Length == 0)
             {
-                return (await FolderIdAsync(driveId, "", CancellationToken.None), null);
+                return (await CallAsync(ct => FolderIdAsync(driveId, "", ct)), null);
             }
             var parentId = TryGetCurrentListing(driveId, ParentOf(folderPath), out var parent) ? parent.FolderId : null;
-            var folder = await LookupAsync(driveId, folderPath, CancellationToken.None);
+            var folder = await CallAsync(ct => LookupAsync(driveId, folderPath, ct));
             return (folder?.Id, folder?.ParentId ?? parentId);
         }
-        catch (Exception e) when (e is RemoteException or HttpRequestException or TaskCanceledException)
+        catch (Exception e) when (e is RemoteException or HttpRequestException or OperationCanceledException or TimeoutException)
         {
             return (null, null);
+        }
+    }
+
+    /// <summary>A folder's pages, each given up after CallTimeout without an answer (<see cref="TimeoutException"/>).</summary>
+    async IAsyncEnumerable<IReadOnlyList<DriveItemInfo>> PagesAsync(string driveId, string folderPath)
+    {
+        using var deadline = new CancellationTokenSource();
+        var pages = api.ListChildrenAsync(driveId, folderPath, deadline.Token).GetAsyncEnumerator(deadline.Token);
+        Task<bool>? next = null;
+        try
+        {
+            while (true)
+            {
+                deadline.CancelAfter(options.CallTimeout);
+                next = pages.MoveNextAsync().AsTask();
+                if (!await WithinAsync(next, deadline.Token))
+                {
+                    yield break;
+                }
+                deadline.CancelAfter(Timeout.InfiniteTimeSpan);
+                yield return pages.Current;
+            }
+        }
+        finally
+        {
+            // A page still being read can't be disposed; it ends with the cancelled token
+            if (next is null || next.IsCompleted)
+            {
+                await pages.DisposeAsync();
+            }
+        }
+    }
+
+    /// <summary>A call given up after CallTimeout without an answer (<see cref="TimeoutException"/>), also when it ignores its token.</summary>
+    async Task<T> CallAsync<T>(Func<CancellationToken, Task<T>> call)
+    {
+        using var deadline = new CancellationTokenSource(options.CallTimeout);
+        return await WithinAsync(call(deadline.Token), deadline.Token);
+    }
+
+    async Task<T> WithinAsync<T>(Task<T> call, CancellationToken deadline)
+    {
+        try
+        {
+            return await call.WaitAsync(deadline);
+        }
+        catch (OperationCanceledException) when (deadline.IsCancellationRequested)
+        {
+            throw new TimeoutException($"No answer from Microsoft 365 within {options.CallTimeout.TotalSeconds:0} s");
         }
     }
 
     /// <summary>Records a known item in the caches, so the next lookup or listing needs no call. Also notes the local write.</summary>
     void Upsert(string driveId, string drivePath, DriveItemInfo item)
     {
-        if (listings.TryGetValue(Key(driveId, ParentOf(drivePath)), out var listing) && listing.IsLoaded)
-        {
-            listing.Remove(NameOf(drivePath), out _);
-            listing.Set(item);
-        }
+        Local(driveId, drivePath, item);
         lookups[Key(driveId, drivePath)] = (item, Now);
         LocalWrite(driveId);
     }
@@ -653,12 +806,41 @@ public sealed partial class DriveEngine(DriveNamespace ns, IDriveApi api, Conten
     /// <summary>Records that nothing exists at the path any more.</summary>
     void Forget(string driveId, string drivePath)
     {
-        if (listings.TryGetValue(Key(driveId, ParentOf(drivePath)), out var listing) && listing.IsLoaded)
-        {
-            listing.Remove(NameOf(drivePath), out _);
-        }
+        Local(driveId, drivePath, null);
         lookups[Key(driveId, drivePath)] = (null, Now);
         LocalWrite(driveId);
+    }
+
+    /// <summary>
+    /// A local write at a path (<paramref name="item"/> null: nothing there now). Applied to its folder's listing, and kept with the
+    /// feed's recent changes, so a listing of that folder that is loading or being read again meanwhile gets it too.
+    /// </summary>
+    void Local(string driveId, string drivePath, DriveItemInfo? item)
+    {
+        var feed = feeds.GetOrAdd(driveId, _ => NewFeed());
+        lock (feed.ApplyGate)
+        {
+            Record(feed, [new Recorded(Now, null, drivePath, item)]);
+            if (listings.TryGetValue(Key(driveId, ParentOf(drivePath)), out var listing) && listing.IsLoaded)
+            {
+                ApplyLocal(listing, drivePath, item, replay: false);
+            }
+        }
+    }
+
+    /// <summary>A local write onto a listing. Replayed, it doesn't put back an older version than the listing has.</summary>
+    static void ApplyLocal(Listing listing, string drivePath, DriveItemInfo? item, bool replay)
+    {
+        var name = NameOf(drivePath);
+        if (replay && item is not null && listing.Items.TryGetValue(name, out var known) && known.Id == item.Id && IsOlder(item.ETag, known.ETag))
+        {
+            return;
+        }
+        listing.Remove(name, out _);
+        if (item is not null)
+        {
+            listing.Set(item);
+        }
     }
 
     /// <summary>Drops what is cached at and below a path, so it is read again.</summary>
@@ -719,14 +901,30 @@ public sealed partial class DriveEngine(DriveNamespace ns, IDriveApi api, Conten
         DrivePath = drivePath,
     };
 
-    /// <summary>An entry for staged content, bound to it: handles that keep it follow that content (<see cref="Follow"/>).</summary>
+    /// <summary>
+    /// An entry for staged content, bound to it: handles that keep it follow that content (<see cref="Follow"/>). Content that was
+    /// uploaded meanwhile (its staging file became cached content) is the item it went into.
+    /// </summary>
     FsEntry PendingEntry(string path, DriveMount drive, PendingFile pending)
     {
+        long size;
+        try
+        {
+            size = new FileInfo(pending.StagingPath).Length;
+        }
+        catch (FileNotFoundException) when (pending.Result is { } result)
+        {
+            return ItemEntry(VolumePath(pending.DriveId, pending.ResultPath!) ?? path, drive, pending.DriveId, pending.ResultPath!, result);
+        }
+        catch (FileNotFoundException)
+        {
+            size = 0; // discarded meanwhile: the entry is bound to it, so writes through it fail
+        }
         var entry = new FsEntry
         {
             Path = path,
             Name = pending.Name,
-            Size = new FileInfo(pending.StagingPath).Length,
+            Size = size,
             Created = pending.Base?.Created ?? pending.Modified,
             Modified = pending.Modified,
             ReadOnly = IsReadOnly(drive, pending.Name, false),

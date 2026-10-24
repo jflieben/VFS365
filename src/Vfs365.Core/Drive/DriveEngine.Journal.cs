@@ -5,38 +5,82 @@ namespace Vfs365.Core.Drive;
 /// <summary>
 /// A journal record next to each staging file with unsaved changes, so a crash or reboot loses no save: the next start
 /// re-queues them for upload (into the original item, with If-Match, so a server-side change since then ends in a conflict copy).
-/// One that already uploaded before the crash (same content on the server) isn't sent again. Temp and lock files are not journaled.
+/// One that already uploaded before the crash (same content on the server) isn't sent again. Content the journal doesn't say was
+/// on disk (written, not closed) may be zeros after a power loss: it uploads as a "(recovered)" copy instead. Office's own temp and
+/// lock files are not journaled.
 /// </summary>
 public sealed partial class DriveEngine
 {
-    sealed record JournalRecord(string DriveId, string DrivePath, DriveItemInfo? Base, DateTimeOffset Modified);
+    /// <summary>
+    /// Flushed: the staging file was forced to disk after its last write; null in journals before 0.5.0, which flushed at every close,
+    /// so their records count as flushed. OriginalPath: renamed away from there to a temp name (<see cref="PendingFile.Alias"/>), so it
+    /// goes back there unless a save claims its item.
+    /// </summary>
+    sealed record JournalRecord(string DriveId, string DrivePath, DriveItemInfo? Base, DateTimeOffset Modified, bool? Flushed = null, string? OriginalPath = null);
 
     static string JournalOf(string stagingPath) => stagingPath + ".json";
 
     /// <summary>
-    /// Writes, rewrites (call it when Base or the path changes) or, for temp names, removes the pending file's journal record. The record
-    /// is on disk when this returns.
+    /// Writes, rewrites (call it when Base, the path or Flushed changes) or, for names that never upload, removes the pending file's
+    /// journal record. The record is on disk when this returns.
     /// </summary>
     void Journal(PendingFile pending)
     {
         var path = JournalOf(pending.StagingPath);
-        if (LocalOnlyNames.IsLocalOnly(pending.Name))
+        lock (pending)
         {
-            TryDelete(path);
-            pending.Journaled = false;
-            return;
+            if (StaysLocal(pending))
+            {
+                TryDelete(path);
+                pending.Journaled = false;
+                return;
+            }
+            if (!pending.IsLive)
+            {
+                return;
+            }
+            using (var file = new FileStream(path + ".tmp", FileMode.Create, FileAccess.Write, FileShare.None))
+            {
+                JsonSerializer.Serialize(file, new JournalRecord(pending.DriveId, pending.DrivePath, pending.Base, pending.Modified, pending.Flushed, pending.Alias?.OriginalPath));
+                file.Flush(flushToDisk: true);
+            }
+            File.Move(path + ".tmp", path, overwrite: true);
+            pending.Journaled = true;
         }
-        if (!pending.IsLive)
+    }
+
+    /// <summary>
+    /// Forces the staged content to disk and the journal to say so (at a close, or before an upload is retried), so a restart after a
+    /// power loss uploads it into its item. Not while the calling thread holds a write lease.
+    /// </summary>
+    void MarkFlushed(PendingFile pending)
+    {
+        pending.Writing.EnterWriteLock();
+        try
         {
-            return;
+            if (pending.IsLive && FlushToDisk(pending.StagingPath))
+            {
+                pending.Flushed = true;
+                Journal(pending);
+            }
         }
-        using (var file = new FileStream(path + ".tmp", FileMode.Create, FileAccess.Write, FileShare.None))
+        finally
         {
-            JsonSerializer.Serialize(file, new JournalRecord(pending.DriveId, pending.DrivePath, pending.Base, pending.Modified));
-            file.Flush(flushToDisk: true);
+            pending.Writing.ExitWriteLock();
         }
-        File.Move(path + ".tmp", path, overwrite: true);
-        pending.Journaled = true;
+    }
+
+    /// <summary>A write comes: the journal stops saying the content is on disk, before the write can reach the disk.</summary>
+    void Unflush(PendingFile pending)
+    {
+        lock (pending)
+        {
+            if (pending.Flushed)
+            {
+                pending.Flushed = false;
+                Journal(pending);
+            }
+        }
     }
 
     /// <summary>Re-queues changes an earlier run could not upload and removes leftover staging files. Call once before mounting.</summary>
@@ -54,6 +98,7 @@ public sealed partial class DriveEngine
             {
                 if (JsonSerializer.Deserialize<JournalRecord>(File.ReadAllText(journal)) is { } record && File.Exists(staging))
                 {
+                    var flushed = record.Flushed ?? true;
                     var pending = new PendingFile(record.DriveId, record.DrivePath, staging, record.Base, record.Modified)
                     {
                         Dirty = true,
@@ -62,10 +107,16 @@ public sealed partial class DriveEngine
                         RetryAt = Now,
                         Queued = true,
                         Recovered = true,
+                        Flushed = flushed,
+                        RecoverAsCopy = !flushed,
+                        TempSince = Now,
+                        Alias = record.OriginalPath is { } original && record.Base is { } item
+                            ? new AliasItem(record.DriveId, record.DrivePath, item, original, Now + options.SettleWindow) : null,
                     };
                     overlay[pending.Key] = pending;
                     recovered++;
-                    Log($"recovered unsaved {record.DrivePath}, uploading");
+                    Log(flushed ? $"recovered unsaved {record.DrivePath}, uploading"
+                        : $"recovered unsaved {record.DrivePath}, which was still being written: uploading it as a recovered copy next to it");
                     continue;
                 }
             }

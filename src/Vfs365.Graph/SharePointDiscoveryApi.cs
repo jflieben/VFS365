@@ -1,3 +1,4 @@
+using System.Net;
 using System.Text.Json;
 using System.Xml;
 using Vfs365.Core.Discovery;
@@ -43,10 +44,21 @@ public sealed class SharePointDiscoveryApi(M365Client client) : ISharePointDisco
             $"&Properties='{Uri.EscapeDataString("EnableMultiGeoSearch:true")}'&ClientType='{ClientType}'");
     }
 
+    /// <summary>
+    /// A 403 (access to a library, not to the site) counts as neither read-only nor locked: the libraries still show, and SharePoint
+    /// refuses what the user may not do.
+    /// </summary>
     public async Task<SiteMetadata> GetSiteAsync(string webUrl, CancellationToken ct)
     {
-        using var doc = await RequiredAsync(new Uri($"{webUrl}/_api/site?$select=ReadOnly,WriteLocked"), ct);
-        return new(Bool(doc.RootElement, "ReadOnly"), Bool(doc.RootElement, "WriteLocked"));
+        try
+        {
+            using var doc = await RequiredAsync(new Uri($"{webUrl}/_api/site?$select=ReadOnly,WriteLocked"), ct);
+            return new(Bool(doc.RootElement, "ReadOnly"), Bool(doc.RootElement, "WriteLocked"));
+        }
+        catch (M365RequestException e) when (e.Status == HttpStatusCode.Forbidden && e.Error == Core.RemoteError.AccessDenied)
+        {
+            return new(false, false);
+        }
     }
 
     public async Task<IReadOnlyList<PinnedLibrary>?> GetWebLibrariesAsync(string webUrl, CancellationToken ct)
@@ -140,12 +152,15 @@ public sealed class SharePointDiscoveryApi(M365Client client) : ISharePointDisco
     /// <summary>
     /// Parses a search response (odata=nometadata). Rows without IDs are dropped; RowCount still counts them for paging. The web URL is
     /// SPWebUrl when the library's path lies under it, else derived from the path (a default view outside Forms, or a library deeper
-    /// than web/library, would give a wrong web).
+    /// than web/library, would give a wrong web). GeoLocationSource is read when search reports it; it isn't in selectproperties, since
+    /// whether search accepts it there is unverified.
     /// </summary>
     public static SearchPage ParseSearchPage(JsonElement root)
     {
         var rows = root.GetProperty("PrimaryQueryResult").GetProperty("RelevantResults").GetProperty("Table").GetProperty("Rows");
         var libraries = new List<DiscoveredLibrary>();
+        var docIds = new List<long?>();
+        var geos = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         long? lastDocId = null;
         foreach (var row in rows.EnumerateArray())
         {
@@ -160,6 +175,11 @@ public sealed class SharePointDiscoveryApi(M365Client client) : ISharePointDisco
             string? Get(string key) => cells.TryGetValue(key, out var value) && !string.IsNullOrWhiteSpace(value) ? value : null;
 
             lastDocId = long.TryParse(Get("DocId"), out var docId) ? docId : null;
+            docIds.Add(lastDocId);
+            if (Get("GeoLocationSource") is { } geo)
+            {
+                geos.Add(geo);
+            }
 
             var webUrl = WebUrl(Get("SPWebUrl"), Get("Path")) ?? Get("SPSiteUrl")?.TrimEnd('/');
             if (Get("ListId") is not { } listId || Get("SiteId") is not { } siteId || Get("WebId") is not { } webId || webUrl is null)
@@ -177,7 +197,7 @@ public sealed class SharePointDiscoveryApi(M365Client client) : ISharePointDisco
                 Get("Title") ?? "",
                 Get("SiteTemplate")));
         }
-        return new SearchPage(libraries, rows.GetArrayLength(), lastDocId);
+        return new SearchPage(libraries, rows.GetArrayLength(), lastDocId, docIds, [.. geos]);
     }
 
     static string? WebUrl(string? spWebUrl, string? path)

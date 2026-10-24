@@ -1,5 +1,48 @@
 # Changelog
 
+## 0.5.0
+
+Result of a second full review of the code, and a new sign-in.
+
+Sign-in
+- VFS365 signs in through Windows' own Web Account Manager, called directly. Microsoft's authentication library and its broker runtime (msalruntime.dll, which may not be redistributed) are no longer included. Sign-in works as before: silently with the Windows account, a window only from Sign in in the tray or at the start. `vfs365 whoami --sign-in` shows the sign-in window, to test it.
+- With the tray icon off (TrayIcon 0), a needed sign-in opens the window by itself, once per problem.
+
+Saving and data safety
+- After your own save, a colleague's later version is no longer hidden for an hour; your next save builds on what you read, or ends in a conflict copy.
+- Files named like temp files (starting with ~, ending in .tmp, or 8 digits such as 20261024) save like any other file when they exist in Microsoft 365, and new ones upload when still there 5 minutes after their close. Before, their saves stayed on the PC and were lost at the next start. Office's own temp and lock files still never upload.
+- A cached file keeps the length it was served with, also after a restart: Office files that SharePoint added properties to no longer show as damaged.
+- A folder renamed elsewhere is noticed even when only a folder below it was opened, so opens and saves can't land in the renamed folder.
+- A file opened after the drive was idle, after sleep or right after a start is the version now in Microsoft 365.
+- Renaming or moving a folder takes files still waiting to upload along.
+- Word saves of a file with changes not uploaded yet, and backup copies made during a save, can no longer delete or move the saved document.
+- A metadata change in SharePoint (a column, a label, a flow) no longer turns a save into a conflict copy.
+- After a crash, changes that were still being written upload as a "(recovered)" copy next to the file instead of into it.
+- A download no longer mixes two versions when a colleague saves the same size meanwhile.
+- When Microsoft 365 can't be reached, files and folders opened before keep opening.
+
+Reliability
+- A connection that stops answering no longer hangs the drive, folder listings, change checks, discovery or downloads: they fail after a minute without progress and are tried again. Slow connections finish their uploads: parts get smaller and resume where they stopped.
+- A failed or incomplete library search no longer leaves the drive without SharePoint libraries for a day; it is tried again within the hour, within minutes on a first start. A start after an interrupted first start reads the libraries at once.
+- Deleting many files no longer holds up saving: deletes run in the background.
+- The agent restarts after any unexpected exit; when it gives up, a tray icon offers Retry and Show log.
+- Notifications: at most one per kind a minute. Refused deletes say why in plain words.
+- Policy values written as text (yes, on, enabled) or as QWORD are read; unreadable ones keep the default and are named in the log.
+
+API use
+- Library details are checked weekly instead of every two days. Change checks slow down in busy libraries, push reconnects are spread out, and a folder loading in the background is served first when someone waits for it.
+
+Security
+- The network provider no longer asks the network about \\VFS365 when the drive isn't mounted. DEPLOYMENT.md explains how to keep that name from resolving on the network; the agent warns (log and monitoring) when it does.
+- The agent refuses a monitoring SAS that can read, change or delete rows, since every user can read it from the policy. Add-only SASes keep working.
+- The installer runs its machine steps without console windows and not on a repair; a failed upgrade restores the previous version and restarts its agents; a rebuilt release of the same version replaces the installed one.
+- Uninstall cleans up very deep folder trees and does the machine-wide steps first; stopping agents signals only each session's own agent.
+- Releases are built and signed in separate jobs, only from main, and every signature is checked before publishing.
+
+Monitoring
+- Statistics are sent as the device they were used on (pooled AVD with roaming profiles), get a random row key, and are retried for a week. Changes to MonitoringUrl and MonitoringDetail apply without a restart.
+- Dashboard: changing the connection or period during a load no longer mixes data; today's throttling counts; the last 3 days are marked as still arriving; keyboard access and contrast are better; duplicate rows are left out. The dashboard's SAS needs only Read. Opened from disk, it no longer stores the SAS beyond the tab.
+
 ## 0.4.2 (2026-10-22)
 
 - Signed binaries!

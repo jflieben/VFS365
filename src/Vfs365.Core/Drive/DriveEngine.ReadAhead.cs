@@ -116,9 +116,9 @@ public sealed partial class DriveEngine
                 return;
             }
         }
-        catch (Exception e) when (e is not OperationCanceledException)
+        catch (Exception e)
         {
-            Log($"reading {item.Name} ahead failed: {e.Message}");
+            Log($"reading {item.Name} ahead failed: {e.Message}"); // nothing cancels it: a cancellation is a timeout too
         }
         finally
         {

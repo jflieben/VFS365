@@ -40,6 +40,19 @@ public sealed class CacheCipher
     /// <summary>Bytes on disk for <paramref name="length"/> bytes of content.</summary>
     public static long StoredLength(long length) => length + Chunks(length) * TagSize + FooterSize;
 
+    /// <summary>The content length a cache file of <paramref name="stored"/> bytes holds; -1 when no content length gives that size.</summary>
+    public static long ContentLength(long stored)
+    {
+        var sealedBytes = stored - FooterSize;
+        if (sealedBytes < 0)
+        {
+            return -1;
+        }
+        var (chunks, rest) = Math.DivRem(sealedBytes, ChunkSize + TagSize);
+        var length = chunks * ChunkSize + (rest > TagSize ? rest - TagSize : 0);
+        return StoredLength(length) == stored ? length : -1;
+    }
+
     static long Chunks(long length) => (length + ChunkSize - 1) / ChunkSize;
 
     /// <summary>Starts a cache file: sets its size and writes the footer with a new nonce. Chunks are written with <see cref="Write"/>.</summary>

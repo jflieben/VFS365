@@ -28,20 +28,25 @@ public static class MachineCleanup
         public string DataFolder => Path.Combine([Folder, .. DataPath]);
     }
 
-    /// <summary>Signals every running agent, waits up to <paramref name="timeout"/> for them to finish uploading and unmount, then ends the rest.</summary>
+    /// <summary>
+    /// Signals every running agent, waits up to <paramref name="timeout"/> for them to finish uploading and unmount, then ends the rest.
+    /// A session's stop event counts only when the user its agent runs as owns it (<see cref="AgentControl.RequestStop(int, SecurityIdentifier, bool)"/>).
+    /// </summary>
     public static void StopAgents(TimeSpan timeout, bool dryRun, Action<string> say)
     {
         var agents = AgentNames.SelectMany(Process.GetProcessesByName).Where(p => p.Id != Environment.ProcessId).ToList();
-        foreach (var session in agents.Select(p => p.SessionId).Distinct())
+        foreach (var session in agents.GroupBy(p => p.SessionId))
         {
             if (dryRun)
             {
-                say($"Would stop the agent in session {session}");
+                say($"Would stop the agent in session {session.Key}");
+                continue;
             }
-            else
-            {
-                say(AgentControl.RequestStop(session) ? $"Asked the agent in session {session} to stop" : $"No stop signal in session {session}");
-            }
+            var found = session.Select(Describe).OfType<(SecurityIdentifier User, Version Version)>().ToList();
+            var legacy = found.Any(a => a.Version < AgentControl.FirstSessionEvent);
+            say(found.Select(a => a.User).Distinct().Any(user => AgentControl.RequestStop(session.Key, user, legacy))
+                ? $"Asked the agent in session {session.Key} to stop"
+                : $"No stop signal of the agent's user in session {session.Key}");
         }
         if (dryRun)
         {
@@ -66,6 +71,61 @@ public static class MachineCleanup
             }
         }
     }
+
+    /// <summary>The user an agent process runs as and the version of its program; null when they can't be read.</summary>
+    static (SecurityIdentifier User, Version Version)? Describe(Process agent)
+    {
+        var process = OpenProcess(0x1000, false, agent.Id); // query limited information
+        if (process == IntPtr.Zero)
+        {
+            return null;
+        }
+        try
+        {
+            if (!OpenProcessToken(process, 0x8, out var token)) // query
+            {
+                return null;
+            }
+            SecurityIdentifier? user;
+            try
+            {
+                using var identity = new WindowsIdentity(token);
+                user = identity.User;
+            }
+            finally
+            {
+                CloseHandle(token);
+            }
+            var path = new StringBuilder(1024);
+            var length = path.Capacity;
+            if (user is null || !QueryFullProcessImageNameW(process, 0, path, ref length))
+            {
+                return null;
+            }
+            var file = FileVersionInfo.GetVersionInfo(path.ToString());
+            return (user, new Version(file.FileMajorPart, file.FileMinorPart, file.FileBuildPart));
+        }
+        catch (Exception e) when (e is ArgumentException or System.Security.SecurityException or UnauthorizedAccessException or FileNotFoundException)
+        {
+            return null;
+        }
+        finally
+        {
+            CloseHandle(process);
+        }
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern IntPtr OpenProcess(uint access, bool inherit, int processId);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    static extern bool OpenProcessToken(IntPtr process, uint access, out IntPtr token);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern bool QueryFullProcessImageNameW(IntPtr process, int flags, StringBuilder name, ref int size);
+
+    [DllImport("kernel32.dll")]
+    static extern bool CloseHandle(IntPtr handle);
 
     /// <summary>Every profile on the machine, for its %LOCALAPPDATA%\VFS365.</summary>
     public static IEnumerable<UserProfile> ProfileDataFolders()
@@ -100,7 +160,7 @@ public static class MachineCleanup
     /// relative to the handle of the one before, and refused when it is a reparse point (junction, symbolic link, mount point); VFS365
     /// must be owned by the profile's user, SYSTEM or Administrators. Everything below is opened relative to that folder's handle without
     /// following reparse points, which are left in place. Swapping a folder for a link after a check redirects nothing: opens go through
-    /// the verified handles, not paths.
+    /// the verified handles, not paths. A failure in one profile is reported and the others go on.
     /// </summary>
     public static void RemoveUserData(IEnumerable<UserProfile> profiles, bool dryRun, Action<string> say)
     {
@@ -119,8 +179,9 @@ public static class MachineCleanup
                     RemoveContents(data, folder, dryRun, say);
                 }
             }
-            catch (Win32Exception e)
+            catch (Exception e)
             {
+                // Whatever happens in one user's folder, the others are cleaned
                 say($"Could not clean {folder}: {e.Message}");
             }
         }
@@ -276,33 +337,140 @@ public static class MachineCleanup
             }
         }
 
-        /// <summary>Deletes an entry of <paramref name="parent"/> and, for a folder, its contents. Links are left in place.</summary>
+        /// <summary>Folders deeper than this below the data folder are left (and named), however deep a user made them.</summary>
+        const int MaxDepth = 64;
+
+        /// <summary>
+        /// Deletes an entry of <paramref name="parent"/> and, for a folder, its contents: depth first on a stack of open folders rather than
+        /// by recursion, so a deep folder chain can't overflow the stack. Links and folders deeper than <see cref="MaxDepth"/> are left in
+        /// place, and so are the folders holding them.
+        /// </summary>
         public static void Delete(SafeFileHandle parent, string name, string display, Action<string> say)
         {
-            using var entry = Open(parent, name, DeleteAccess | ReadAttributes, 0);
-            var attributes = Attributes(entry);
-            if ((attributes & ReparsePointAttribute) != 0)
+            if (Entry.Open(parent, name, display, 1, say) is not { } first)
             {
-                say($"Leaving {display}: it is a link (reparse point)");
                 return;
             }
-            if ((attributes & DirectoryAttribute) != 0)
+            var open = new Stack<Entry>();
+            open.Push(first);
+            try
             {
-                // The same folder again (empty name), for listing
-                using var folder = Open(entry, "", ListDirectory, DirectoryFile);
-                foreach (var child in List(folder))
+                while (open.TryPeek(out var top))
                 {
-                    try
+                    if (top.Children.TryDequeue(out var child))
                     {
-                        Delete(folder, child, Path.Combine(display, child), say);
+                        var path = Path.Combine(top.Display, child);
+                        try
+                        {
+                            if (Entry.Open(top.Listing!, child, path, open.Count + 1, say) is { } entry)
+                            {
+                                open.Push(entry);
+                                continue;
+                            }
+                        }
+                        catch (Win32Exception e)
+                        {
+                            say($"Could not remove {path}: {e.Message}");
+                        }
+                        top.Kept = true;
+                        continue;
                     }
-                    catch (Win32Exception e)
+                    open.Pop();
+                    using (top)
                     {
-                        say($"Could not remove {Path.Combine(display, child)}: {e.Message}");
+                        if (top.Kept)
+                        {
+                            if (open.TryPeek(out var up))
+                            {
+                                up.Kept = true;
+                            }
+                            continue;
+                        }
+                        if (open.Count == 0)
+                        {
+                            MarkDeleted(top.Handle); // the caller reports a failure of the entry itself
+                            continue;
+                        }
+                        try
+                        {
+                            MarkDeleted(top.Handle);
+                        }
+                        catch (Win32Exception e)
+                        {
+                            say($"Could not remove {top.Display}: {e.Message}");
+                            open.Peek().Kept = true;
+                        }
                     }
                 }
             }
-            MarkDeleted(entry);
+            finally
+            {
+                while (open.TryPop(out var left))
+                {
+                    left.Dispose();
+                }
+            }
+        }
+
+        /// <summary>An entry being deleted: its handle and, for a folder, a listing handle and the children not yet deleted.</summary>
+        sealed class Entry(SafeFileHandle handle, SafeFileHandle? listing, Queue<string> children, string display) : IDisposable
+        {
+            public SafeFileHandle Handle => handle;
+            public SafeFileHandle? Listing => listing;
+            public Queue<string> Children => children;
+            public string Display => display;
+
+            /// <summary>Something below stays, so this folder stays too.</summary>
+            public bool Kept { get; set; }
+
+            /// <summary>Opens <paramref name="name"/> in <paramref name="parent"/> at <paramref name="depth"/>; null (and said why) for a link or a folder too deep.</summary>
+            public static Entry? Open(SafeFileHandle parent, string name, string display, int depth, Action<string> say)
+            {
+                var entry = NoFollow.Open(parent, name, DeleteAccess | ReadAttributes, 0);
+                try
+                {
+                    var attributes = Attributes(entry);
+                    if ((attributes & ReparsePointAttribute) != 0)
+                    {
+                        say($"Leaving {display}: it is a link (reparse point)");
+                    }
+                    else if ((attributes & DirectoryAttribute) == 0)
+                    {
+                        return new Entry(entry, null, new Queue<string>(), display);
+                    }
+                    else if (depth > MaxDepth)
+                    {
+                        say($"Leaving {display}: more than {MaxDepth} folders deep");
+                    }
+                    else
+                    {
+                        // The same folder again (empty name), for listing
+                        var folder = NoFollow.Open(entry, "", ListDirectory, DirectoryFile);
+                        try
+                        {
+                            return new Entry(entry, folder, new Queue<string>(List(folder)), display);
+                        }
+                        catch
+                        {
+                            folder.Dispose();
+                            throw;
+                        }
+                    }
+                }
+                catch
+                {
+                    entry.Dispose();
+                    throw;
+                }
+                entry.Dispose();
+                return null;
+            }
+
+            public void Dispose()
+            {
+                listing?.Dispose();
+                handle.Dispose();
+            }
         }
 
         /// <summary>Deletes what the handle is open on (POSIX semantics: the name goes at once, read-only or not).</summary>

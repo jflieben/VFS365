@@ -2,40 +2,11 @@
   "version": 2,
   "dependencies": {
     "net10.0-windows7.0": {
-      "Microsoft.Identity.Client": {
-        "type": "Direct",
-        "requested": "[4.90.1, )",
-        "resolved": "4.90.1",
-        "contentHash": "GLsf4cfEfIZD4pBkmBc8kCjfE811PKsM29T9nMZQDS2px/buM/Ha8jVYiGPdiA7cqjYNIX+G5d0S12TtGZS6RA==",
-        "dependencies": {
-          "Microsoft.IdentityModel.Abstractions": "8.14.0"
-        }
-      },
-      "Microsoft.Identity.Client.Broker": {
-        "type": "Direct",
-        "requested": "[4.90.1, )",
-        "resolved": "4.90.1",
-        "contentHash": "n1sD4oVBfQjyekTXULWwgANj2DMCAmJcJq5pzBfAceCK2FauVyf8U0KxJ9jHWkA0d7cOfAangOmkeJ2uo4xhcw==",
-        "dependencies": {
-          "Microsoft.Identity.Client": "4.90.1",
-          "Microsoft.Identity.Client.NativeInterop": "0.20.6"
-        }
-      },
       "System.Security.Cryptography.ProtectedData": {
         "type": "Direct",
         "requested": "[10.0.12, )",
         "resolved": "10.0.12",
         "contentHash": "wO0W8VDMeRJZakRySOmemAnrBZMwEFRlbfBtATxUiLf2I3IhSRnCp1Vt157NWptdE4IJ7eftd5n8q9LtaKHFTQ=="
-      },
-      "Microsoft.Identity.Client.NativeInterop": {
-        "type": "Transitive",
-        "resolved": "0.20.6",
-        "contentHash": "noyfdMfVxyWpM6xUDmlW6gUvZ5ci24z7Qoy15JvynTQfZV5vTD2NEdsnT5Gy4ngViwgdIp5iRjRy10jAKXFAgw=="
-      },
-      "Microsoft.IdentityModel.Abstractions": {
-        "type": "Transitive",
-        "resolved": "8.14.0",
-        "contentHash": "iwbCpSjD3ehfTwBhtSNEtKPK0ICun6ov7Ibx6ISNA9bfwIyzI2Siwyi9eJFCJBwxowK9xcA1mj+jBWiigeqgcQ=="
       },
       "System.IO.FileSystem.AccessControl": {
         "type": "Transitive",
@@ -48,14 +19,14 @@
       "vfs365.drive.winfsp": {
         "type": "Project",
         "dependencies": {
-          "Vfs365.Core": "[0.3.2, )",
+          "Vfs365.Core": "[0.5.0, )",
           "winfsp.net": "[2.1.25156, )"
         }
       },
       "vfs365.graph": {
         "type": "Project",
         "dependencies": {
-          "Vfs365.Core": "[0.3.2, )"
+          "Vfs365.Core": "[0.5.0, )"
         }
       },
       "winfsp.net": {
@@ -69,11 +40,6 @@
       }
     },
     "net10.0-windows7.0/win-arm64": {
-      "Microsoft.Identity.Client.NativeInterop": {
-        "type": "Transitive",
-        "resolved": "0.20.6",
-        "contentHash": "noyfdMfVxyWpM6xUDmlW6gUvZ5ci24z7Qoy15JvynTQfZV5vTD2NEdsnT5Gy4ngViwgdIp5iRjRy10jAKXFAgw=="
-      },
       "System.IO.FileSystem.AccessControl": {
         "type": "Transitive",
         "resolved": "5.0.0",
@@ -81,11 +47,6 @@
       }
     },
     "net10.0-windows7.0/win-x64": {
-      "Microsoft.Identity.Client.NativeInterop": {
-        "type": "Transitive",
-        "resolved": "0.20.6",
-        "contentHash": "noyfdMfVxyWpM6xUDmlW6gUvZ5ci24z7Qoy15JvynTQfZV5vTD2NEdsnT5Gy4ngViwgdIp5iRjRy10jAKXFAgw=="
-      },
       "System.IO.FileSystem.AccessControl": {
         "type": "Transitive",
         "resolved": "5.0.0",

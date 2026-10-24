@@ -39,12 +39,12 @@ flowchart LR
 ## How it works
 
 - A WinFsp network volume per user: `\\VFS365\<user>` and a navigation pane entry, optionally a drive letter. Works on multi-session hosts (AVD). Name, letter, content (SharePoint sites, OneDrive or both) and site filters are set by policy.
-- Signs in with JSolve's multi-tenant app: an admin consents once per tenant, no app registration needed. Forks and tenants that require their own registration set `ClientId`. Member accounts in their own tenant only (no guest access).
+- Signs in through Windows' own Web Account Manager (silently on Entra joined or registered devices) with JSolve's multi-tenant app: an admin consents once per tenant, no app registration needed. Forks and tenants that require their own registration set `ClientId`. Member accounts in their own tenant only (no guest access).
 - Reports errors and daily usage to your own Azure table storage when `MonitoringUrl` is set, with a [dashboard](monitoring/vfs365-monitoring.html) to view them; API use per user is capped by policy.
 - Libraries are discovered per user with SharePoint Search (M365AutoLink's method) and listed when opened; nothing is mirrored up front, so library size doesn't matter.
 - Reads stream; saves upload into the existing item, keeping version history and sharing links; large copies upload while they are written. Copies of many small files run at disk speed: new files upload right after they are closed, four at a time, and copies out of the drive download the next small files ahead.
 - Starts from the last session's libraries and folders, so the drive is there at logon; a change feed per library in use (delta plus push) brings in changes made elsewhere. Big folders show what has arrived while the rest loads.
-- File copies are cached encrypted per user, size-limited, and wiped by `vfs365 signout`, on an account change or at Intune unenrollment. A tray icon (English or Dutch) reports conflicts, waiting uploads with their cause, and sign-in problems, and offers Sign in; the drive never asks for a sign-in by itself once it runs.
+- File copies are cached encrypted per user, size-limited, and wiped by `vfs365 signout`, on an account change or at Intune unenrollment. A tray icon (English or Dutch) reports conflicts, waiting uploads with their cause, and sign-in problems, and offers Sign in; with the icon, the drive never asks for a sign-in by itself once it runs.
 
 ### Saving a file
 
@@ -101,9 +101,9 @@ You need an Azure storage account with three tables and two shared access signat
 1. **Storage account.** Any StorageV2 account works; Standard LRS is plenty. Create the tables `errors`, `statistics` and `devices` (portal: Storage browser > Tables > Add table).
 2. **SAS for the devices.** Storage account > Security + networking > Shared access signature: allowed services **Table**, resource types **Object**, permissions **Add** only, HTTPS only, an expiry date (one or two years, with a reminder to renew). Generate and copy the **Table service SAS URL** (`https://<account>.table.core.windows.net/?sv=...&sp=a&...`).
 3. **Policy.** Set **Report to Azure table storage** (`MonitoringUrl`) to that URL as a **computer** policy: Group Policy (Computer Configuration > Administrative Templates > JSolve > VFS365 > Monitoring) or the Intune settings catalog after importing the ADMX. It is the registry value `MonitoringUrl` (REG_SZ) under `HKLM\SOFTWARE\Policies\JSolve\VFS365`. Computer policy, so the installer can report installs and updates too. Optional: **Detail in error reports** (`MonitoringDetail`) = `NoPaths` keeps file and folder paths out of the reports.
-4. **SAS for the dashboard.** A second SAS: services **Table**, resource types **Container** and **Object**, permissions **Read** and **List**, HTTPS only, a short expiry (the dashboard warns three days before it ends).
-5. **CORS**, so a browser may read the tables: Settings > Resource sharing (CORS) > Table service: allowed origins `*` (or where you host the dashboard), methods `GET` and `OPTIONS`, allowed and exposed headers `*`, max age `3600`.
-6. **Open the dashboard** ([vfs365-monitoring.html](monitoring/vfs365-monitoring.html), also attached to every release) in a browser and paste the second SAS URL. Rows appear as devices report: errors at once, a day's statistics the next day.
+4. **SAS for the dashboard.** A second SAS: services **Table**, resource type **Object**, permission **Read**, HTTPS only, a short expiry (the dashboard warns three days before it ends). The dashboard only reads rows, so it needs nothing more.
+5. **CORS**, so a browser may read the tables: Settings > Resource sharing (CORS) > Table service: allowed origins `*` (a page opened from disk needs `*`; or the https address where you host the dashboard), methods `GET` and `OPTIONS`, allowed and exposed headers `*`, max age `3600`.
+6. **Open the dashboard** ([vfs365-monitoring.html](monitoring/vfs365-monitoring.html), also attached to every release) in a browser and paste the second SAS URL. Rows appear as devices report: errors at once, a day's statistics the next day. Opened from disk, "Remember" keeps the SAS for that tab only; host the page on https to remember it.
 
 The same with the Azure CLI, in PowerShell:
 
@@ -118,8 +118,8 @@ foreach ($table in "errors", "statistics", "devices") { az storage table create 
 $add = az storage account generate-sas --account-name $account --account-key $key --services t --resource-types o --permissions a --https-only --expiry (Get-Date).AddYears(2).ToString("yyyy-MM-dd") -o tsv
 "MonitoringUrl: https://$account.table.core.windows.net/?$add"
 
-# Dashboard: read and list, 30 days
-$read = az storage account generate-sas --account-name $account --account-key $key --services t --resource-types co --permissions rl --https-only --expiry (Get-Date).AddDays(30).ToString("yyyy-MM-dd") -o tsv
+# Dashboard: read only, 30 days
+$read = az storage account generate-sas --account-name $account --account-key $key --services t --resource-types o --permissions r --https-only --expiry (Get-Date).AddDays(30).ToString("yyyy-MM-dd") -o tsv
 "Dashboard: https://$account.table.core.windows.net/?$read"
 
 az storage cors add --account-name $account --account-key $key --services t --methods GET OPTIONS --origins "*" --allowed-headers "*" --exposed-headers "*" --max-age 3600
@@ -129,7 +129,7 @@ Good to know:
 
 - **Renewing and revoking.** An expired devices SAS sends nothing (each device logs that once); set the new URL in the policy before the old one ends. A SAS can't be revoked on its own: regenerating the storage key it was signed with (`key1` above) revokes every SAS signed with that key. Sign new ones with `key2` first, roll them out, then regenerate `key1`.
 - **Network.** Devices send over https straight to `<account>.table.core.windows.net`. With the storage firewall on, allow your offices, VPN and AVD subnets, or the reports don't arrive (the log says why).
-- **Privacy.** Rows contain user and device names, and error rows file and folder paths unless `MonitoringDetail` is `NoPaths`. Keep the dashboard SAS short-lived and only share it with whoever needs it; anyone with it can read every row.
+- **Privacy.** Rows contain user and device names, and error rows file and folder paths unless `MonitoringDetail` is `NoPaths`. Keep the dashboard SAS short-lived and only share it with whoever needs it; anyone with it can read every row. Rows are not signed: anyone with the devices SAS can add rows.
 - **Cost.** Small: a statistics row per user per day and a few error rows. For 2,500 users that is about 2,500 rows and a few MB a day, which costs cents a month in a standard account.
 
 See [Monitoring in DEPLOYMENT.md](docs/DEPLOYMENT.md#monitoring) for every column and when it is sent.
@@ -139,6 +139,8 @@ See [Monitoring in DEPLOYMENT.md](docs/DEPLOYMENT.md#monitoring) for every colum
 - Discovery uses SharePoint Search: sites excluded from search and Restricted Content Discovery sites aren't found. Pinned locations (policy, or `vfs365 pin` per user) fill the gap.
 - Byte-range locks don't cross machines: multi-user Access, QuickBooks and SQLite files are unsafe. The `DatabaseFiles` policy makes them read-only or blocks them if you want / expect concurrent use
 - No Office co-authoring from the drive; that works only through Microsoft's own client.
+- While a user's drive isn't running, `\\VFS365` is an ordinary server name to Windows. Turn off LLMNR and NetBIOS name resolution and own the DNS name, as in [The name VFS365 on the network](docs/DEPLOYMENT.md#the-name-vfs365-on-the-network).
+- x64 apps on ARM64 devices can't resolve typed `\\VFS365` paths in their file dialogs (files open and save normally); see [Known limitations](docs/DEPLOYMENT.md#known-limitations).
 
 ## Docs
 

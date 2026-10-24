@@ -1,3 +1,5 @@
+using System.Diagnostics;
+using System.Reflection;
 using System.Security.Principal;
 using Vfs365.Agent;
 
@@ -77,6 +79,45 @@ public sealed class MachineCleanupTests : IDisposable
 
         Assert.True(File.Exists(Path.Combine(profile.DataFolder, "discovery.json")));
         Assert.Contains(said, line => line.Contains("owned by", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void A_deep_folder_chain_is_cleaned_down_to_the_depth_limit_without_recursion()
+    {
+        var profile = Profile("eve", unsaved: false);
+        // 200 levels: far below what recursion survived on SYSTEM's stack, far above the 64 folders cleaned
+        var chain = Path.Combine(profile.DataFolder, "cache");
+        for (var i = 0; i < 200; i++)
+        {
+            chain = Path.Combine(chain, "d");
+            Directory.CreateDirectory(chain);
+            if (i is 10 or 150)
+            {
+                File.WriteAllText(Path.Combine(chain, $"file{i}"), "x");
+            }
+        }
+        var said = new List<string>();
+
+        MachineCleanup.RemoveUserData([profile], dryRun: false, said.Add);
+
+        var kept = Directory.EnumerateFiles(profile.DataFolder, "*", SearchOption.AllDirectories).Select(Path.GetFileName).ToList();
+        Assert.Equal(["file150"], kept);
+        Assert.Single(said, line => line.Contains("more than 64 folders deep", StringComparison.Ordinal));
+        Assert.DoesNotContain(said, line => line.StartsWith("Could not", StringComparison.Ordinal));
+        Assert.False(File.Exists(Path.Combine(profile.DataFolder, "agent.log")));
+    }
+
+    [Fact]
+    public void Reads_the_user_and_program_version_of_an_agent_process()
+    {
+        var describe = typeof(MachineCleanup).GetMethod("Describe", BindingFlags.NonPublic | BindingFlags.Static)!;
+        using var self = Process.GetCurrentProcess();
+
+        var found = ((SecurityIdentifier User, Version Version)?)describe.Invoke(null, [self]);
+
+        var file = FileVersionInfo.GetVersionInfo(Environment.ProcessPath!);
+        Assert.Equal(WindowsIdentity.GetCurrent().User, found!.Value.User);
+        Assert.Equal(new Version(file.FileMajorPart, file.FileMinorPart, file.FileBuildPart), found.Value.Version);
     }
 
     [Fact]

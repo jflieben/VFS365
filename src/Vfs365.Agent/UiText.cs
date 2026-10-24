@@ -38,6 +38,12 @@ public static class UiText
         ["Status.Restarting"] = ("restarting after uploads finish", "start opnieuw zodra uploads klaar zijn"),
         ["Status.NotStarted"] = ("not started: {0}", "niet gestart: {0}"),
         ["Status.Taken"] = ("not started: another user on this PC has {0}", "niet gestart: een andere gebruiker op deze pc heeft {0}"),
+        ["Status.Stopped"] = ("stopped after unexpected errors", "gestopt na onverwachte fouten"),
+
+        // Why a start waits, where only the exception text was known (StartText)
+        ["Start.Mounted"] = ("your drive is already running, in another session or program", "uw station draait al, in een andere sessie of een ander programma"),
+        ["Start.WinFsp"] = ("Windows could not start the drive; WinFsp may be missing", "Windows kon het station niet starten; mogelijk ontbreekt WinFsp"),
+        ["Start.Files"] = ("VFS365 can't read or write its files in your profile", "VFS365 kan zijn bestanden in uw profiel niet lezen of schrijven"),
 
         // Notifications
         ["Copy.Title"] = ("Saved as a copy", "Opgeslagen als kopie"),
@@ -51,8 +57,8 @@ public static class UiText
         ["Waiting.Many"] = ("{0} files are waiting to upload: {1}. VFS365 keeps trying; your changes are kept on this PC.",
             "{0} bestanden wachten op uploaden: {1}. VFS365 blijft het proberen; uw wijzigingen blijven op deze pc."),
         ["NotDeleted.Title"] = ("Not deleted", "Niet verwijderd"),
-        ["NotDeleted.One"] = ("{0} could not be deleted in Microsoft 365 ({1}). It is back in its folder.",
-            "{0} kon niet worden verwijderd in Microsoft 365 ({1}). Het staat weer in de map."),
+        ["NotDeleted.One"] = ("{0} could not be deleted in Microsoft 365: {1}. It is back in its folder.",
+            "{0} kon niet worden verwijderd in Microsoft 365: {1}. Het staat weer in de map."),
         ["NotDeleted.Many"] = ("{0} files could not be deleted in Microsoft 365. They are back in their folders.",
             "{0} bestanden konden niet worden verwijderd in Microsoft 365. Ze staan weer in hun mappen."),
         ["Uploaded.Title"] = ("Uploaded", "Geüpload"),
@@ -76,12 +82,19 @@ public static class UiText
         ["Letter.Title"] = ("Drive letter not available", "Stationsletter niet beschikbaar"),
         ["Letter.Text"] = ("{0} is in use or not valid, so your files are in the navigation pane and at {1}, without a drive letter.",
             "{0} is in gebruik of ongeldig. Uw bestanden staan daarom zonder stationsletter in het navigatiedeelvenster en op {1}."),
+        ["Letter.TextNoPane"] = ("{0} is in use or not valid, so your files are at {1}, without a drive letter.",
+            "{0} is in gebruik of ongeldig. Uw bestanden staan daarom zonder stationsletter op {1}."),
         ["Security.Title"] = ("Security warning", "Beveiligingswaarschuwing"),
         ["Security.Text"] = ("Another user on this PC has taken {0}. VFS365 didn't start your drive, so nothing can be saved there by mistake. Tell your IT department.",
             "Een andere gebruiker op deze pc heeft {0} in gebruik. VFS365 heeft uw station niet gestart, zodat daar niets per ongeluk wordt opgeslagen. Meld dit bij uw IT-afdeling."),
+        ["Security.SameName"] = ("Another account with your user name ({1}) has {0} on this PC. VFS365 didn't start your drive, so nothing can be saved there by mistake. Sign that account out of this PC, or tell your IT department.",
+            "Een ander account met uw gebruikersnaam ({1}) heeft {0} in gebruik op deze pc. VFS365 heeft uw station niet gestart, zodat daar niets per ongeluk wordt opgeslagen. Meld dat account af op deze pc, of meld dit bij uw IT-afdeling."),
         ["Failed.Title"] = ("VFS365 didn't start", "VFS365 is niet gestart"),
         ["Failed.Text"] = ("{0}. Choose Retry in the VFS365 menu, or Show log for the details.",
             "{0}. Kies Opnieuw proberen in het VFS365-menu, of Logboek weergeven voor de details."),
+        ["Stopped.Title"] = ("VFS365 stopped", "VFS365 is gestopt"),
+        ["Stopped.Text"] = ("VFS365 stopped unexpectedly several times. Choose Retry in the VFS365 menu to start it again, or Show log for the details.",
+            "VFS365 is meerdere keren onverwacht gestopt. Kies Opnieuw proberen in het VFS365-menu om het weer te starten, of Logboek weergeven voor de details."),
         ["Shutdown.Uploading"] = ("Uploading {0} changed file(s) to Microsoft 365", "{0} gewijzigd(e) bestand(en) uploaden naar Microsoft 365"),
 
         // Plain causes (PlainCause)

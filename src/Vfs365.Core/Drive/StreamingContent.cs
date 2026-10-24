@@ -9,7 +9,8 @@ namespace Vfs365.Core.Drive;
 /// Streams pause when nobody reads near them and stop after a while, so peeking at a big file doesn't download all of it.
 /// Every stream asks for the version the listing named, so one download never mixes two versions.
 /// A failed stream is tried again after 1 and 2 s; reads fail only when all attempts did (and again after a cool-down), or for good
-/// when the content served isn't that version or isn't Length bytes (then <c>contentChanged</c> gets the item as served).
+/// when the content served isn't that version or isn't Length bytes (then <c>contentChanged</c> gets the item as served). A stream that
+/// brings no bytes for the no-progress timeout counts as a failed attempt, whether or not a reader is waiting for it.
 /// </summary>
 internal sealed class StreamingContent : IContentSource
 {
@@ -17,22 +18,39 @@ internal sealed class StreamingContent : IContentSource
     const int ReadAhead = 8;
     const int MaxStreams = 3;
     const int MaxFailures = 3;
+
+    /// <summary>Bytes read from a stream at a time, so progress shows within a block on a slow line.</summary>
+    const int Piece = 64 * 1024;
     static readonly TimeSpan RetryDelay = TimeSpan.FromSeconds(1);
     static readonly TimeSpan IdleStop = TimeSpan.FromSeconds(30);
-    static readonly TimeSpan NoProgressTimeout = TimeSpan.FromSeconds(90);
     static readonly TimeSpan FailureCooldown = TimeSpan.FromSeconds(10);
 
     /// <summary>
     /// One streaming request. Demand is the furthest block its readers asked for; it runs at most ReadAhead blocks past that.
     /// ActiveAt is when a reader last wanted more or a block arrived: its own idle time, which other streams don't extend.
+    /// ProgressAt is when it started or last got bytes; Flowing once it got any.
     /// </summary>
-    sealed class Runner(int next, int demand, CancellationToken disposed)
+    sealed class Runner
     {
-        public int Next { get; set; } = next;
-        public int Demand { get; set; } = demand;
+        public Runner(int next, int demand, CancellationToken disposed)
+        {
+            (Next, Demand) = (next, demand);
+            Stop = CancellationTokenSource.CreateLinkedTokenSource(disposed);
+            Stall = CancellationTokenSource.CreateLinkedTokenSource(Stop.Token);
+        }
+
+        public int Next { get; set; }
+        public int Demand { get; set; }
         public long ActiveAt { get; set; } = Now;
+        public long ProgressAt { get; set; } = Now;
+        public bool Flowing { get; set; }
         public bool Parked { get; set; }
-        public CancellationTokenSource Stop { get; } = CancellationTokenSource.CreateLinkedTokenSource(disposed);
+
+        /// <summary>Stops the stream without counting a failure (room for another, nobody reading, disposed, given up by a reader).</summary>
+        public CancellationTokenSource Stop { get; }
+
+        /// <summary>Fires when no bytes came for the no-progress timeout: a failed attempt.</summary>
+        public CancellationTokenSource Stall { get; }
     }
 
     readonly IDriveApi api;
@@ -41,6 +59,7 @@ internal sealed class StreamingContent : IContentSource
     readonly Action<StreamingContent> completed;
     readonly Action<StreamingContent>? failed;
     readonly Action<DriveItemInfo>? contentChanged;
+    readonly TimeSpan noProgress;
     readonly CacheCipher.SealedFile? sealedFile;
     readonly SafeFileHandle file;
     readonly bool[] present, claimed;
@@ -60,11 +79,13 @@ internal sealed class StreamingContent : IContentSource
     /// <param name="contentTag">The version to download (the listing's cTag, else eTag); every stream is checked against it.</param>
     /// <param name="name">The cache file's name, which its encrypted chunks are bound to.</param>
     /// <param name="failed">Called when the download gave up, so new readers can start a fresh one.</param>
+    /// <param name="noProgress">A stream without bytes for this long is a failed attempt; a read waiting this long without progress fails.</param>
     public StreamingContent(IDriveApi api, string driveId, string itemId, string? contentTag, long length, string finalPath, string name, CacheCipher? cipher,
-        Action<StreamingContent> completed, Action<StreamingContent>? failed = null, Action<DriveItemInfo>? contentChanged = null)
+        Action<StreamingContent> completed, Action<StreamingContent>? failed = null, Action<DriveItemInfo>? contentChanged = null, TimeSpan? noProgress = null)
     {
         (this.api, this.driveId, this.itemId, this.contentTag, this.finalPath) = (api, driveId, itemId, contentTag, finalPath);
         (this.completed, this.failed, this.contentChanged) = (completed, failed, contentChanged);
+        this.noProgress = noProgress ?? TimeSpan.FromSeconds(90);
         Length = length;
         partialPath = $"{finalPath}.{Guid.NewGuid():N}.part";
         Directory.CreateDirectory(Path.GetDirectoryName(finalPath)!);
@@ -98,6 +119,9 @@ internal sealed class StreamingContent : IContentSource
 
     /// <summary>Opened by the content cache; it disposes this when the last reader is done.</summary>
     internal int References { get; set; }
+
+    /// <summary>Set by the content cache when the item was deleted meanwhile: the finished file isn't kept.</summary>
+    internal volatile bool Forgotten;
 
     static long Now => Environment.TickCount64;
 
@@ -135,12 +159,15 @@ internal sealed class StreamingContent : IContentSource
         CancellationTokenSource? cancel = null;
         var waitingFor = -1;
         var deadline = 0L;
+        var timeout = (long)noProgress.TotalMilliseconds;
         try
         {
             while (true)
             {
                 Task wait;
-                Runner? stop = null;
+                Runner? stop = null, stalled = null;
+                var gaveUp = false;
+                long left;
                 lock (gate)
                 {
                     var moreDemand = false;
@@ -165,7 +192,7 @@ internal sealed class StreamingContent : IContentSource
                     if (missing != waitingFor)
                     {
                         // Progress on this read's own blocks; other streams' progress doesn't count
-                        (waitingFor, deadline) = (missing, Now + (long)NoProgressTimeout.TotalMilliseconds);
+                        (waitingFor, deadline) = (missing, Now + timeout);
                     }
                     var runner = runners.FirstOrDefault(r => r.Next <= missing && missing <= r.Next + ReadAhead);
                     if (runner is null)
@@ -201,29 +228,52 @@ internal sealed class StreamingContent : IContentSource
                         runner.ActiveAt = Now;
                         moreDemand = true;
                     }
+                    // Bytes arriving on the stream this read waits for count as its progress too (a slow line takes long per block)
+                    left = (runner is { Flowing: true } ? Math.Max(deadline, runner.ProgressAt + timeout) : deadline) - Now;
+                    if (left <= 0 && runner is not null && Now - runner.ProgressAt >= timeout)
+                    {
+                        // Stalled: stopped here and counted as a failed attempt, so the next read starts a fresh stream
+                        runners.Remove(runner);
+                        stalled = runner;
+                        failure = new TimeoutException($"No download progress for {noProgress.TotalSeconds:0.#} s");
+                        gaveUp = ++failures >= MaxFailures;
+                        if (gaveUp)
+                        {
+                            failedAt = Now;
+                        }
+                        moreDemand = true;
+                    }
                     if (moreDemand)
                     {
                         Signal();
                     }
                     wait = changed.Task;
                 }
+                // Outside the gate: cancellation runs the stream's code inline
                 if (stop is not null)
                 {
-                    Cancel(stop); // outside the gate: cancellation runs the stream's code inline
+                    Cancel(stop);
+                }
+                if (left <= 0)
+                {
+                    if (stalled is not null)
+                    {
+                        Cancel(stalled);
+                        if (gaveUp)
+                        {
+                            failed?.Invoke(this);
+                        }
+                    }
+                    throw new TimeoutException($"No download progress for {noProgress.TotalSeconds:0.#} s");
                 }
                 cancel ??= CancellationTokenSource.CreateLinkedTokenSource(ct, disposed.Token);
-                var left = deadline - Now;
                 try
                 {
-                    if (left <= 0)
-                    {
-                        throw new TimeoutException();
-                    }
                     await wait.WaitAsync(TimeSpan.FromMilliseconds(left), cancel.Token);
                 }
                 catch (TimeoutException)
                 {
-                    throw new TimeoutException($"No download progress for {NoProgressTimeout.TotalSeconds} s");
+                    // Checked again above: the stream may have made progress meanwhile
                 }
             }
         }
@@ -248,6 +298,7 @@ internal sealed class StreamingContent : IContentSource
     {
         RequestPriority.Use(priority); // Task.Run copied the context of whoever started this stream
         var token = runner.Stop.Token;
+        var stall = runner.Stall;
         var claim = -1;
         try
         {
@@ -260,7 +311,13 @@ internal sealed class StreamingContent : IContentSource
             {
                 await Task.Delay(RetryDelay * retry, token);
             }
-            await using var stream = await api.OpenReadAsync(driveId, itemId, contentTag, (long)runner.Next * BlockSize, Length, token);
+            lock (gate)
+            {
+                runner.ProgressAt = Now;
+            }
+            // WaitAsync as well as the token: a call that ignores its token can't hold the stream
+            stall.CancelAfter(noProgress);
+            await using var stream = await api.OpenReadAsync(driveId, itemId, contentTag, (long)runner.Next * BlockSize, Length, stall.Token).WaitAsync(stall.Token);
             var buffer = new byte[BlockSize];
             while (true)
             {
@@ -273,13 +330,27 @@ internal sealed class StreamingContent : IContentSource
                         return;
                     }
                 }
+                stall.CancelAfter(Timeout.InfiniteTimeSpan); // waiting for readers isn't stalling
                 if (!await WaitForDemandAsync(runner, block))
                 {
                     return;
                 }
 
                 var length = (int)Math.Min(BlockSize, Length - (long)block * BlockSize);
-                await stream.ReadExactlyAsync(buffer.AsMemory(0, length), token);
+                for (var got = 0; got < length;)
+                {
+                    stall.CancelAfter(noProgress);
+                    var read = await stream.ReadAsync(buffer.AsMemory(got, Math.Min(Piece, length - got)), stall.Token).AsTask().WaitAsync(stall.Token);
+                    if (read == 0)
+                    {
+                        throw new EndOfStreamException($"The download ended at {(long)block * BlockSize + got} of {Length} bytes");
+                    }
+                    got += read;
+                    lock (gate)
+                    {
+                        (runner.ProgressAt, runner.Flowing) = (Now, true);
+                    }
+                }
                 bool write;
                 lock (gate)
                 {
@@ -347,7 +418,9 @@ internal sealed class StreamingContent : IContentSource
             bool gaveUp;
             lock (gate)
             {
-                failure = e;
+                failure = e is OperationCanceledException && stall.IsCancellationRequested
+                    ? new TimeoutException($"No download progress for {noProgress.TotalSeconds:0.#} s", e)
+                    : e;
                 gaveUp = ++failures >= MaxFailures;
                 if (gaveUp)
                 {
@@ -375,6 +448,7 @@ internal sealed class StreamingContent : IContentSource
                 complete = presentCount == present.Length;
                 Signal();
             }
+            runner.Stall.Dispose();
             runner.Stop.Dispose();
             if (complete)
             {

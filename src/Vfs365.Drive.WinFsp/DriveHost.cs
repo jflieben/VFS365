@@ -15,6 +15,12 @@ public sealed class DriveHost : IDisposable
     /// <summary>ERROR_FILE_EXISTS as WinFsp reports it when another volume holds the same UNC prefix.</summary>
     const int FileExists = unchecked((int)0x80070050);
 
+    /// <summary>
+    /// How long a request may take before WinFsp cancels it: WinFsp's maximum, up from its default 5 minutes, so a save that uploads on
+    /// close over a slow line isn't failed while its upload goes on.
+    /// </summary>
+    static readonly TimeSpan IrpTimeout = TimeSpan.FromMinutes(10);
+
     readonly FileSystemHost host;
     readonly Channel<EngineChange> changes = Channel.CreateUnbounded<EngineChange>(new UnboundedChannelOptions { SingleReader = true });
     readonly Task notifier;
@@ -30,7 +36,13 @@ public sealed class DriveHost : IDisposable
     /// <summary>Tells Windows (Explorer, apps watching folders) about a change that didn't come through this volume. Queued; never blocks.</summary>
     public void Notify(EngineChange change) => changes.Writer.TryWrite(change);
 
-    /// <summary>Sends queued changes in batches, off WinFsp's dispatcher threads (NotifyBegin waits for renames in progress).</summary>
+    /// <summary>NotifyBegin attempts per batch: it gives up after a second while renames are in progress.</summary>
+    const int NotifyAttempts = 5;
+
+    /// <summary>
+    /// Sends queued changes in batches, off WinFsp's dispatcher threads (NotifyBegin waits for renames in progress). A batch NotifyBegin
+    /// refuses is tried again a few times before it is dropped.
+    /// </summary>
     async Task NotifyLoopAsync()
     {
         var batch = new List<NotifyInfo>();
@@ -49,29 +61,36 @@ public sealed class DriveHost : IDisposable
                         : change.IsDirectory ? NotifyFilter.ChangeDirName : NotifyFilter.ChangeFileName,
                 });
             }
-            try
+            for (var attempt = 1; ; attempt++)
             {
-                var begin = host.NotifyBegin(1000);
-                if (begin >= 0)
+                try
                 {
-                    try
+                    var begin = host.NotifyBegin(1000);
+                    if (begin >= 0)
                     {
-                        var status = host.Notify([.. batch]);
-                        log?.Invoke($"notified {batch.Count} change(s), first {batch[0].FileName}: 0x{status:X8}");
+                        try
+                        {
+                            var status = host.Notify([.. batch]);
+                            log?.Invoke($"notified {batch.Count} change(s), first {batch[0].FileName}: 0x{status:X8}");
+                        }
+                        finally
+                        {
+                            host.NotifyEnd();
+                        }
+                        break;
                     }
-                    finally
+                    if (attempt == NotifyAttempts)
                     {
-                        host.NotifyEnd();
+                        log?.Invoke($"notify of {batch.Count} change(s) skipped, NotifyBegin 0x{begin:X8} {NotifyAttempts} times");
+                        break;
                     }
                 }
-                else
+                catch (Exception e)
                 {
-                    log?.Invoke($"notify skipped, NotifyBegin 0x{begin:X8}");
+                    log?.Invoke($"notify failed: {e.GetType().Name}: {e.Message}");
+                    break;
                 }
-            }
-            catch (Exception e)
-            {
-                log?.Invoke($"notify failed: {e.GetType().Name}: {e.Message}");
+                await Task.Delay(TimeSpan.FromMilliseconds(200 * attempt));
             }
             batch.Clear();
         }
@@ -87,6 +106,10 @@ public sealed class DriveHost : IDisposable
         Action<string>? log, Action<string>? trace = null)
     {
         var host = new FileSystemHost(new Vfs365FileSystem(engine, label, log, trace)) { Prefix = uncPrefix };
+        if (!WinFspNative.SetIrpTimeout(host, IrpTimeout))
+        {
+            log?.Invoke($"WinFsp's request timeout could not be set to {IrpTimeout.TotalMinutes:0} min; it stays at WinFsp's default");
+        }
         var status = host.MountEx(mountPoint, 16, null, false, 0);
         if (status < 0)
         {

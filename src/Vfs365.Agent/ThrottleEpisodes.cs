@@ -4,7 +4,8 @@ namespace Vfs365.Agent;
 
 /// <summary>
 /// Throttled responses grouped into episodes for monitoring and the log: an episode starts with a throttled response and ends when
-/// nothing was throttled for <see cref="Quiet"/> after its last pause ended.
+/// nothing was throttled for <see cref="Quiet"/> after its last pause ended. A response after that starts a new episode even when
+/// nobody asked for the old one yet (a late tick after sleep).
 /// </summary>
 public sealed class ThrottleEpisodes
 {
@@ -24,25 +25,32 @@ public sealed class ThrottleEpisodes
         public int Background { get; set; }
         public TimeSpan LongestPause { get; set; }
 
+        /// <summary>The pause every request had, as Microsoft asked (Retry-After); background work waits ThrottlePauseMinutes on top, not counted here.</summary>
         public TimeSpan Held => Until - From;
 
         public string Describe()
         {
             var statuses = string.Join(", ", new[] { (429, Status429), (503, Status503) }.Where(s => s.Item2 > 0).Select(s => $"{s.Item1} x{s.Item2}"));
-            return $"Microsoft throttled VFS365 for {Span(Held)}: {Responses} response(s) ({statuses}); SharePoint {SharePoint}, Graph {Graph}; " +
-                $"background work {Background}, user actions {Responses - Background}; longest wait {Span(LongestPause)}.";
+            return $"Microsoft throttled VFS365 for {Span(Held)} (the pause it asked for; background work waits longer): {Responses} response(s) ({statuses}); " +
+                $"SharePoint {SharePoint}, Graph {Graph}; background work {Background}, user actions {Responses - Background}; longest wait {Span(LongestPause)}.";
         }
 
         static string Span(TimeSpan span) => span < TimeSpan.FromSeconds(90) ? $"{Math.Max(1, (int)span.TotalSeconds)} s" : $"{(int)Math.Round(span.TotalMinutes, MidpointRounding.AwayFromZero)} min";
     }
 
     readonly Lock gate = new();
+    readonly List<Episode> ended = [];
     Episode? open;
 
     public void Add(ThrottleNotice notice)
     {
         lock (gate)
         {
+            if (open is not null && notice.At >= open.Until + Quiet)
+            {
+                ended.Add(open);
+                open = null;
+            }
             open ??= new Episode { From = notice.At, Until = notice.At };
             open.Responses++;
             if (notice.Status == 429)
@@ -76,18 +84,23 @@ public sealed class ThrottleEpisodes
         }
     }
 
-    /// <summary>The episode that ended by <paramref name="now"/>, once; null while one goes on or none was open.</summary>
-    public Episode? Ended(DateTimeOffset now)
+    /// <summary>Episodes that ended by <paramref name="now"/>, each once, oldest first; MaxValue ends the one still going on (a stop).</summary>
+    public IReadOnlyList<Episode> Ended(DateTimeOffset now)
     {
         lock (gate)
         {
-            if (open is null || now < open.Until + Quiet)
+            if (open is not null && (now == DateTimeOffset.MaxValue || now >= open.Until + Quiet))
             {
-                return null;
+                ended.Add(open);
+                open = null;
             }
-            var ended = open;
-            open = null;
-            return ended;
+            if (ended.Count == 0)
+            {
+                return [];
+            }
+            var episodes = ended.ToList();
+            ended.Clear();
+            return episodes;
         }
     }
 }

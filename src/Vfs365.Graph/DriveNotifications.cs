@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Net.WebSockets;
 using System.Text;
 using System.Text.Json;
@@ -81,11 +82,29 @@ public sealed class PushDebounce(Func<Task> read) : IDisposable
 /// </summary>
 public sealed class DriveNotifications(M365Client client)
 {
+    static readonly TimeSpan FirstRetry = TimeSpan.FromSeconds(5), MaxRetry = TimeSpan.FromMinutes(5);
+
+    /// <summary>A channel up this long starts its back-off over when it drops; one that drops sooner backs off further.</summary>
+    static readonly TimeSpan StableAfter = TimeSpan.FromSeconds(60);
+
+    /// <summary>Engine.IO 3's defaults, until the server's open packet names its own.</summary>
+    static readonly TimeSpan DefaultPingInterval = TimeSpan.FromSeconds(25), DefaultPingTimeout = TimeSpan.FromSeconds(20);
+
+    static readonly TimeSpan ConnectTimeout = TimeSpan.FromSeconds(60);
+
     /// <summary>Raw frames, for diagnostics.</summary>
     public Action<string>? Trace { get; set; }
 
     /// <summary>Why a channel dropped or couldn't open.</summary>
     public Action<string>? Problem { get; set; }
+
+    /// <summary>Time, randomness (0 to 1) and the wait between connections; replaceable for tests.</summary>
+    public Func<DateTimeOffset> Clock { get; init; } = () => DateTimeOffset.UtcNow;
+    public Func<double> Random { get; init; } = System.Random.Shared.NextDouble;
+    public Func<TimeSpan, CancellationToken, Task> Delay { get; init; } = Task.Delay;
+
+    /// <summary>Opens the WebSocket; replaceable for tests.</summary>
+    public Func<Uri, CancellationToken, Task<WebSocket>> Connect { get; init; } = ConnectAsync;
 
     public async Task<Uri> GetEndpointAsync(string driveId, CancellationToken ct)
     {
@@ -94,21 +113,24 @@ public sealed class DriveNotifications(M365Client client)
     }
 
     /// <summary>
-    /// Calls <paramref name="changed"/> for every notification until cancelled. Reconnects with a fresh endpoint after a drop,
-    /// backing off up to 5 minutes; <paramref name="connected"/> reports when the channel is up or down.
+    /// Calls <paramref name="changed"/> for every notification until cancelled. Reconnects with a fresh endpoint after a drop, backing
+    /// off from 5 seconds to 5 minutes plus 0 to 100% at random (a front end restart drops every client at once; they mustn't all come
+    /// back together), starting over only after a channel stayed up a minute; <paramref name="connected"/> reports when the channel is
+    /// up or down.
     /// </summary>
     public async Task ListenAsync(string driveId, Action changed, Action<bool> connected, CancellationToken ct)
     {
         RequestPriority.MarkBackground();
-        var delay = TimeSpan.FromSeconds(5);
+        var delay = FirstRetry;
         while (!ct.IsCancellationRequested)
         {
+            DateTimeOffset? upSince = null;
             try
             {
                 var endpoint = await GetEndpointAsync(driveId, ct);
                 await ReceiveAsync(endpoint, changed, () =>
                 {
-                    delay = TimeSpan.FromSeconds(5);
+                    upSince = Clock();
                     connected(true);
                 }, ct);
             }
@@ -121,40 +143,74 @@ public sealed class DriveNotifications(M365Client client)
                 Problem?.Invoke($"push channel of drive {driveId}: {e.Message}");
             }
             connected(false);
+            if (upSince is { } since && Clock() - since >= StableAfter)
+            {
+                delay = FirstRetry;
+            }
             try
             {
-                await Task.Delay(delay, ct);
+                await Delay(delay * (1 + Random()), ct);
             }
             catch (OperationCanceledException)
             {
                 return;
             }
-            delay = TimeSpan.FromSeconds(Math.Min(delay.TotalSeconds * 2, 300));
+            delay = delay * 2 < MaxRetry ? delay * 2 : MaxRetry;
         }
     }
 
+    static async Task<WebSocket> ConnectAsync(Uri uri, CancellationToken ct)
+    {
+        var socket = new ClientWebSocket();
+        socket.Options.SetRequestHeader("User-Agent", GraphUserAgent.Value);
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        deadline.CancelAfter(ConnectTimeout);
+        try
+        {
+            await socket.ConnectAsync(uri, deadline.Token);
+            return socket;
+        }
+        catch (OperationCanceledException e) when (!ct.IsCancellationRequested)
+        {
+            socket.Dispose();
+            throw new IOException($"no connection within {ConnectTimeout.TotalSeconds:N0} s (timed out)", e);
+        }
+        catch
+        {
+            socket.Dispose();
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// One connection, until it closes. Silence for longer than the ping interval plus the ping timeout (no pong, no other frame) ends
+    /// it as dead, as Engine.IO clients do.
+    /// </summary>
     async Task ReceiveAsync(Uri endpoint, Action changed, Action ready, CancellationToken ct)
     {
-        using var socket = new ClientWebSocket();
-        socket.Options.SetRequestHeader("User-Agent", GraphUserAgent.Value);
         var query = endpoint.Query.TrimStart('?');
         var nsp = endpoint.AbsolutePath;
-        await socket.ConnectAsync(new Uri($"wss://{endpoint.Authority}/socket.io/?EIO=3&transport=websocket{(query.Length > 0 ? "&" + query : "")}"), ct);
+        using var socket = await Connect(new Uri($"wss://{endpoint.Authority}/socket.io/?EIO=3&transport=websocket{(query.Length > 0 ? "&" + query : "")}"), ct);
         using var stop = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        var silence = DefaultPingInterval + DefaultPingTimeout;
+        stop.CancelAfter(silence);
         Task? pinger = null;
         var buffer = new byte[16 * 1024];
         try
         {
             while (await ReadAsync(socket, buffer, stop.Token) is { Length: > 0 } message)
             {
+                stop.CancelAfter(silence);
                 Trace?.Invoke($"< {(message.Length > 200 ? message[..200] + "..." : message)}");
                 if (message[0] == '0')
                 {
                     // Open: join the endpoint's namespace with its query, then ping at the interval the server asks for
                     using var open = JsonDocument.Parse(message[1..]);
-                    var interval = open.RootElement.TryGetProperty("pingInterval", out var ms) && ms.ValueKind == JsonValueKind.Number ? ms.GetInt32() : 25000;
+                    var interval = Milliseconds(open.RootElement, "pingInterval") ?? DefaultPingInterval;
+                    silence = interval + (Milliseconds(open.RootElement, "pingTimeout") ?? DefaultPingTimeout);
+                    stop.CancelAfter(silence);
                     await SendAsync(socket, $"40{nsp}{(query.Length > 0 ? "?" + query : "")},", stop.Token);
-                    pinger = PingAsync(socket, TimeSpan.FromMilliseconds(interval), stop.Token);
+                    pinger = PingAsync(socket, interval, stop.Token);
                 }
                 else if (message == "2")
                 {
@@ -178,6 +234,10 @@ public sealed class DriveNotifications(M365Client client)
                 }
             }
         }
+        catch (Exception e) when (stop.IsCancellationRequested && !ct.IsCancellationRequested && e is OperationCanceledException or WebSocketException)
+        {
+            throw new IOException($"no answer to pings for {silence.TotalSeconds.ToString("0.#", CultureInfo.InvariantCulture)} s", e);
+        }
         finally
         {
             await stop.CancelAsync();
@@ -187,14 +247,17 @@ public sealed class DriveNotifications(M365Client client)
                 {
                     await pinger;
                 }
-                catch (Exception e) when (e is OperationCanceledException or WebSocketException)
+                catch (Exception e) when (e is OperationCanceledException or WebSocketException or ObjectDisposedException or IOException)
                 {
                 }
             }
         }
     }
 
-    static async Task PingAsync(ClientWebSocket socket, TimeSpan interval, CancellationToken ct)
+    static TimeSpan? Milliseconds(JsonElement open, string name) =>
+        open.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.Number && value.TryGetInt32(out var ms) && ms > 0 ? TimeSpan.FromMilliseconds(ms) : null;
+
+    static async Task PingAsync(WebSocket socket, TimeSpan interval, CancellationToken ct)
     {
         while (true)
         {
@@ -203,11 +266,11 @@ public sealed class DriveNotifications(M365Client client)
         }
     }
 
-    static Task SendAsync(ClientWebSocket socket, string text, CancellationToken ct) =>
+    static Task SendAsync(WebSocket socket, string text, CancellationToken ct) =>
         socket.SendAsync(Encoding.UTF8.GetBytes(text), WebSocketMessageType.Text, true, ct);
 
     /// <summary>One whole text message; empty when the server closed the socket.</summary>
-    static async Task<string> ReadAsync(ClientWebSocket socket, byte[] buffer, CancellationToken ct)
+    static async Task<string> ReadAsync(WebSocket socket, byte[] buffer, CancellationToken ct)
     {
         using var message = new MemoryStream();
         while (true)

@@ -54,6 +54,41 @@ public sealed class AgentLogTests : IDisposable
     }
 
     [Fact]
+    public void A_full_file_that_can_not_be_moved_goes_on_without_trying_on_every_line()
+    {
+        using var log = AgentLog.Open(folder, true, 1000, () => now);
+        log.WriteLine("first");
+        // Another program holds agent.log open without delete sharing, so it can't be moved to logs\
+        using (new FileStream(Current, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+        {
+            for (var i = 0; i < 40; i++)
+            {
+                log.WriteLine($"line {i} {new string('x', 80)}");
+            }
+        }
+        var text = ReadShared(Current);
+        var tries = text.Split('\n').Count(l => l.Contains("could not be moved", StringComparison.Ordinal));
+        Assert.InRange(tries, 1, 8); // about one per 500 bytes, not one per line
+        Assert.Contains("line 39", text);
+        Assert.Empty(Archived);
+
+        // Once it is free again the next try moves it
+        for (var i = 0; i < 10; i++)
+        {
+            log.WriteLine($"later {i} {new string('y', 80)}");
+        }
+        Assert.NotEmpty(Archived);
+        Assert.DoesNotContain(@"logs\" + Environment.NewLine, ReadShared(Current));
+    }
+
+    /// <summary>Reads a log another handle still writes.</summary>
+    static string ReadShared(string path)
+    {
+        using var reader = new StreamReader(new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete));
+        return reader.ReadToEnd();
+    }
+
+    [Fact]
     public void Writers_in_several_processes_never_overwrite_each_other()
     {
         // The supervisor, the agent and an agent being replaced each have their own handle on agent.log

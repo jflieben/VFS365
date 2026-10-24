@@ -1,0 +1,60 @@
+# Dependabot updates the lock files of projects that reference a bumped package directly, not of projects that get it through a
+# project reference (Cli and Background through Agent), so locked restore in CI fails on its NuGet pull requests. This job
+# regenerates all lock files on such a pull request, commits any change to its branch and starts CI for the new commit (a push with
+# GITHUB_TOKEN starts no workflows by itself). The token is only in the push step, not while restore evaluates MSBuild files.
+name: Dependabot lock files
+
+on:
+  pull_request:
+    paths: [Directory.Packages.props, '**/packages.lock.json']
+
+permissions: {}
+
+concurrency:
+  group: lockfiles-${{ github.head_ref }}
+  cancel-in-progress: false
+
+jobs:
+  lockfiles:
+    if: github.actor == 'dependabot[bot]' && github.event.pull_request.user.login == 'dependabot[bot]'
+    runs-on: windows-latest
+    permissions:
+      contents: write # push the lock files
+      actions: write # start CI
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.head_ref }}
+          persist-credentials: false
+
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Lock files
+        id: lockfiles
+        shell: pwsh
+        run: |
+          dotnet restore Vfs365.slnx --force-evaluate -p:RestoreLockedMode=false
+          if($LASTEXITCODE -ne 0){ Throw 'Restore failed' }
+          $changed = git status --porcelain -- '*packages.lock.json'
+          if(-not $changed){ 'Lock files are up to date.'; exit 0 }
+          $changed
+          "changed=true" >> $env:GITHUB_OUTPUT
+
+      - name: Push and start CI
+        if: steps.lockfiles.outputs.changed == 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ github.head_ref }}
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -- '*packages.lock.json'
+          if($LASTEXITCODE -ne 0){ Throw 'git add failed' }
+          git commit -m 'Update lock files of projects that reference the bumped packages indirectly'
+          if($LASTEXITCODE -ne 0){ Throw 'git commit failed' }
+          git push "https://x-access-token:$env:GH_TOKEN@github.com/$env:GITHUB_REPOSITORY.git" "HEAD:$env:BRANCH"
+          if($LASTEXITCODE -ne 0){ Throw 'Push failed' }
+          gh workflow run ci.yml --repo $env:GITHUB_REPOSITORY --ref $env:BRANCH

@@ -208,7 +208,7 @@ public sealed class WalkTests : IDisposable
     }
 
     [Fact]
-    public async Task With_push_up_hot_checks_slow_down_while_nothing_changes()
+    public async Task With_push_up_hot_checks_slow_down_until_this_engine_writes()
     {
         var api = new FakeDriveApi();
         api.Add("docs", folder: true);
@@ -227,15 +227,123 @@ public sealed class WalkTests : IDisposable
             return reads;
         }
 
-        Assert.Equal(1, await ReadsAfter(20)); // empty: next in 40 s
+        Assert.Equal(1, await ReadsAfter(20)); // next in 40 s
         Assert.Equal(0, await ReadsAfter(1));
         Assert.Equal(0, await ReadsAfter(30));
-        Assert.Equal(1, await ReadsAfter(11)); // empty again: next in 80 s
+        Assert.Equal(1, await ReadsAfter(11)); // next in 80 s
         Assert.Equal(0, await ReadsAfter(60));
 
         api.Add("docs/new.txt");
-        Assert.Equal(1, await ReadsAfter(21)); // a change: back to 20 s
+        Assert.Equal(1, await ReadsAfter(21)); // a change elsewhere: push brings those, next in 160 s
+        Assert.Equal(0, await ReadsAfter(100));
+        Assert.Equal(1, await ReadsAfter(60));
+
+        await engine.CreateAsync("\\docs\\mine.txt", false, default);
+        await engine.CommitAsync("\\docs\\mine.txt", default); // a write here: back to 20 s
         Assert.Equal(1, await ReadsAfter(21));
+    }
+
+    [Fact]
+    public async Task Without_push_hot_checks_slow_down_on_empty_reads_and_a_change_resets_them()
+    {
+        var api = new FakeDriveApi();
+        api.Add("docs", folder: true);
+        var engine = Create(api, walkThreshold: 0);
+        await engine.PollAsync("b!me");
+        await Names(engine, "\\docs");
+
+        async Task<int> ReadsAfter(int seconds)
+        {
+            var before = api.DeltaCalls;
+            now += TimeSpan.FromSeconds(seconds);
+            await engine.PollActiveAsync();
+            var reads = api.DeltaCalls - before;
+            await Names(engine, "\\docs");
+            return reads;
+        }
+
+        Assert.Equal(1, await ReadsAfter(20)); // empty: next in 40 s
+        Assert.Equal(0, await ReadsAfter(30));
+        Assert.Equal(1, await ReadsAfter(10)); // empty: next in 80 s, at most
+        Assert.Equal(0, await ReadsAfter(70));
+        Assert.Equal(1, await ReadsAfter(10));
+        Assert.Equal(0, await ReadsAfter(70));
+        Assert.Equal(1, await ReadsAfter(10));
+
+        api.Add("docs/new.txt");
+        Assert.Equal(1, await ReadsAfter(80)); // a change: back to 20 s
+        Assert.Equal(1, await ReadsAfter(20));
+    }
+
+    [Fact]
+    public async Task Opening_what_was_just_reported_does_not_keep_a_drive_in_use()
+    {
+        var api = new FakeDriveApi();
+        api.Add("docs", folder: true);
+        var engine = Create(api, walkThreshold: 0);
+        await engine.PollAsync("b!me");
+        await Names(engine, "\\docs");
+
+        now += TimeSpan.FromMinutes(9);
+        api.Add("docs/new.txt");
+        await engine.PollAsync("b!me");
+        await Names(engine, "\\docs"); // Explorer reading the folder again after the change notification
+        now += TimeSpan.FromMinutes(2);
+
+        Assert.Empty(engine.ActiveDrives());
+    }
+
+    [Fact]
+    public async Task A_push_read_right_after_a_read_waits_and_counts_as_one()
+    {
+        var api = new FakeDriveApi();
+        api.Add("docs", folder: true);
+        var engine = Create(api, walkThreshold: 0);
+        engine.SetPush("b!me", true);
+        await engine.PollAsync("b!me");
+        var calls = api.DeltaCalls;
+
+        now += TimeSpan.FromSeconds(5);
+        await engine.NotifiedAsync("b!me");
+        Assert.Equal(calls, api.DeltaCalls);
+        now += TimeSpan.FromSeconds(10);
+        await engine.PollActiveAsync();
+        Assert.Equal(calls, api.DeltaCalls);
+        now += TimeSpan.FromSeconds(6);
+        await engine.PollActiveAsync();
+        Assert.Equal(calls + 1, api.DeltaCalls);
+
+        now += TimeSpan.FromSeconds(30);
+        await engine.NotifiedAsync("b!me");
+        Assert.Equal(calls + 2, api.DeltaCalls);
+    }
+
+    [Fact]
+    public async Task The_catch_up_read_after_a_push_reconnect_is_delayed_and_skipped_after_a_recent_read()
+    {
+        var api = new FakeDriveApi();
+        var random = 0.5;
+        var engine = new DriveEngine(DriveNamespace.Build(new MyDrive("b!me", "https://x-my.sharepoint.com/personal/u"), [], (_, _) => Task.FromResult("unused"), DriveScope.OneDrive),
+            api, new ContentCache(Path.Combine(directory, "cache"), api),
+            new DriveEngineOptions { StagingDirectory = Path.Combine(directory, "staging"), Clock = () => now, WalkThreshold = 0, Random = () => random });
+        await engine.PollAsync("b!me");
+        var calls = api.DeltaCalls;
+
+        now += TimeSpan.FromMinutes(5);
+        engine.SetPush("b!me", true);
+        await engine.PollActiveAsync();
+        Assert.Equal(calls, api.DeltaCalls); // not at once: a front end restart reconnects every client together
+        now += TimeSpan.FromSeconds(16);
+        await engine.PollActiveAsync();
+        Assert.Equal(calls + 1, api.DeltaCalls);
+
+        // Down and up again shortly after a read: nothing to catch up on
+        engine.SetPush("b!me", false);
+        now += TimeSpan.FromSeconds(5);
+        engine.SetPush("b!me", true);
+        now += TimeSpan.FromSeconds(16);
+        await engine.PollActiveAsync();
+        Assert.Equal(calls + 1, api.DeltaCalls);
     }
 
     public void Dispose()

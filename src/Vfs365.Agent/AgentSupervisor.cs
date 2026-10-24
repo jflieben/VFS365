@@ -9,7 +9,8 @@ namespace Vfs365.Agent;
 /// vfs365-agent.exe as started at sign-in: runs the agent as a child process (--child) and starts it again when it crashes, so a fault
 /// in the agent or in a component it loads doesn't leave the user without the drive until the next sign-in. A normal stop (unmount,
 /// sign-out, uninstall, a restart from the tray) or a problem the agent reported itself ends the supervisor too. At most MaxRestarts
-/// within RestartWindow; crash details from the Windows event log go to agent.log, and giving up goes to monitoring as a crash row.
+/// within RestartWindow; crash details from the Windows event log go to agent.log, and giving up goes to monitoring as a crash row and
+/// to the tray (unless policy hides it), whose Retry starts the agent again.
 /// </summary>
 public static class AgentSupervisor
 {
@@ -53,14 +54,23 @@ public static class AgentSupervisor
             }
             // Windows records the crash only once the process is gone: the details follow in the log while the agent starts again
             var details = Task.Run(() => WriteCrashDetails(childId));
+            // The first start's --after (a restart from the tray) is done
+            childArgs = WithoutOption(WithoutOption(args.ToList(), "--after"), RestartedFlag);
             if (restarts.Count >= MaxRestarts)
             {
                 var gaveUp = $"The agent stopped unexpectedly (exit code 0x{code:X8}) {MaxRestarts + 1} times within {RestartWindow.TotalMinutes:0} minutes " +
-                    "and was not started again; it starts at the next sign-in";
+                    "and was not started again; it starts at the next sign-in, or at Retry in the tray";
                 Write([$"Agent:      {gaveUp}."]);
-                ReportGivingUp(args, gaveUp);
+                var settings = Settings(args);
+                ReportGivingUp(settings, gaveUp);
                 details.Wait(TimeSpan.FromSeconds(30));
-                return code;
+                if (!WaitForRetry(settings, sessionEnding))
+                {
+                    return code;
+                }
+                Write(["Agent:      starting again (Retry in the tray)"]);
+                restarts.Clear();
+                continue;
             }
             restarts.Enqueue(now);
             Write([$"Agent:      stopped unexpectedly (exit code 0x{code:X8}); starting again"]);
@@ -69,18 +79,59 @@ public static class AgentSupervisor
             {
                 return code;
             }
-
-            // The first start's --after (a restart from the tray) is done; the new child reports the crash
-            childArgs = WithoutOption(WithoutOption(args.ToList(), "--after"), RestartedFlag);
-            childArgs.AddRange([RestartedFlag, $"0x{code:X8}"]);
+            childArgs.AddRange([RestartedFlag, $"0x{code:X8}"]); // the new child reports the crash
         }
     }
 
     /// <summary>
-    /// A crash: an NTSTATUS error (access violation, fail-fast, a CLR exception) rather than a normal or reported exit (0, 1, 2), a
-    /// kill (-1, from Task Manager or the uninstaller) or Ctrl+C.
+    /// A crash: any exit but the agent's own (0 stopped, 1 a problem it reported, 2 usage), a kill (-1: Task Manager, the uninstaller),
+    /// Ctrl+C (STATUS_CONTROL_C_EXIT) and an end at logoff (DBG_TERMINATE_PROCESS). So NTSTATUS errors, CLR exits (an unhandled
+    /// exception 0xE0434352, fail-fast 0x80131623) and anything else unexpected.
     /// </summary>
-    public static bool Crashed(int code) => ((uint)code & 0xC0000000) == 0xC0000000 && code != -1 && (uint)code != 0xC000013A;
+    public static bool Crashed(int code) => code is not (0 or 1 or 2 or -1) && (uint)code is not (0xC000013A or 0x40010004);
+
+    /// <summary>Settings for the supervisor's own reports and tray; null when they can't be read.</summary>
+    static AgentSettings? Settings(string[] args)
+    {
+        try
+        {
+            var config = Array.IndexOf(args, "--config") is var at and >= 0 && at + 1 < args.Length ? args[at + 1] : null;
+            return AgentSettings.Load(config);
+        }
+        catch (Exception e) when (e is IOException or System.Text.Json.JsonException or UnauthorizedAccessException or System.Security.SecurityException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// After giving up: a tray icon that says so, with Retry and Show log, until Retry (true) or the end of the session. False at once
+    /// when policy hides the tray icon.
+    /// </summary>
+    static bool WaitForRetry(AgentSettings? settings, Func<bool> sessionEnding)
+    {
+        if (settings is { TrayIcon: false } || sessionEnding())
+        {
+            return false;
+        }
+        using var retry = new ManualResetEventSlim(false);
+        var ended = false;
+        using var tray = new Tray(settings?.Label ?? AgentSettings.DefaultLabel, new TrayActions(settings?.HelpUrl ?? AgentSettings.DefaultHelpUrl)
+        {
+            Retry = retry.Set,
+            SessionEnded = () => ended = true,
+        }, line => Write([$"Agent:      {line}"]));
+        tray.SetStatus(UiText.Get("Status.Stopped"), TrayState.Error);
+        tray.Notify(UiText.Get("Stopped.Title"), UiText.Get("Stopped.Text"));
+        while (!retry.Wait(TimeSpan.FromSeconds(1)))
+        {
+            if (ended || sessionEnding())
+            {
+                return false;
+            }
+        }
+        return true;
+    }
 
     static List<string> WithoutOption(List<string> args, string name)
     {
@@ -210,19 +261,23 @@ public static class AgentSupervisor
 
     static bool SameProcess(string? value, int processId) => ParseHex(value) == processId;
 
-    /// <summary>A crash row from the supervisor itself, as no agent runs to report it. Best effort, 10 s at most.</summary>
-    static void ReportGivingUp(string[] args, string message)
+    /// <summary>A crash row from the supervisor itself, as no agent runs to report it, with the last known account. Best effort, 10 s at most.</summary>
+    static void ReportGivingUp(AgentSettings? settings, string message)
     {
         try
         {
-            var config = Array.IndexOf(args, "--config") is var at and >= 0 && at + 1 < args.Length ? args[at + 1] : null;
-            var settings = AgentSettings.Load(config);
-            if (MonitoringTarget.Parse(settings.MonitoringUrl, out _) is not { } target)
+            if (settings is null || MonitoringTarget.Parse(settings.MonitoringUrl, out _) is not { } target)
             {
                 return;
             }
             var tenant = TenantResolver.Resolve(settings, DeviceJoin.Read()).Tenant;
-            var monitoring = new Monitoring(target, DeviceInfo.Current(), line => Write([line])) { TenantId = () => tenant, Detail = settings.MonitoringDetail };
+            var user = UsageStatistics.Load().LastUser();
+            var monitoring = new Monitoring(target, DeviceInfo.Current(), line => Write([line]))
+            {
+                TenantId = () => tenant,
+                User = () => user,
+                Detail = settings.MonitoringDetail,
+            };
             monitoring.Error("crash", message);
             monitoring.FlushAsync(TimeSpan.FromSeconds(10)).Wait();
         }

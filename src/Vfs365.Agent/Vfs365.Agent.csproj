@@ -4,11 +4,11 @@
 
   <PropertyGroup>
     <TargetFramework>net10.0-windows</TargetFramework>
+    <!-- Wam.cs calls WinRT interfaces by vtable slot -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="Microsoft.Identity.Client" />
-    <PackageReference Include="Microsoft.Identity.Client.Broker" />
     <PackageReference Include="System.Security.Cryptography.ProtectedData" />
     <ProjectReference Include="..\Vfs365.Core\Vfs365.Core.csproj" />
     <ProjectReference Include="..\Vfs365.Graph\Vfs365.Graph.csproj" />

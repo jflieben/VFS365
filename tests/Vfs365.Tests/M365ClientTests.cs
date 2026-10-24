@@ -103,17 +103,224 @@ public sealed class M365ClientTests
     }
 
     [Fact]
-    public void Retry_after_is_kept_between_zero_and_five_minutes()
+    public void Retry_after_is_kept_between_one_second_and_five_minutes()
     {
         var now = DateTimeOffset.UnixEpoch;
         var past = new HttpResponseMessage(HttpStatusCode.TooManyRequests);
         past.Headers.RetryAfter = new System.Net.Http.Headers.RetryConditionHeaderValue(now - TimeSpan.FromHours(1));
         var huge = Status(429, TimeSpan.FromHours(3));
 
-        Assert.Equal(TimeSpan.Zero, M365Client.RetryAfter(past, now));
+        Assert.Equal(TimeSpan.FromSeconds(1), M365Client.RetryAfter(past, now));
+        Assert.Equal(TimeSpan.FromSeconds(1), M365Client.RetryAfter(Status(429, TimeSpan.Zero), now));
         Assert.Equal(TimeSpan.FromMinutes(5), M365Client.RetryAfter(huge, now));
         Assert.Equal(TimeSpan.FromSeconds(7), M365Client.RetryAfter(Status(503, TimeSpan.FromSeconds(7)), now));
         Assert.Null(M365Client.RetryAfter(Status(503), now));
+    }
+
+    [Fact]
+    public async Task Retry_after_zero_waits_a_second_before_the_retry()
+    {
+        var time = new Time();
+        var server = new Server(_ => Status(429, TimeSpan.Zero), _ => Ok());
+        using var doc = await Client(server, time).GetJsonAsync(Item, default);
+
+        Assert.Equal(2, server.Requests.Count);
+        Assert.Equal(TimeSpan.FromSeconds(1), time.Waits[0]);
+    }
+
+    [Fact]
+    public async Task Throttle_notices_say_how_long_background_work_waits()
+    {
+        var notices = new List<ThrottleNotice>();
+        var client = Client(new Server(_ => Status(429, TimeSpan.FromSeconds(10)), _ => Ok()), new Time { Blocking = TimeSpan.FromHours(1) });
+        client.ThrottlePause = TimeSpan.FromMinutes(15);
+        client.Throttled = notices.Add;
+
+        (await client.GetJsonAsync(Item, default))!.Dispose();
+
+        var notice = Assert.Single(notices);
+        Assert.Equal(TimeSpan.FromSeconds(10), notice.Pause);
+        Assert.Equal(TimeSpan.FromMinutes(15), notice.BackgroundPause);
+    }
+
+    [Fact]
+    public async Task A_bad_request_is_rejected_and_not_retried()
+    {
+        var server = new Server(_ => Status(400), _ => Ok());
+        var e = await Assert.ThrowsAsync<M365RequestException>(() => Client(server, new Time()).GetJsonAsync(Item, default));
+
+        Assert.Equal(RemoteError.Rejected, e.Error);
+        Assert.Single(server.Requests);
+    }
+
+    /// <summary>Hands each request to a script that may wait, read the body or fail.</summary>
+    sealed class Scripted(params Func<HttpRequestMessage, CancellationToken, Task<HttpResponseMessage>>[] answers) : HttpMessageHandler
+    {
+        int next;
+        public int Requests => next;
+
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct) =>
+            answers[Math.Min(Interlocked.Increment(ref next) - 1, answers.Length - 1)](request, ct);
+    }
+
+    static async Task<HttpResponseMessage> Never(HttpRequestMessage request, CancellationToken ct)
+    {
+        await Task.Delay(Timeout.Infinite, ct);
+        throw new InvalidOperationException();
+    }
+
+    static readonly TimeSpan Short = TimeSpan.FromMilliseconds(300);
+
+    /// <summary>The agent's HttpClient has no timeout: the client's own deadlines apply.</summary>
+    static M365Client Timed(HttpMessageHandler server, Time? time = null)
+    {
+        var clock = time ?? new Time();
+        return new(new HttpClient(server) { Timeout = Timeout.InfiniteTimeSpan }, new Tokens())
+        {
+            HeaderTimeout = Short, StallTimeout = Short, Clock = () => clock.Now, Random = () => 0, Delay = clock.Delay,
+        };
+    }
+
+    [Fact]
+    public async Task A_request_without_an_answer_fails_as_a_timeout()
+    {
+        var client = Timed(new Scripted(Never));
+
+        var e = await Assert.ThrowsAsync<TaskCanceledException>(() => client.GetJsonAsync(Item, CancellationToken.None)).WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.IsType<TimeoutException>(e.InnerException);
+        Assert.Contains("timed out", e.Message);
+
+        // The caller's own cancellation stays a cancellation
+        using var cancel = new CancellationTokenSource(TimeSpan.FromMilliseconds(50));
+        var cancelled = await Assert.ThrowsAnyAsync<OperationCanceledException>(() => Timed(new Scripted(Never)).GetJsonAsync(Item, cancel.Token));
+        Assert.IsNotType<TimeoutException>(cancelled.InnerException);
+    }
+
+    /// <summary>A response body that gives one byte per read after <paramref name="pause"/>, and none at all from <paramref name="stallAt"/> on.</summary>
+    sealed class Dribble(byte[] data, TimeSpan pause, int stallAt = int.MaxValue) : Stream
+    {
+        int position;
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => data.Length;
+        public override long Position { get => position; set => throw new NotSupportedException(); }
+        public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+        public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken ct = default)
+        {
+            if (position >= data.Length)
+            {
+                return 0;
+            }
+            await Task.Delay(position >= stallAt ? Timeout.InfiniteTimeSpan : pause, ct);
+            buffer.Span[0] = data[position++];
+            return 1;
+        }
+
+        public override Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken ct) => ReadAsync(buffer.AsMemory(offset, count), ct).AsTask();
+        public override void Flush() { }
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+    }
+
+    static Func<HttpRequestMessage, CancellationToken, Task<HttpResponseMessage>> Body(Stream body) => (_, _) =>
+    {
+        var content = new StreamContent(body);
+        content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/json");
+        return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = content });
+    };
+
+    [Fact]
+    public async Task A_body_that_stops_arriving_times_out_and_a_slow_one_completes()
+    {
+        var json = Encoding.UTF8.GetBytes("""{"value":1}""");
+
+        // 11 reads 60 ms apart: longer than the stall timeout in all, never in one read
+        using (var doc = await Timed(new Scripted(Body(new Dribble(json, TimeSpan.FromMilliseconds(60))))).GetJsonAsync(Item, default))
+        {
+            Assert.Equal(1, doc!.RootElement.GetProperty("value").GetInt32());
+        }
+
+        var stalled = Timed(new Scripted(Body(new Dribble(json, TimeSpan.Zero, stallAt: 4))));
+        var e = await Assert.ThrowsAsync<TaskCanceledException>(() => stalled.GetJsonAsync(Item, default)).WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.IsType<TimeoutException>(e.InnerException);
+
+        // A download stream the same way
+        var (stream, _) = await Timed(new Scripted(Body(new Dribble(new byte[8], TimeSpan.Zero, stallAt: 3)))).OpenStreamAsync(new Uri("https://contoso.sharepoint.com/download?x=1"), 0, default);
+        await using (stream)
+        {
+            var buffer = new byte[8];
+            await Assert.ThrowsAsync<TaskCanceledException>(() => stream.ReadExactlyAsync(buffer).AsTask()).WaitAsync(TimeSpan.FromSeconds(10));
+        }
+    }
+
+    /// <summary>A request body sink that takes <paramref name="pause"/> per write, and never finishes one from <paramref name="stallAt"/> bytes on.</summary>
+    sealed class Sink(TimeSpan pause, long stallAt = long.MaxValue) : Stream
+    {
+        long written;
+        public long Written => written;
+        public override bool CanRead => false;
+        public override bool CanSeek => false;
+        public override bool CanWrite => true;
+        public override long Length => written;
+        public override long Position { get => written; set => throw new NotSupportedException(); }
+        public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+        public override async ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken ct = default)
+        {
+            await Task.Delay(written >= stallAt ? Timeout.InfiniteTimeSpan : pause, ct);
+            written += buffer.Length;
+        }
+
+        public override void Flush() { }
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+    }
+
+    static Func<HttpRequestMessage, CancellationToken, Task<HttpResponseMessage>> Consume(Sink sink) => async (request, ct) =>
+    {
+        await request.Content!.CopyToAsync(sink, ct);
+        return Ok();
+    };
+
+    static readonly Uri UploadUrl = new("https://contoso.sharepoint.com/_api/v2.0/drives/b!x/items/1/uploadSession?guid=abc");
+
+    [Fact]
+    public async Task An_upload_that_makes_progress_completes_and_one_that_stalls_times_out()
+    {
+        // 96 KiB in 16 KiB writes 100 ms apart: longer in all than the header timeout, never stalled
+        var slow = new Sink(TimeSpan.FromMilliseconds(100));
+        using (await Timed(new Scripted(Consume(slow))).SendJsonAsync(HttpMethod.Put, UploadUrl, () => new ByteArrayContent(new byte[96 * 1024]), default, authenticate: false))
+        {
+        }
+        Assert.Equal(96 * 1024, slow.Written);
+
+        var stuck = Timed(new Scripted(Consume(new Sink(TimeSpan.Zero, stallAt: 32 * 1024))));
+        var e = await Assert.ThrowsAsync<TaskCanceledException>(() =>
+            stuck.SendJsonAsync(HttpMethod.Put, UploadUrl, () => new ByteArrayContent(new byte[64 * 1024]), default, authenticate: false)).WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Contains("no progress", e.Message);
+    }
+
+    static Func<HttpContent> Fragment(long from, long to, long total) => () =>
+    {
+        var content = new ByteArrayContent(new byte[to - from + 1]);
+        content.Headers.ContentRange = new System.Net.Http.Headers.ContentRangeHeaderValue(from, to, total);
+        return content;
+    };
+
+    [Fact]
+    public async Task Fragments_and_other_writes_are_sent_once_and_DriveApi_resumes_them()
+    {
+        // A fragment whose answer got lost may have arrived: DriveApi asks the session what it expects next (DriveApiUploadTests)
+        var fragment = new Scripted((_, _) => throw new HttpRequestException("connection reset"), (_, _) => Task.FromResult(Ok()));
+        await Assert.ThrowsAsync<HttpRequestException>(() => Timed(fragment).SendJsonAsync(HttpMethod.Put, UploadUrl, Fragment(0, 99, 1000), default, authenticate: false));
+        Assert.Equal(1, fragment.Requests);
+        var write = new Scripted((_, _) => throw new HttpRequestException("connection reset"), (_, _) => Task.FromResult(Ok()));
+        await Assert.ThrowsAsync<HttpRequestException>(() => Timed(write).SendJsonAsync(HttpMethod.Put, Item, () => new StringContent("x"), default));
+        Assert.Equal(1, write.Requests);
     }
 
     [Fact]

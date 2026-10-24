@@ -30,6 +30,9 @@ sealed class Vfs365FileSystem(DriveEngine engine, string label, Action<string>? 
 
         /// <summary>The staging file or item version Source reads.</summary>
         public string? SourceVersion { get; set; }
+
+        /// <summary>Sources replaced by another version while a read may still use them; disposed with the handle.</summary>
+        public List<IContentSource> Retired { get; } = [];
         public bool Wrote { get; set; }
         public Lock Gate { get; } = new();
     }
@@ -198,6 +201,10 @@ sealed class Vfs365FileSystem(DriveEngine engine, string label, Action<string>? 
         var handle = (Handle)fileDesc;
         handle.Content?.Dispose();
         handle.Source?.Dispose();
+        foreach (var retired in handle.Retired)
+        {
+            retired.Dispose();
+        }
         handle.Reader?.Dispose();
     }
 
@@ -281,6 +288,20 @@ sealed class Vfs365FileSystem(DriveEngine engine, string label, Action<string>? 
         var current = handle.Content is null ? handle.Entry.Size : RandomAccess.GetLength(handle.Content);
         if (!setAllocationSize || (long)newSize < current)
         {
+            if (newSize == 0)
+            {
+                // Cut to nothing: stage empty instead of downloading what goes
+                handle.Entry = engine.Follow(handle.Entry);
+                bool staged;
+                lock (handle.Gate)
+                {
+                    staged = handle.Wrote && handle.Content is not null && handle.ContentPath == handle.Entry.StagingPath;
+                }
+                if (!staged)
+                {
+                    Stage(handle, truncate: true);
+                }
+            }
             var (content, entry, lease) = BeginWrite(handle);
             using (lease)
             {
@@ -348,6 +369,12 @@ sealed class Vfs365FileSystem(DriveEngine engine, string label, Action<string>? 
         DirectoryReader reader;
         lock (handle.Gate)
         {
+            if (marker is null && handle.Reader is { } earlier)
+            {
+                // A new scan on the same handle (RestartScan): the folder is read again, not served from the first scan
+                earlier.Dispose();
+                handle.Reader = null;
+            }
             reader = handle.Reader ??= new DirectoryReader(engine.ListStreamAsync(handle.Entry, default).GetAsyncEnumerator(), handle.Entry, handle.Entry.Path != "\\");
         }
 
@@ -507,8 +534,11 @@ sealed class Vfs365FileSystem(DriveEngine engine, string label, Action<string>? 
             FsException { Error: FsError.Invalid } => STATUS_FILE_INVALID,
             RemoteException { Error: RemoteError.NotFound } => STATUS_OBJECT_NAME_NOT_FOUND,
             RemoteException { Error: RemoteError.AccessDenied } => STATUS_ACCESS_DENIED,
+            // 409 (a folder created or moved onto a taken name) is a name collision; 412 and 423 (changed or locked) a sharing violation
+            RemoteException { Error: RemoteError.Conflict } taken when taken.Message.StartsWith("409", StringComparison.Ordinal) => STATUS_OBJECT_NAME_COLLISION,
             RemoteException { Error: RemoteError.Locked or RemoteError.Conflict } => STATUS_SHARING_VIOLATION,
             RemoteException { Error: RemoteError.ReadOnly } => STATUS_MEDIA_WRITE_PROTECTED,
+            RemoteException { Error: RemoteError.Rejected } => STATUS_OBJECT_NAME_INVALID, // a name or request SharePoint refuses
             RemoteException { Error: RemoteError.Throttled or RemoteError.Unavailable } => STATUS_UNEXPECTED_NETWORK_ERROR,
             ContentChangedException => STATUS_FILE_INVALID, // "externally altered so that the opened file is no longer valid"
             HttpRequestException => STATUS_NETWORK_UNREACHABLE,
@@ -538,7 +568,7 @@ sealed class Vfs365FileSystem(DriveEngine engine, string label, Action<string>? 
             }
             throw;
         }
-        var version = entry.StagingPath ?? $"{entry.ItemId}|{entry.ContentTag}";
+        var version = VersionOf(entry);
         lock (handle.Gate)
         {
             if (handle.Source is not null && handle.SourceVersion == version)
@@ -549,12 +579,22 @@ sealed class Vfs365FileSystem(DriveEngine engine, string label, Action<string>? 
         var source = Run(engine.OpenContentAsync(entry, default));
         lock (handle.Gate)
         {
-            handle.Source?.Dispose();
+            if (handle.Source is not null && handle.SourceVersion == version)
+            {
+                source.Dispose(); // another read on this handle opened it meanwhile
+                return handle.Source;
+            }
+            if (handle.Source is { } replaced)
+            {
+                handle.Retired.Add(replaced); // a read on another thread may still use it
+            }
             handle.Source = source;
             handle.SourceVersion = version;
             return source;
         }
     }
+
+    static string VersionOf(FsEntry entry) => entry.StagingPath ?? $"{entry.ItemId}|{entry.ContentTag}";
 
     /// <summary>
     /// The staging file a write goes to, with the engine's write lease taken: dispose it after the write and MarkDirty. A handle whose
@@ -604,12 +644,15 @@ sealed class Vfs365FileSystem(DriveEngine engine, string label, Action<string>? 
     static uint Attributes(FsEntry entry) =>
         entry.IsDirectory ? AttributeDirectory : entry.ReadOnly ? AttributeReadOnly : AttributeNormal;
 
+    /// <summary>The handle's size is what its reads serve: the staging file, else the opened content of its version, else the entry's.</summary>
     static FileInfo Info(Handle handle)
     {
         long size;
         lock (handle.Gate)
         {
-            size = handle.Content is { IsClosed: false } content ? RandomAccess.GetLength(content) : handle.Entry.Size;
+            size = handle.Content is { IsClosed: false } content ? RandomAccess.GetLength(content)
+                : handle.Source is { } source && handle.SourceVersion == VersionOf(handle.Entry) ? source.Length
+                : handle.Entry.Size;
         }
         return Info(handle.Entry, size);
     }
@@ -649,47 +692,69 @@ sealed class Vfs365FileSystem(DriveEngine engine, string label, Action<string>? 
 
     static readonly SecurityIdentifier Owner = WindowsIdentity.GetCurrent().User!;
     static readonly SecurityIdentifier LocalSystem = new(WellKnownSidType.LocalSystemSid, null);
-    int tokenUnreadable;
+    int tokenUnreadable, checkFailed;
 
     /// <summary>
     /// False when the open being served comes from someone other than the volume's user or SYSTEM (elevated processes of the user have
-    /// the same SID). Checked before the engine sees the name, so another user's open costs no lookup and can't probe names; WinFsp's
-    /// access check against the volume's descriptor follows anyway. Reads the requester's token, which WinFsp passes with each create for
-    /// that check: it covers impersonating callers and needs no rights on another user's process. Undecidable cases are allowed (logged once).
+    /// the same SID), or from a token of theirs that the volume's descriptor gives no access at all: an app container, or a restricted
+    /// token whose restricting SIDs don't include them (sandboxed browser and document renderers). Checked before the engine sees the
+    /// name, so such an open costs no lookup and can't probe names; WinFsp's access check against the volume's descriptor follows anyway.
+    /// Low integrity tokens still pass for reading, as on a local disk (Explorer's preview handlers run at low integrity); WinFsp's check
+    /// refuses their writes. Reads the requester's token, which WinFsp passes with each create for that check: it covers impersonating
+    /// callers and needs no rights on another user's process. Undecidable cases are allowed (logged once).
     /// </summary>
     bool FromOwner(string fileName)
     {
-        SecurityIdentifier? user;
+        Requester.Verdict verdict;
         string? problem = null;
         try
         {
-            user = Requester.User();
+            verdict = Requester.Check(securityDescriptor);
         }
         catch (Exception e)
         {
-            (user, problem) = (null, e.Message);
+            (verdict, problem) = (new Requester.Verdict(null, null, 0), e.Message);
         }
-        if (user is not null)
+        if (verdict.User is not { } user)
         {
-            if (user == Owner || user == LocalSystem)
+            if (Interlocked.Exchange(ref tokenUnreadable, 1) == 0)
             {
-                return true;
+                log?.Invoke($"error: the requester of an open could not be read, opens are left to WinFsp's own access check{(problem is null ? "" : $": {problem}")}");
             }
+            return true;
+        }
+        if (user != Owner && user != LocalSystem)
+        {
             trace?.Invoke($"refused {fileName}: requested by {user.Value}");
             return false;
         }
-        if (Interlocked.Exchange(ref tokenUnreadable, 1) == 0)
+        if (verdict.Granted == false)
         {
-            log?.Invoke($"error: the requester of an open could not be read, opens are left to WinFsp's own access check{(problem is null ? "" : $": {problem}")}");
+            trace?.Invoke($"refused {fileName}: a restricted or app container token of the user");
+            return false;
+        }
+        if (verdict.Granted is null && Interlocked.Exchange(ref checkFailed, 1) == 0)
+        {
+            log?.Invoke($"error: the access check on an open could not run (error {verdict.Error}), such opens are left to WinFsp's own access check");
         }
         return true;
     }
 
-    /// <summary>The user of the create request being served, from WinFsp's request (FSP_FSCTL_TRANSACT_REQ); null when unreadable.</summary>
+    /// <summary>The requester of the create request being served, from WinFsp's request (FSP_FSCTL_TRANSACT_REQ).</summary>
     static unsafe class Requester
     {
         const uint CreateKind = 1; // FspFsctlTransactCreateKind
         const int KindOffset = 4, AccessTokenOffset = 40, TokenUser = 1;
+        const uint FileReadAttributes = 0x80;
+
+        /// <summary>
+        /// The requester's user (null: unreadable) and whether its token gets any access under the volume's descriptor (null: the check
+        /// couldn't run, Error says why).
+        /// </summary>
+        public readonly record struct Verdict(SecurityIdentifier? User, bool? Granted, int Error);
+
+        /// <summary>FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_GENERIC_EXECUTE, FILE_ALL_ACCESS.</summary>
+        static GenericMapping fileMapping = new(0x120089, 0x120116, 0x1200A0, 0x1F01FF);
 
         static readonly delegate* unmanaged<IntPtr> OperationContext = (delegate* unmanaged<IntPtr>)NativeLibrary.GetExport(
             GetModuleHandle(RuntimeInformation.ProcessArchitecture switch
@@ -701,27 +766,50 @@ sealed class Vfs365FileSystem(DriveEngine engine, string label, Action<string>? 
 
         /// <summary>
         /// Only creates carry a token. Other requests act on handles that passed this check, and creates without a token come from
-        /// kernel mode; both count as the owner's.
+        /// kernel mode; both count as the owner's. The access check asks for FILE_READ_ATTRIBUTES, the least any open is given: the
+        /// descriptor grants all or nothing per SID, so a token refused that gets nothing from WinFsp's own check either.
         /// </summary>
-        public static SecurityIdentifier? User()
+        public static Verdict Check(byte[] descriptor)
         {
             var context = (byte**)OperationContext();
             if (context is null || *context is null)
             {
-                return null;
+                return new(null, null, 0);
             }
             var request = *context;
             var token = (IntPtr)(long)(*(ulong*)(request + AccessTokenOffset) & 0xffffffff); // low half: a handle in this process
             if (*(uint*)(request + KindOffset) != CreateKind || token == IntPtr.Zero)
             {
-                return Owner;
+                return new(Owner, true, 0);
             }
             var info = stackalloc byte[256];
-            return GetTokenInformation(token, TokenUser, info, 256, out _) ? new SecurityIdentifier(*(IntPtr*)info) : null;
+            if (!GetTokenInformation(token, TokenUser, info, 256, out _))
+            {
+                return new(null, null, Marshal.GetLastPInvokeError());
+            }
+            var user = new SecurityIdentifier(*(IntPtr*)info);
+            var privileges = stackalloc byte[256];
+            var privilegesLength = 256;
+            fixed (byte* sd = descriptor)
+            {
+                return AccessCheck(sd, token, FileReadAttributes, ref fileMapping, privileges, ref privilegesLength, out _, out var granted)
+                    ? new(user, granted, 0)
+                    : new(user, null, Marshal.GetLastPInvokeError());
+            }
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct GenericMapping(uint read, uint write, uint execute, uint all)
+        {
+            public uint Read = read, Write = write, Execute = execute, All = all;
         }
 
         [DllImport("advapi32.dll", SetLastError = true)]
         static extern bool GetTokenInformation(IntPtr token, int infoClass, byte* info, int length, out int returned);
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        static extern bool AccessCheck(byte* securityDescriptor, IntPtr clientToken, uint desiredAccess, ref GenericMapping genericMapping,
+            byte* privilegeSet, ref int privilegeSetLength, out uint grantedAccess, out bool accessStatus);
 
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         static extern IntPtr GetModuleHandle(string moduleName);

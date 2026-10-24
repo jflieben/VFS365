@@ -52,7 +52,7 @@ public class SearchParsingTests
         Assert.Equal("aaaaaaaa-0000-0000-0000-000000000001|bbbbbbbb-0000-0000-0000-000000000002|7a9b2c4d-1111-2222-3333-444455556666", library.Key);
     }
 
-    static string Row(string path, string? spWebUrl, long? docId = null) => $$"""
+    static string Row(string path, string? spWebUrl, long? docId = null, string? geo = null) => $$"""
         { "Cells": [
           { "Key": "Title", "Value": "Docs" },
           { "Key": "Path", "Value": "{{path}}" },
@@ -60,7 +60,8 @@ public class SearchParsingTests
           { "Key": "SiteId", "Value": "aaaaaaaa-0000-0000-0000-000000000001" },
           { "Key": "WebId", "Value": "bbbbbbbb-0000-0000-0000-000000000002" },
           { "Key": "SPWebUrl", "Value": {{(spWebUrl is null ? "null" : $"\"{spWebUrl}\"")}} },
-          { "Key": "DocId", "Value": {{(docId is null ? "null" : $"\"{docId}\"")}} }
+          { "Key": "DocId", "Value": {{(docId is null ? "null" : $"\"{docId}\"")}} },
+          { "Key": "GeoLocationSource", "Value": {{(geo is null ? "null" : $"\"{geo}\"")}} }
         ] }
         """;
 
@@ -87,6 +88,16 @@ public class SearchParsingTests
         const string path = "https://contoso.sharepoint.com/sites/A/Docs/Forms/AllItems.aspx";
         Assert.Equal(42, Page(Row(path, null, 17), Row(path, null, 42)).LastDocId);
         Assert.Null(Page(Row(path, null, 17), Row(path, null)).LastDocId);
+    }
+
+    [Fact]
+    public void Every_rows_doc_id_and_geo_are_kept_to_check_the_paging_order()
+    {
+        const string path = "https://contoso.sharepoint.com/sites/A/Docs/Forms/AllItems.aspx";
+        var page = Page(Row(path, null, 42, "EUR"), Row(path, null), Row(path, null, 17, "NAM"), Row(path, null, 18, "eur"));
+
+        Assert.Equal([42, null, 17, 18], page.DocIds!);
+        Assert.Equal(["EUR", "NAM"], page.Geos!.Order(StringComparer.OrdinalIgnoreCase));
     }
 
     [Fact]

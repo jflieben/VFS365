@@ -3,14 +3,15 @@ namespace Vfs365.Core.Drive;
 /// <summary>
 /// Large files written front to back, whose final size was set first (Windows' copy engine does both), upload while they are written:
 /// each write waits while the previous fragment is still uploading, so the writer's progress follows the network and the close
-/// only sends the last fragment. Anything else falls back to a whole-file upload on close.
+/// only sends the last fragment. Anything else, and any failure (a timeout included), falls back to a whole-file upload on close;
+/// a write never fails because of it.
 /// </summary>
 public sealed partial class DriveEngine
 {
     /// <summary>The writer set the file's size. Before any data, on a large file, this starts a progressive upload.</summary>
     public void SizeSet(FsEntry file, long size)
     {
-        if (PendingOf(file) is not { } pending || LocalOnlyNames.IsLocalOnly(pending.Name))
+        if (PendingOf(file) is not { } pending || TempLike(pending) || pending.Base is { } baseItem && StandInETag(baseItem))
         {
             return;
         }
@@ -61,6 +62,7 @@ public sealed partial class DriveEngine
                 if (progress.InFlight is { } previous)
                 {
                     await previous;
+                    progress.InFlight = null;
                 }
                 progress.Session ??= await api.CreateUploadSessionAsync(pending.DriveId, TargetOf(pending), ct);
                 var start = progress.Sent;
@@ -68,8 +70,9 @@ public sealed partial class DriveEngine
                 progress.InFlight = api.UploadFragmentAsync(progress.Session, pending.StagingPath, start, fragment, progress.Size, CancellationToken.None);
             }
         }
-        catch (Exception e) when (e is not OperationCanceledException)
+        catch (Exception e) when (!ct.IsCancellationRequested)
         {
+            // A timeout too: the write is in the staging file already, so it succeeds and the file uploads whole on close
             Log($"streaming upload of {pending.DrivePath} stopped, uploading on close instead: {e.Message}");
             await AbandonAsync(pending, progress);
         }
@@ -79,7 +82,10 @@ public sealed partial class DriveEngine
         }
     }
 
-    /// <summary>Sends the rest of a progressive upload. Null when there is none to finish (the caller uploads the whole file).</summary>
+    /// <summary>
+    /// Sends the rest of a progressive upload. Null when there is none to finish, or it failed on the way (the session is abandoned and
+    /// the caller uploads the whole file). The item deleted, changed or locked meanwhile throws, as a whole upload would.
+    /// </summary>
     async Task<DriveItemInfo?> FinishProgressiveAsync(PendingFile pending, CancellationToken ct)
     {
         if (pending.Progress is not { } progress)
@@ -100,6 +106,7 @@ public sealed partial class DriveEngine
             if (progress.InFlight is { } previous)
             {
                 await previous;
+                progress.InFlight = null;
             }
 
             DriveItemInfo? item = null;
@@ -110,7 +117,18 @@ public sealed partial class DriveEngine
             pending.Progress = null;
             return item ?? throw new IOException($"Upload session for {pending.DrivePath} ended without an item");
         }
-        catch (Exception e) when (e is not OperationCanceledException)
+        catch (RemoteException e) when (e.Error is RemoteError.NotFound or RemoteError.Gone or RemoteError.Conflict or RemoteError.Locked)
+        {
+            await AbandonAsync(pending, progress);
+            throw;
+        }
+        catch (Exception e) when (!ct.IsCancellationRequested)
+        {
+            Log($"streaming upload of {pending.DrivePath} failed, uploading it whole: {e.Message}");
+            await AbandonAsync(pending, progress);
+            return null;
+        }
+        catch
         {
             await AbandonAsync(pending, progress);
             throw;

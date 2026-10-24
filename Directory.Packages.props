@@ -1,7 +1,5 @@
 <Project>
   <ItemGroup>
-    <PackageVersion Include="Microsoft.Identity.Client" Version="4.90.1" />
-    <PackageVersion Include="Microsoft.Identity.Client.Broker" Version="4.90.1" />
     <PackageVersion Include="Microsoft.Win32.SystemEvents" Version="10.0.12" />
     <PackageVersion Include="System.Security.Cryptography.ProtectedData" Version="10.0.12" />
     <!-- Matches the installed WinFsp build (2025, 2.1.25156); move to 2.2 with the patched 2026 driver -->

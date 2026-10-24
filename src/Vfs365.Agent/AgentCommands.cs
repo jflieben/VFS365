@@ -2,7 +2,6 @@ using System.Diagnostics;
 using System.Globalization;
 using System.Net.NetworkInformation;
 using System.Text.Json;
-using Microsoft.Identity.Client;
 using Vfs365.Core;
 using Vfs365.Core.Discovery;
 using Vfs365.Core.Drive;
@@ -20,7 +19,7 @@ public static class AgentCommands
 
         Usage:
           vfs365 settings [--config <file>]               effective settings and where each comes from
-          vfs365 whoami   [--config <file>]               sign in, show tenant and OneDrive
+          vfs365 whoami   [--sign-in] [--config <file>]   sign in, show tenant and OneDrive; --sign-in shows Windows' sign-in window
           vfs365 discover [--config <file>] [--drives] [--json] [--full] [--audit]
                                                           find the user's libraries (--drives resolves Graph drive IDs, --full reads all metadata again,
                                                           --audit checks recall against site search, followed sites and hubs)
@@ -59,7 +58,13 @@ public static class AgentCommands
     /// </summary>
     public static void StopForSessionEnd()
     {
-        ExplorerLocation.Unregister();
+        try
+        {
+            ExplorerLocation.Unregister();
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException or System.Security.SecurityException)
+        {
+        }
         AgentControl.RequestStop();
         finished?.Wait(SessionEndWait);
     }
@@ -137,9 +142,10 @@ public static class AgentCommands
             MachineCleanup.StopAgents(TimeSpan.FromSeconds(60), dryRun, Say);
             if (Flag("--cleanup"))
             {
-                MachineCleanup.RemoveUserData(MachineCleanup.ProfileDataFolders(), dryRun, Say);
+                // Machine-wide steps first: a profile that can't be cleaned must not leave them behind
                 MachineCleanup.RemoveExplorerEntries(dryRun, Say);
                 NetworkProviderOrder.Remove(dryRun, Say);
+                MachineCleanup.RemoveUserData(MachineCleanup.ProfileDataFolders(), dryRun, Say);
             }
             return 0;
         }
@@ -159,7 +165,8 @@ public static class AgentCommands
                 error.WriteLine("Usage: vfs365 machine-report install|update|uninstall");
                 return 2;
             }
-            if (MonitoringTarget.Parse(AgentSettings.Load(Option("--config")).MonitoringUrl, out var problem) is not { } target)
+            // Runs as SYSTEM: settings from policy and --config only, never a vfs365.local.json in the working directory
+            if (MonitoringTarget.Parse(AgentSettings.Load(Option("--config"), workingDirectory: false).MonitoringUrl, out var problem) is not { } target)
             {
                 Say(problem ?? "Monitoring: off (no MonitoringUrl policy for the device)");
                 return 0;
@@ -213,10 +220,12 @@ public static class AgentCommands
             }
             clientId = settings.ClientId.Value!;
             // The console tool runs in the foreground and may show a sign-in window; the background agent only at its start or on Sign in
-            var tokens = new MsalTokenSource(clientId, tenant.Tenant) { PromptWhenNeeded = !tray };
+            var tokens = new WamTokenSource(clientId, tenant.Tenant) { PromptWhenNeeded = !tray };
             if (monitoring is not null)
             {
-                monitoring.User = () => tokens.LastResult?.Account.Username;
+                // Before this start's first token (a crash row, start problems) the account of the last day with statistics
+                var lastUser = UsageStatistics.Load().LastUser();
+                monitoring.User = () => tokens.LastResult?.Username ?? lastUser;
                 monitoring.TenantId = () => tokens.LastResult?.TenantId ?? tenant.Tenant;
             }
 
@@ -244,7 +253,7 @@ public static class AgentCommands
                     "The next start signs in again with the Windows account.");
                 return 0;
             }
-            using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(100) };
+            using var http = new HttpClient { Timeout = Timeout.InfiniteTimeSpan }; // M365Client sets the deadlines
             var client = new M365Client(http, tokens, settings.ApiBudgetPerMinute > 0 ? new RequestBudget(settings.ApiBudgetPerMinute) : null)
             {
                 ThrottlePause = TimeSpan.FromMinutes(settings.ThrottlePauseMinutes),
@@ -258,8 +267,14 @@ public static class AgentCommands
 
             if (command == "whoami")
             {
+                // --sign-in: through Windows' sign-in window, shown even when the Windows account would do (to test the prompt)
+                if (Flag("--sign-in") && !await tokens.SignInAsync(userAsked: true, default, force: true))
+                {
+                    error.WriteLine($"Sign-in: {tokens.SignInProblemText}");
+                    return 1;
+                }
                 var me = await api.GetMyDriveAsync(default);
-                Say($"User:       {tokens.LastResult?.Account.Username}");
+                Say($"User:       {tokens.LastResult?.Username}");
                 Say($"Signed in:  tenant {tokens.LastResult?.TenantId}");
                 Say($"OneDrive:   {me.WebUrl}");
                 Say($"SharePoint: {SharePointUrls.TenantRootFromOneDriveUrl(me.WebUrl)}");
@@ -343,7 +358,7 @@ public static class AgentCommands
                     }
                 }
             }
-            DiscoveryStore.Save(result.State with { Libraries = libraries, TenantHint = tenant.Tenant });
+            DiscoveryStore.Save(DiscoverySchedule.Keep(result, previous) with { Libraries = libraries, TenantHint = tenant.Tenant });
 
             if (Flag("--json"))
             {
@@ -392,7 +407,8 @@ public static class AgentCommands
             }
             return 0;
         }
-        catch (Exception e) when (e is MsalException or M365RequestException or HttpRequestException or FileNotFoundException or JsonException or IOException or ArgumentException)
+        catch (Exception e) when (e is SignInException or M365RequestException or HttpRequestException or FileNotFoundException or JsonException or IOException
+            or UnauthorizedAccessException or ArgumentException)
         {
             error.WriteLine(e.Message);
             if (monitoring is not null)
@@ -418,6 +434,34 @@ public static class AgentCommands
     /// </summary>
     public static string UncPrefix(string userName) =>
         $@"\VFS365\{string.Concat(userName.Select(c => char.IsControl(c) || "\"/\\[]:|<>+=;,?*".Contains(c) ? '_' : c))}";
+
+    /// <summary>
+    /// The holder of this user's UNC path (DOMAIN\name) when it is another account with the same user name, in another domain or on
+    /// another machine (CONTOSO\ann and FABRIKAM\ann, or a local ann and AzureAD\ann); null otherwise.
+    /// </summary>
+    public static string? SameNameHolder(string? holder, string domain, string user)
+    {
+        if (holder?.Split('\\') is not [var holderDomain, var holderName])
+        {
+            return null;
+        }
+        return UncPrefix(holderName).Equals(UncPrefix(user), StringComparison.OrdinalIgnoreCase) && !holderDomain.Equals(domain, StringComparison.OrdinalIgnoreCase)
+            ? holder
+            : null;
+    }
+
+    /// <summary>DOMAIN\name of a SID, or null when Windows can't say.</summary>
+    static string? AccountOf(string? sid)
+    {
+        try
+        {
+            return sid is null ? null : new System.Security.Principal.SecurityIdentifier(sid).Translate(typeof(System.Security.Principal.NTAccount)).Value;
+        }
+        catch (Exception e) when (e is SystemException)
+        {
+            return null;
+        }
+    }
 
     /// <summary>Cached content, folder listings, discovery state and the cache key; never staging (unsaved changes).</summary>
     static void WipeUserData()
@@ -522,7 +566,7 @@ public static class AgentCommands
     /// sign-in it waits and tries again (tray: "waiting for the network", "waiting for sign-in"); other problems keep the tray icon in
     /// an error state with the cause, Retry and Show log. A drive letter that is in use or not valid gives a drive without a letter.
     /// </summary>
-    static async Task<int> MountAsync(AgentSettings settings, string? configPath, SharePointDiscoveryApi api, M365Client client, MsalTokenSource tokens,
+    static async Task<int> MountAsync(AgentSettings settings, string? configPath, SharePointDiscoveryApi api, M365Client client, WamTokenSource tokens,
         DiscoveryOptions discoveryOptions, string tenantHint, bool background, bool showTray, string? restartAfter, string? driveOption, bool trace,
         bool navigationPane, bool discoverNow, Monitoring? monitoring, Stopwatch stopwatch, Action<string> say, Action<string> log, TextWriter error)
     {
@@ -546,12 +590,13 @@ public static class AgentCommands
         client.Throttled = throttling.Add;
         void ReportThrottling(DateTimeOffset now)
         {
-            if (throttling.Ended(now) is { } episode)
+            foreach (var episode in throttling.Ended(now))
             {
                 say($"Throttled:  {episode.Describe()}");
                 monitoring?.Throttling(episode);
             }
         }
+        DriveEngine? restoredEngine = null; // set once mounted: change feeds that failed meanwhile are read again soon
         void NetworkChanged(object? sender, NetworkAvailabilityEventArgs e)
         {
             networkUp = e.IsAvailable;
@@ -559,6 +604,7 @@ public static class AgentCommands
             if (e.IsAvailable)
             {
                 networkFailedAt = DateTimeOffset.MinValue;
+                restoredEngine?.NetworkRestored();
                 WakeUp();
             }
         }
@@ -578,10 +624,10 @@ public static class AgentCommands
                     WakeUp();
                 }
             });
-            tokens.SignedIn = result => say($"Signed in:  {result.Account?.Username} (tenant {result.TenantId})");
+            tokens.SignedIn = result => say($"Signed in:  {result.Username} (tenant {result.TenantId})");
             tokens.SignInFailed = e =>
             {
-                say($"Sign-in:    needed, {SignInText.Of(e, CultureInfo.InvariantCulture)} ({e.ErrorCode}: {e.Message.Split('\n')[0].Trim()})");
+                say($"Sign-in:    needed, {SignInText.Of(e, CultureInfo.InvariantCulture)} ({e.Code}: {e.Message.Split('\n')[0].Trim()})");
                 monitoring?.Error("sign-in", e.Message);
                 if (tray is { } shown && DateTimeOffset.UtcNow - signInNotice > TimeSpan.FromMinutes(10))
                 {
@@ -648,15 +694,18 @@ public static class AgentCommands
             {
                 var problem = StartProblem.Of(e, !networkUp);
                 var english = StartProblem.Of(e, !networkUp, CultureInfo.InvariantCulture);
+                // A problem StartProblem knows only by its exception text gets plain words, in the display language too
+                var reason = problem.Wait == StartWait.Retry && problem.Reason == e.Message ? StartText.Plain(e) : problem.Reason;
+                var englishReason = english.Wait == StartWait.Retry && english.Reason == e.Message ? StartText.Plain(e, CultureInfo.InvariantCulture) : english.Reason;
                 var delay = problem.Wait == StartWait.Retry ? TimeSpan.FromHours(1) : TimeSpan.FromSeconds(Math.Min(300, 15 << Math.Min(attempt, 5)));
                 if (english.Reason != lastProblem)
                 {
                     lastProblem = english.Reason;
-                    say($"Waiting:    {what}: {english.Reason} ({e.Message.Split('\n')[0].Trim()}); trying again in {delay.TotalMinutes:0.#} min, or at Retry in the tray");
+                    say($"Waiting:    {what}: {englishReason} ({e.Message.Split('\n')[0].Trim()}); trying again in {delay.TotalMinutes:0.#} min, or at Retry in the tray");
                     if (problem.Wait == StartWait.Retry)
                     {
                         monitoring?.Error("start", e.Message);
-                        tray?.Notify(UiText.Get("Failed.Title"), UiText.Get("Failed.Text", Sentence(problem.Reason)));
+                        tray?.Notify(UiText.Get("Failed.Title"), UiText.Get("Failed.Text", Sentence(reason)));
                     }
                 }
                 else
@@ -667,31 +716,54 @@ public static class AgentCommands
                 {
                     StartWait.Network => UiText.Get("Status.WaitingNetwork"),
                     StartWait.SignIn => UiText.Get("Status.WaitingSignIn"),
-                    _ => UiText.Get("Status.NotStarted", problem.Reason.TrimEnd('.')),
+                    _ => UiText.Get("Status.NotStarted", reason.TrimEnd('.')),
                 }, problem.Wait == StartWait.Retry ? TrayState.Error : TrayState.Waiting);
                 return await PauseAsync(delay);
             }
 
             // Mount with what the last run knew (libraries, drive IDs, folder listings), so Explorer shows the drive at once and without
             // network calls; discovery and the change feeds bring it up to date in the background. The first run only needs the OneDrive.
-            var key = CacheKey.LoadOrCreate();
-            var cache = new ContentCache(Path.Combine(DiscoveryStore.DataDirectory, "cache"), new DriveApi(client),
-                new ContentCacheOptions { MaxBytes = settings.CacheSizeMB * (1L << 20), Cipher = new CacheCipher(key) });
-            var saved = DiscoveryStore.Load();
-            if (DeviceManagement.LeftManagement())
+            // The profile's files can be locked or unreadable for a while (antivirus, a profile disk): retried like any start problem
+            byte[] key;
+            ContentCache cache;
+            DiscoveryState? saved;
+            bool usable;
+            var wipe = false;
+            for (var attempt = 0; ; attempt++)
             {
-                // The device left Intune: company content cached here goes, and nothing from before is shown
-                say("Wiped:      cached content and folder listings (the device is no longer managed)");
-                cache.Clear();
-                MetadataStore.Delete();
-                saved = null;
-            }
-            var usable = saved is { OneDrive: not null } && saved.TenantHint == tenantHint;
-            if (saved is not null && !usable)
-            {
-                // Another tenant than last time: what was cached belongs to the other account
-                cache.Clear();
-                MetadataStore.Delete();
+                try
+                {
+                    key = CacheKey.LoadOrCreate();
+                    cache = new ContentCache(Path.Combine(DiscoveryStore.DataDirectory, "cache"), new DriveApi(client),
+                        new ContentCacheOptions { MaxBytes = settings.CacheSizeMB * (1L << 20), Cipher = new CacheCipher(key) });
+                    saved = DiscoveryStore.Load();
+                    wipe |= DeviceManagement.LeftManagement(); // true once: kept until the wipe below is done
+                    if (wipe)
+                    {
+                        // The device left Intune: company content cached here goes, and nothing from before is shown
+                        cache.Clear();
+                        MetadataStore.Delete();
+                        File.Delete(DiscoveryStore.FilePath);
+                        say("Wiped:      cached content and folder listings (the device is no longer managed)");
+                        wipe = false;
+                        saved = null;
+                    }
+                    usable = saved is { OneDrive: not null } && saved.TenantHint == tenantHint;
+                    if (saved is not null && !usable)
+                    {
+                        // Another tenant than last time: what was cached belongs to the other account
+                        cache.Clear();
+                        MetadataStore.Delete();
+                    }
+                    break;
+                }
+                catch (Exception e) when (background && e is IOException or UnauthorizedAccessException)
+                {
+                    if (!await WaitAfterAsync(e, attempt, "reading VFS365's files in the profile"))
+                    {
+                        return 0;
+                    }
+                }
             }
             MyDrive oneDrive;
             MyDrive? justRead = null; // this start's /me/drive answer, which the first discovery then needn't ask for again
@@ -722,10 +794,7 @@ public static class AgentCommands
                 }
                 tokens.PromptWhenNeeded = !background;
             }
-            var keeper = new DiscoveryStateKeeper(usable
-                ? saved!
-                : new DiscoveryState(DateTimeOffset.UtcNow, SharePointUrls.TenantRootFromOneDriveUrl(oneDrive.WebUrl), [], new Dictionary<string, string>(),
-                    LibraryRules.Version, oneDrive, default, tenantHint));
+            var keeper = new DiscoveryStateKeeper(usable ? saved! : DiscoverySchedule.Placeholder(oneDrive, tenantHint, settings.Scope, DateTimeOffset.UtcNow));
             if (!usable)
             {
                 keeper.Touch(); // the next start mounts at once, also in OneDrive scope (which has no discovery to save it)
@@ -775,6 +844,7 @@ public static class AgentCommands
                         }
                     },
                 });
+            restoredEngine = engine;
             if (usable)
             {
                 engine.ImportSnapshots(MetadataStore.Load(key));
@@ -815,9 +885,10 @@ public static class AgentCommands
             {
                 say($"Warning:    {problem}; the drive is mounted without a letter, at {unc}{(navigationPane ? " and in the navigation pane" : "")}");
                 monitoring?.Error("drive letter", problem);
-                tray?.Notify(UiText.Get("Letter.Title"), UiText.Get("Letter.Text", shown, unc));
+                tray?.Notify(UiText.Get("Letter.Title"), UiText.Get(navigationPane ? "Letter.Text" : "Letter.TextNoPane", shown, unc));
             }
-            // The letter from policy; when it is taken (or not valid) the drive still mounts, by UNC path and in the navigation pane
+            // The letter from policy; when it is taken (or not valid) the drive still mounts, by UNC path and in the navigation pane. A held
+            // UNC path is no letter problem (the user's own drive in another session, or another user's): it goes to the loop below.
             DriveHost MountDrive()
             {
                 if (letter.KeepLetter)
@@ -826,7 +897,7 @@ public static class AgentCommands
                     {
                         return DriveHost.Mount(engine, letter.MountPoint, true, prefix, settings.Label, fsLog, fsTrace);
                     }
-                    catch (IOException e) when (!IsMountConflict(e))
+                    catch (IOException e) when (e is not MountConflictException)
                     {
                         var holder = letter.MountPoint is { } wanted ? DriveLetterReport.Read(wanted).Target : null;
                         LetterProblem($"{letter.MountPoint ?? "No free drive letter"}: {(holder is null ? e.Message : $"in use ({holder})")}", letter.MountPoint ?? "*");
@@ -847,13 +918,18 @@ public static class AgentCommands
                 }
                 catch (Exception e) when (background && IsMountConflict(e))
                 {
-                    // Another user's volume holds this user's UNC path: apps with stored paths would save there. Not retried by itself.
-                    if (lastProblem != e.Message)
+                    // Another user's volume holds this user's UNC path: apps with stored paths would save there. Tried again hourly and on Retry.
+                    var sameName = SameNameHolder(AccountOf((e as MountConflictException)?.Owner), Environment.UserDomainName, Environment.UserName);
+                    var message = sameName is null ? e.Message
+                        : $@"{unc} is held by {sameName}, another account with the same user name as this one ({Environment.UserDomainName}\{Environment.UserName}). " +
+                          "UNC paths go by user name, so only one of them can have VFS365's drive on this PC at a time; files saved to that path would go to " +
+                          $"the other account's drive, so VFS365 doesn't mount. Sign {sameName} out of this PC. ({e.Message})";
+                    if (lastProblem != message)
                     {
-                        lastProblem = e.Message;
-                        say($"Security:   {e.Message} The drive is not started; Retry in the tray tries again.");
-                        monitoring?.Error("security", e.Message);
-                        tray?.Notify(UiText.Get("Security.Title"), UiText.Get("Security.Text", unc));
+                        lastProblem = message;
+                        say($"Security:   {message} The drive is not started; Retry in the tray tries again.");
+                        monitoring?.Error("security", message);
+                        tray?.Notify(UiText.Get("Security.Title"), sameName is null ? UiText.Get("Security.Text", unc) : UiText.Get("Security.SameName", unc, sameName));
                     }
                     tray?.SetStatus(UiText.Get("Status.Taken", unc), TrayState.Error);
                     if (!await PauseAsync(TimeSpan.FromHours(1)))
@@ -876,7 +952,43 @@ public static class AgentCommands
             var refreshing = false;
             var accountChanged = false;
             var nextDiscovery = DateTimeOffset.MaxValue;
-            DateTimeOffset NextDay() => DateTimeOffset.UtcNow + DailyDiscovery + TimeSpan.FromMinutes(Random.Shared.Next(0, 121));
+            var discoveryFailures = 0;
+            DateTimeOffset NextDay() => DiscoverySchedule.NextDay(DateTimeOffset.UtcNow, Random.Shared);
+
+            // The agent's own state files (discovery state, folder listings, Refresh time): a failed write is logged once per cause and
+            // tried again later; it never ends the agent or skips the saves after it
+            var saveProblems = new Dictionary<string, string>(StringComparer.Ordinal);
+            bool SaveQuietly(string what, Action save)
+            {
+                try
+                {
+                    save();
+                    bool recovered;
+                    lock (saveProblems)
+                    {
+                        recovered = saveProblems.Remove(what);
+                    }
+                    if (recovered)
+                    {
+                        say($"Saved:      {what} again");
+                    }
+                    return true;
+                }
+                catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+                {
+                    lock (saveProblems)
+                    {
+                        if (saveProblems.GetValueOrDefault(what) == e.Message)
+                        {
+                            return false;
+                        }
+                        saveProblems[what] = e.Message;
+                    }
+                    say($"Warning:    could not save {what}, trying again later: {e.Message}");
+                    monitoring?.Error("agent", $"could not save {what}: {e.Message}");
+                    return false;
+                }
+            }
 
             // A new agent with the same arguments waits for this one to upload what is pending and unmount, then mounts
             void RestartAgent(string why)
@@ -913,6 +1025,23 @@ public static class AgentCommands
                 RestartAgent("for the new account");
             }
 
+            // A failed run (an error, or a search that failed even partly): logged and reported, tried again in 15 to 60 minutes, sooner
+            // without libraries. Returns why, in the display language (for Refresh).
+            string DiscoveryFailed(string message, string cause, bool network, bool searchFailed = false)
+            {
+                var delay = DiscoverySchedule.AfterFailure(++discoveryFailures, settings.Scope == DriveScope.OneDrive || keeper.Current.Libraries.Count > 0, Random.Shared);
+                say($"Discovery:  failed, showing {(settings.Scope == DriveScope.OneDrive ? "the OneDrive" : $"{keeper.Current.Libraries.Count} libraries")} " +
+                    $"from the last run{(searchFailed ? " and what this one found" : "")}; trying again in {delay.TotalMinutes:0} min: {message}");
+                monitoring?.Error("discovery", message);
+                var plain = PlainCause.Of(cause, !networkUp || network, tokens.SignInProblem);
+                if (plain == Cause.Offline)
+                {
+                    networkFailedAt = DateTimeOffset.UtcNow;
+                }
+                nextDiscovery = DateTimeOffset.UtcNow + delay;
+                return PlainCause.Text(plain);
+            }
+
             // Null when it worked, else why not in the display language (for Refresh)
             async Task<string?> DiscoverAsync(bool everything)
             {
@@ -933,11 +1062,12 @@ public static class AgentCommands
                     }
                     else
                     {
-                        var before = keeper.Current.Libraries;
+                        var before = keeper.Current;
                         var result = await new DiscoveryService(api, everything ? discoveryOptions with { MetadataMaxAge = TimeSpan.Zero } : discoveryOptions)
-                            .RunAsync(keeper.Current, default, justRead, tokens.LastResult?.TenantId);
+                            .RunAsync(before, default, justRead, tokens.LastResult?.TenantId);
                         justRead = null;
-                        keeper.Replace(result.State with { TenantHint = tenantHint });
+                        // A failed search keeps the libraries (nothing is hidden) but not the time: the next start and Refresh don't take it as recent
+                        keeper.Replace(DiscoverySchedule.Keep(result, before) with { TenantHint = tenantHint });
                         if (result.OneDrive.DriveId != oneDrive.DriveId)
                         {
                             AccountChanged();
@@ -945,26 +1075,25 @@ public static class AgentCommands
                         }
                         engine.SetLibraries(keeper.Current.Libraries);
                         var shown = keeper.Current.Libraries.Select(l => l.Key).ToHashSet(StringComparer.OrdinalIgnoreCase);
-                        foreach (var gone in before.Where(l => l.DriveId is not null && !shown.Contains(l.Key)))
+                        foreach (var gone in before.Libraries.Where(l => l.DriveId is not null && !shown.Contains(l.Key)))
                         {
                             cache.ForgetDrive(gone.DriveId!); // no longer reachable or shown: its cached content goes
                         }
-                        say($"Libraries:  {result.Libraries.Count} from discovery in {watch.Elapsed.TotalSeconds:N1} s{(result.SearchError is { } problem ? $" ({problem})" : "")}");
+                        if (result.SearchError is { } searchError)
+                        {
+                            // "Search failed after N rows: <the request's error>": the cause is in the request's error
+                            return DiscoveryFailed(searchError, searchError.IndexOf(": ", StringComparison.Ordinal) is var at and >= 0 ? searchError[(at + 2)..] : searchError,
+                                network: false, searchFailed: true);
+                        }
+                        say($"Libraries:  {result.Libraries.Count} from discovery in {watch.Elapsed.TotalSeconds:N1} s");
                     }
+                    discoveryFailures = 0;
                     nextDiscovery = NextDay();
                     return null;
                 }
-                catch (Exception e) when (e is TaskCanceledException || e is not OperationCanceledException) // a timeout is a failure too
+                catch (Exception e) when (e is not OutOfMemoryException) // nothing cancels discovery: a timeout or a cancellation is a failure too
                 {
-                    say($"Discovery:  failed, showing the libraries from the last run: {e.Message}");
-                    monitoring?.Error("discovery", e.Message);
-                    var cause = PlainCause.Of(e.Message, !networkUp || e is HttpRequestException or TaskCanceledException, tokens.SignInProblem);
-                    if (cause == Cause.Offline)
-                    {
-                        networkFailedAt = DateTimeOffset.UtcNow;
-                    }
-                    nextDiscovery = DateTimeOffset.UtcNow + TimeSpan.FromHours(1);
-                    return PlainCause.Text(cause);
+                    return DiscoveryFailed(e.Message, e.Message, e is HttpRequestException or TaskCanceledException or TimeoutException);
                 }
                 finally
                 {
@@ -972,8 +1101,7 @@ public static class AgentCommands
                 }
             }
 
-            // In OneDrive scope only the once-a-day rule applies: there are no libraries whose age matters
-            DateTimeOffset LibrariesReadAt() => settings.Scope == DriveScope.OneDrive ? DateTimeOffset.MinValue : keeper.Current.RunAt;
+            DateTimeOffset LibrariesReadAt() => DiscoverySchedule.LibrariesReadAt(keeper.Current, settings.Scope);
             string? RefreshBlocked() => RefreshRule.Blocked(DateTimeOffset.UtcNow, LibrariesReadAt(), DiscoveryStore.LastRefresh, refreshing);
             string RefreshLabel() => RefreshRule.Label(DateTimeOffset.UtcNow, LibrariesReadAt(), DiscoveryStore.LastRefresh, refreshing);
 
@@ -999,7 +1127,7 @@ public static class AgentCommands
                             tray?.Notify(UiText.Get("RefreshFailed.Title"), UiText.Get("RefreshFailed.Text", failure));
                             return;
                         }
-                        DiscoveryStore.LastRefresh = DateTimeOffset.UtcNow;
+                        SaveQuietly("the Refresh time", () => DiscoveryStore.LastRefresh = DateTimeOffset.UtcNow);
                         tray?.Notify(UiText.Get("Refreshed.Title"), settings.Scope == DriveScope.OneDrive
                             ? UiText.Get("Refreshed.Folders")
                             : UiText.Get("Refreshed.Libraries", keeper.Current.Libraries.Count));
@@ -1035,19 +1163,36 @@ public static class AgentCommands
             using var push = new PushChannels(engine, new DriveNotifications(client) { Problem = log }, log);
             using var due = new CancellationTokenSource();
             Task scheduler;
+            // Explorer's entries are a convenience: a registry that refuses them never ends the mounted drive
+            bool Explorer(string what, Action change)
+            {
+                try
+                {
+                    change();
+                    return true;
+                }
+                catch (Exception e) when (e is IOException or UnauthorizedAccessException or System.Security.SecurityException)
+                {
+                    say($"Warning:    could not {what}: {e.Message}");
+                    return false;
+                }
+            }
             try
             {
-                ExplorerLocation.SetDriveLabel(prefix, settings.Label);
+                Explorer("name the drive in Explorer", () => ExplorerLocation.SetDriveLabel(prefix, settings.Label));
                 say($"Mounted:    {(drive.DriveLetter is { } assigned ? $"{assigned} and " : "")}{unc} ({settings.Scope}) after {stopwatch.Elapsed.TotalSeconds:N1} s, " +
                     $"{(usable ? $"{keeper.Current.Libraries.Count} libraries from the last run" : "first run")}. Ctrl+C or 'vfs365 unmount' to stop.");
                 if (navigationPane)
                 {
-                    ExplorerLocation.Register(settings.Label, drive.DriveLetter is { } letterRoot ? letterRoot + "\\" : unc, $"{Environment.ProcessPath},0");
-                    say($"Explorer:   \"{settings.Label}\" in the navigation pane");
+                    if (Explorer("add the navigation pane entry", () =>
+                        ExplorerLocation.Register(settings.Label, drive.DriveLetter is { } letterRoot ? letterRoot + "\\" : unc, $"{Environment.ProcessPath},0")))
+                    {
+                        say($"Explorer:   \"{settings.Label}\" in the navigation pane");
+                    }
                 }
                 else
                 {
-                    ExplorerLocation.Unregister(); // an entry left by a run with the navigation pane on, or one that was ended
+                    Explorer("remove the navigation pane entry", ExplorerLocation.Unregister); // an entry left by a run with the navigation pane on, or one that was ended
                 }
 
                 // What Windows tells Explorer about the drive: checked now and every 5 minutes, logged when it changes
@@ -1089,19 +1234,49 @@ public static class AgentCommands
                 }
                 _ = Task.Run(CheckDriveLetter);
 
-                // Settings are read once at the start; a policy changed since shows in the log and the tray
+                // \\VFS365 must not resolve on the network: whoever answers gets the paths apps kept, while the drive isn't mounted
+                _ = Task.Run(async () =>
+                {
+                    if (ServerNameCheck.Warning(await ServerNameCheck.ResolveAsync()) is { } resolves)
+                    {
+                        say($"Warning:    {resolves}");
+                        monitoring?.Error("security", resolves);
+                    }
+                });
+
+                // Settings are read once at the start; a policy changed since shows in the log and the tray. Monitoring follows its policy
+                // at once (a renewed SAS, another level of detail), which users needn't hear about.
                 string? policyChanges = null;
+                (string? Url, MonitoringDetail Detail) monitoringPolicy = (settings.MonitoringUrl, settings.MonitoringDetail);
                 void CheckSettings()
                 {
+                    AgentSettings current;
                     IReadOnlyList<string> differences;
                     try
                     {
-                        differences = AgentSettings.Load(configPath).ChangedFrom(settings);
+                        current = AgentSettings.Load(configPath);
+                        differences = current.ChangedFrom(settings);
                     }
                     catch (Exception e) when (e is IOException or JsonException or UnauthorizedAccessException or System.Security.SecurityException)
                     {
                         return;
                     }
+                    if ((current.MonitoringUrl, current.MonitoringDetail) != monitoringPolicy)
+                    {
+                        monitoringPolicy = (current.MonitoringUrl, current.MonitoringDetail);
+                        var target = MonitoringTarget.Parse(current.MonitoringUrl, out var problem);
+                        if (monitoring is null)
+                        {
+                            say("Settings:   MonitoringUrl changed; monitoring starts after Restart in the tray or at the next sign-in");
+                        }
+                        else
+                        {
+                            monitoring.Retarget(target, current.MonitoringDetail);
+                            say($"Settings:   monitoring policy changed, in effect now. {(target is null ? $"Monitoring: off, {problem ?? "no MonitoringUrl"}" : monitoring.Started)}" +
+                                $", detail {current.MonitoringDetail}");
+                        }
+                    }
+                    differences = differences.Where(name => name is not ("MonitoringUrl" or "MonitoringDetail")).ToList();
                     var names = string.Join(", ", differences);
                     if (names == (policyChanges ?? ""))
                     {
@@ -1131,6 +1306,7 @@ public static class AgentCommands
                             {
                                 await Task.Delay(1000);
                             }
+                            engine.NetworkRestored();
                             push.Sync();
                             await engine.PollActiveAsync();
                         }
@@ -1147,10 +1323,11 @@ public static class AgentCommands
                 }
                 else
                 {
-                    // With a state under a week old the drive shows it at once; discovery waits 5 to 90 minutes, so a tenant's sign-ins don't
-                    // all discover at the same moment. A first start, or an older state, discovers right away.
-                    var recent = usable && !discoverNow && DateTimeOffset.UtcNow - keeper.Current.RunAt < TimeSpan.FromDays(7);
-                    var wait = recent ? TimeSpan.FromSeconds(Random.Shared.Next(5 * 60, 90 * 60 + 1)) : TimeSpan.Zero;
+                    // With a recent state (under a week old, with libraries) the drive shows it at once; discovery waits 5 to 90 minutes, so a
+                    // tenant's sign-ins don't all discover at the same moment. A first start, an older state, or one that never found
+                    // libraries (a first run that didn't finish, a failed search) discovers right away.
+                    var recent = usable && !discoverNow && DiscoverySchedule.Recent(keeper.Current, settings.Scope, DateTimeOffset.UtcNow);
+                    var wait = DiscoverySchedule.StartWait(recent, Random.Shared);
                     if (recent && settings.Scope != DriveScope.OneDrive)
                     {
                         say($"Discovery:  in {wait.TotalMinutes:0} min; the libraries of the last run show until then (Refresh in the tray reads them now)");
@@ -1170,6 +1347,7 @@ public static class AgentCommands
                 }
 
                 var throttleShown = TimeSpan.FromMinutes(Math.Max(2, settings.ThrottlePauseMinutes));
+                var promptedWithoutTray = false;
                 scheduler = Task.Run(async () =>
                 {
                     using var timer = new PeriodicTimer(TimeSpan.FromSeconds(1));
@@ -1187,18 +1365,47 @@ public static class AgentCommands
                             _ = engine.PollActiveAsync();
                             if (statistics is not null && tick % 60 == 0)
                             {
-                                ReportStatistics(statistics, monitoring!, client, tokens.LastResult?.Account.Username, ref statisticsDue, ref statisticsSending);
+                                ReportStatistics(statistics, monitoring!, client, tokens.LastResult?.Username, ref statisticsDue, ref statisticsSending);
                             }
                             if (tick++ % 5 == 0)
                             {
                                 push.Sync();
                             }
-                            keeper.SaveIfChanged();
+                            SaveQuietly("the discovery state", keeper.SaveIfChanged);
                             if (tray is not null)
                             {
                                 foreach (var (title, text) in notices.Due(DateTimeOffset.UtcNow))
                                 {
                                     tray.Notify(title, text);
+                                }
+                            }
+                            // Without a tray icon nothing offers Sign in: a sign-in that is needed opens the window by itself, once per problem
+                            // (not within 15 minutes of a cancel)
+                            if (background && !showTray && tick % 5 == 1)
+                            {
+                                if (!tokens.SignInProblem)
+                                {
+                                    promptedWithoutTray = false;
+                                }
+                                else if (!promptedWithoutTray)
+                                {
+                                    promptedWithoutTray = true;
+                                    say("Sign-in:    needed, and there is no tray icon (policy TrayIcon) to offer Sign in: the sign-in window opens");
+                                    _ = Task.Run(async () =>
+                                    {
+                                        try
+                                        {
+                                            if (await tokens.SignInAsync(userAsked: false, default))
+                                            {
+                                                say("Sign-in:    done");
+                                                WakeUp();
+                                            }
+                                        }
+                                        catch (Exception e) when (e is not OutOfMemoryException)
+                                        {
+                                            log($"sign-in: {e.Message}");
+                                        }
+                                    });
                                 }
                             }
                             if (tick % 5 == 1)
@@ -1235,8 +1442,11 @@ public static class AgentCommands
                             }
                             if (DateTimeOffset.UtcNow >= nextSnapshot && !accountChanged && engine.MetadataVersion != savedVersion)
                             {
-                                savedVersion = engine.MetadataVersion;
-                                MetadataStore.Save(engine.ExportSnapshots(MetadataStore.MaxFoldersPerDrive), key);
+                                var version = engine.MetadataVersion;
+                                if (SaveQuietly("the folder listings", () => MetadataStore.Save(engine.ExportSnapshots(MetadataStore.MaxFoldersPerDrive), key)))
+                                {
+                                    savedVersion = version;
+                                }
                                 nextSnapshot = DateTimeOffset.UtcNow + SnapshotInterval;
                             }
                         }
@@ -1252,7 +1462,7 @@ public static class AgentCommands
                 powerChanged = null;
                 if (navigationPane)
                 {
-                    ExplorerLocation.Unregister();
+                    Explorer("remove the navigation pane entry", ExplorerLocation.Unregister);
                 }
             }
             finally
@@ -1270,27 +1480,44 @@ public static class AgentCommands
             catch (OperationCanceledException)
             {
             }
+
+            // The quick local saves first: at logoff Windows ends the agent about a minute after the session ends, maybe while uploads still run
+            void SaveLocalState()
+            {
+                ReportThrottling(DateTimeOffset.MaxValue); // an episode still going on
+                SaveQuietly("the discovery state", keeper.SaveIfChanged);
+                if (!accountChanged)
+                {
+                    SaveQuietly("the folder listings", () => MetadataStore.Save(engine.ExportSnapshots(MetadataStore.MaxFoldersPerDrive), key));
+                }
+                if (statistics is not null)
+                {
+                    statistics.Fold(client.Usage, monitoring!.Errors, DateTime.Now, tokens.LastResult?.Username, Monitoring.Version, monitoring.Device);
+                    statistics.Save();
+                }
+            }
+            SaveLocalState();
             await engine.ProcessDueAsync(true, default);
-            ReportThrottling(DateTimeOffset.MaxValue); // an episode still going on
-            keeper.SaveIfChanged();
+            SaveLocalState();
             if (accountChanged)
             {
                 // Nothing of the previous account's stays for the next start
-                cache.Clear();
-                MetadataStore.Delete();
-            }
-            else
-            {
-                MetadataStore.Save(engine.ExportSnapshots(MetadataStore.MaxFoldersPerDrive), key);
+                try
+                {
+                    cache.Clear();
+                    MetadataStore.Delete();
+                }
+                catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+                {
+                    say($"Warning:    could not wipe the previous account's cached content: {e.Message}");
+                }
             }
             foreach (var unsaved in engine.Unsaved())
             {
                 say($"Not saved:  {unsaved}");
             }
-            if (statistics is not null)
+            if (monitoring is not null)
             {
-                statistics.Fold(client.Usage, monitoring!.Errors, DateTime.Now, tokens.LastResult?.Account.Username, Monitoring.Version);
-                statistics.Save();
                 await monitoring.FlushAsync(TimeSpan.FromSeconds(3));
             }
             var usage = client.Usage;
@@ -1304,11 +1531,16 @@ public static class AgentCommands
             NetworkChange.NetworkAvailabilityChanged -= NetworkChanged;
             powerChanged = null;
             tray?.Dispose();
+            ReportThrottling(DateTimeOffset.MaxValue); // a stop before the drive was mounted: the first start's episode
+            if (monitoring is not null)
+            {
+                await monitoring.FlushAsync(TimeSpan.FromSeconds(3));
+            }
             done.Set();
         }
     }
 
-    static readonly TimeSpan SnapshotInterval = TimeSpan.FromMinutes(5), DailyDiscovery = TimeSpan.FromDays(1);
+    static readonly TimeSpan SnapshotInterval = TimeSpan.FromMinutes(5);
 
     /// <summary>Another user's volume holds this user's UNC path (\\VFS365\&lt;user&gt;). The user's own leftover volume is retried like any start problem.</summary>
     static bool IsMountConflict(Exception e) => e is MountConflictException { OwnedByAnotherUser: true };
@@ -1338,14 +1570,19 @@ public static class AgentCommands
     static string Sentence(string text) => text.Length == 0 ? text : char.ToUpper(text[0], CultureInfo.CurrentCulture) + text[1..].TrimEnd('.');
 
     /// <summary>
-    /// Adds the last minute's usage to today's statistics. Finished days go out a few minutes after the start or after midnight (spread,
-    /// so a tenant's devices don't all send at once); a day that doesn't arrive (offline, an expired SAS) stays and is tried an hour later.
+    /// Adds the last minute's usage to today's statistics of this device. Finished days go out a few minutes after the start or after
+    /// midnight (spread, so a tenant's devices don't all send at once), each as the device it was used on; a day that doesn't arrive
+    /// (offline, an expired SAS) stays and is tried an hour later.
     /// </summary>
     static void ReportStatistics(UsageStatistics statistics, Monitoring monitoring, M365Client client, string? user, ref DateTime? due, ref Task<int>? sending)
     {
         var now = DateTime.Now;
-        statistics.Fold(client.Usage, monitoring.Errors, now, user, Monitoring.Version);
+        statistics.Fold(client.Usage, monitoring.Errors, now, user, Monitoring.Version, monitoring.Device);
         statistics.Save();
+        if (monitoring.Target is null)
+        {
+            return; // monitoring was turned off meanwhile
+        }
         if (sending is { IsCompleted: true } sent)
         {
             if (sent.IsCompletedSuccessfully && sent.Result == 0)
@@ -1364,6 +1601,7 @@ public static class AgentCommands
             return;
         }
         due = now + TimeSpan.FromHours(1);
-        sending = statistics.SendCompletedAsync(now, (day, usage) => monitoring.StatisticsAsync(day, UsageStatistics.Values(day, usage), usage.User, usage.Version));
+        sending = statistics.SendCompletedAsync(now, (day, usage) =>
+            monitoring.StatisticsAsync(day, UsageStatistics.Values(day, usage), usage.User, usage.Version, usage.DeviceOr(monitoring.Device), usage.Salt));
     }
 }

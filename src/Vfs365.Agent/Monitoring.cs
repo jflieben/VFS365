@@ -18,7 +18,11 @@ public sealed record MonitoringTarget(string BaseUrl, string Query, DateTimeOffs
 
     public Uri TableUri(string table) => new($"{BaseUrl}/{table}{Query}");
 
-    /// <summary>Null when <paramref name="url"/> is empty (no reporting) or not usable (<paramref name="problem"/> says why).</summary>
+    /// <summary>
+    /// Null when <paramref name="url"/> is empty (no reporting) or not usable (<paramref name="problem"/> says why). Every user on the PC
+    /// can read the URL from the policy, so a SAS that can read, list, change or delete rows, or reaches other services, is refused. Meant
+    /// is an account SAS for the Table service, objects and Add only (ss=t, srt=o, sp=a), or a table SAS with Add only (tn, sp=a).
+    /// </summary>
     public static MonitoringTarget? Parse(string? url, out string? problem)
     {
         problem = null;
@@ -32,16 +36,57 @@ public sealed record MonitoringTarget(string BaseUrl, string Query, DateTimeOffs
             problem = "MonitoringUrl is not an https table service URL with a SAS (sv=...&sig=...)";
             return null;
         }
-        DateTimeOffset? expires = null;
-        foreach (var part in uri.Query.TrimStart('?').Split('&'))
+        var fields = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var part in uri.Query.TrimStart('?').Split('&', StringSplitOptions.RemoveEmptyEntries))
         {
-            if (part.StartsWith("se=", StringComparison.OrdinalIgnoreCase)
-                && DateTimeOffset.TryParse(Uri.UnescapeDataString(part[3..]), CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal, out var at))
+            var at = part.IndexOf('=');
+            fields[at < 0 ? part : part[..at]] = at < 0 ? "" : Uri.UnescapeDataString(part[(at + 1)..]);
+        }
+        if (RightsProblem(fields) is { } tooMuch)
+        {
+            problem = tooMuch;
+            return null;
+        }
+        DateTimeOffset? expires = fields.TryGetValue("se", out var se)
+            && DateTimeOffset.TryParse(se, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal, out var until) ? until : null;
+        return new($"{uri.GetLeftPart(UriPartial.Authority)}{uri.AbsolutePath.TrimEnd('/')}", uri.Query, expires);
+    }
+
+    /// <summary>Null when the SAS fields (sp, ss, srt, sr, tn) allow adding table rows and nothing else; else what is wrong and the fix.</summary>
+    static string? RightsProblem(IReadOnlyDictionary<string, string> fields)
+    {
+        var wrong = new List<string>();
+        if (fields.TryGetValue("sr", out var resource))
+        {
+            wrong.Add($"it is for Blob or File storage (sr={resource})");
+        }
+        if (!fields.TryGetValue("sp", out var permissions))
+        {
+            wrong.Add("it doesn't list its permissions (no sp; a stored access policy can't be checked)");
+        }
+        else if (!permissions.Contains('a') || permissions.Any(p => p is not ('a' or 'c')))
+        {
+            // Create (c) only adds tables; read, list, update and delete expose or change other devices' rows
+            wrong.Add($"permissions sp={permissions}, not Add only (a)");
+        }
+        // An account SAS; a table SAS (tn) has neither ss nor srt
+        if (fields.ContainsKey("ss") || fields.ContainsKey("srt") || !fields.ContainsKey("tn"))
+        {
+            var services = fields.GetValueOrDefault("ss");
+            var types = fields.GetValueOrDefault("srt");
+            if (services != "t")
             {
-                expires = at;
+                wrong.Add(services is null ? "no allowed services (ss)" : $"services ss={services}, not Table only (t)");
+            }
+            if (types is null || !types.Contains('o'))
+            {
+                wrong.Add(types is null ? "no allowed resource types (srt)" : $"resource types srt={types}, without Object (o)");
             }
         }
-        return new($"{uri.GetLeftPart(UriPartial.Authority)}{uri.AbsolutePath.TrimEnd('/')}", uri.Query, expires);
+        return wrong.Count == 0 ? null
+            : $"MonitoringUrl's SAS can do more than add table rows, or that can't be checked: {string.Join("; ", wrong)}. Every user on this PC can " +
+              "read it from the policy, so VFS365 doesn't use it. Make a SAS with allowed services Table, resource types Object and permissions Add " +
+              $"only (ss=t, srt=o, sp=a); see {Monitoring.Instructions}";
     }
 }
 
@@ -65,11 +110,14 @@ public sealed record DeviceInfo(string Name, string Id, string? EntraDeviceId)
 
 /// <summary>
 /// Best-effort reports to the customer's own Azure table storage: errors at once (at most 20 an hour, a repeat once an hour), usage
-/// per day (sent the day after), installs, updates and uninstalls. Fire and forget: nothing waits for a report, nothing is retried,
-/// and the first failure is logged once.
+/// per day (sent the day after), installs, updates and uninstalls. Fire and forget: nothing waits for a report, error rows are not
+/// retried (a day's statistics stay in statistics.json until they arrive), and the first failure is logged once. Retarget follows a
+/// policy change while the agent runs.
 /// </summary>
 public sealed class Monitoring(MonitoringTarget target, DeviceInfo device, Action<string> log)
 {
+    volatile MonitoringTarget? current = target;
+
     public const string ErrorsTable = "errors";
     public const string StatisticsTable = "statistics";
     public const string DevicesTable = "devices";
@@ -91,7 +139,8 @@ public sealed class Monitoring(MonitoringTarget target, DeviceInfo device, Actio
     public static string OffHint =>
         $"Monitoring: off. Errors and daily usage can go to your own Azure table storage through the MonitoringUrl policy; instructions at {Instructions}";
 
-    public MonitoringTarget Target => target;
+    /// <summary>Where reports go; null after Retarget turned reporting off.</summary>
+    public MonitoringTarget? Target => current;
     public DeviceInfo Device => device;
 
     /// <summary>The signed-in account (UPN) and its tenant, once known.</summary>
@@ -101,11 +150,19 @@ public sealed class Monitoring(MonitoringTarget target, DeviceInfo device, Actio
     /// <summary>Errors seen, reported or not, for the day's statistics.</summary>
     public int Errors => Volatile.Read(ref errors);
 
-    public string Started => $"Monitoring: errors and daily statistics to {target.Account}" +
-        (target.Expires is { } expires ? $" (SAS valid until {expires.ToLocalTime():yyyy-MM-dd HH:mm})" : "");
+    public string Started => current is not { } to ? "Monitoring: off"
+        : $"Monitoring: errors and daily statistics to {to.Account}" + (to.Expires is { } expires ? $" (SAS valid until {expires.ToLocalTime():yyyy-MM-dd HH:mm})" : "");
 
     /// <summary>Full, or NoPaths: file and folder paths become a short hash and URLs keep only their host (Scrub).</summary>
-    public MonitoringDetail Detail { get; init; } = MonitoringDetail.Full;
+    public MonitoringDetail Detail { get; set; } = MonitoringDetail.Full;
+
+    /// <summary>A changed MonitoringUrl or MonitoringDetail, applied at once (a renewed SAS needs no restart); null stops reporting.</summary>
+    public void Retarget(MonitoringTarget? to, MonitoringDetail detail)
+    {
+        current = to;
+        Detail = detail;
+        Interlocked.Exchange(ref failed, 0); // the first failure with the new SAS is logged again
+    }
 
     /// <summary>An error row. <paramref name="paths"/> are the volume paths and file names in <paramref name="message"/>, hashed with NoPaths.</summary>
     public void Error(string source, string message, params string?[] paths)
@@ -188,10 +245,18 @@ public sealed class Monitoring(MonitoringTarget target, DeviceInfo device, Actio
         return Regex.Replace(message, @"(?<=^|\s)\\(?!\\)[^\r\n:*?""<>|]+", m => Hash(m.Value.TrimEnd()));
     }
 
-    /// <summary>One row per day, device and Windows user. True when it was added (or was there already).</summary>
-    public Task<bool> StatisticsAsync(string day, IEnumerable<(string Name, object? Value)> values, string? user = null, string? version = null)
+    /// <summary>
+    /// One row per day, device and Windows user. True when it was added (or was there already). <paramref name="on"/>: the device the
+    /// day's usage happened on (statistics.json roams with the profile on pooled hosts), else this one. <paramref name="salt"/>, random
+    /// per day and kept with it, ends the row key: a re-send of the same day still conflicts (409, so it counts once), while nobody can
+    /// add the row first and a day created again (after a time-zone change) gets a row of its own.
+    /// </summary>
+    public Task<bool> StatisticsAsync(string day, IEnumerable<(string Name, object? Value)> values, string? user = null, string? version = null,
+        DeviceInfo? on = null, string? salt = null)
     {
-        var sending = SendAsync(StatisticsTable, day, $"{device.Id}_{WindowsIdentity.GetCurrent().User?.Value ?? Environment.UserName}", [.. Common(user, version), .. values]);
+        on ??= device;
+        var rowKey = $"{on.Id}_{WindowsIdentity.GetCurrent().User?.Value ?? Environment.UserName}{(salt is null ? "" : $"_{salt}")}";
+        var sending = SendAsync(StatisticsTable, day, rowKey, [.. Common(user, version, on), .. values]);
         Track(sending);
         return sending;
     }
@@ -215,10 +280,10 @@ public sealed class Monitoring(MonitoringTarget target, DeviceInfo device, Actio
         return Task.WhenAny(Task.WhenAll(waiting), Task.Delay(timeout));
     }
 
-    /// <summary>What every row carries; a statistics row of an earlier day brings that day's user and version.</summary>
-    IEnumerable<(string, object?)> Common(string? user = null, string? version = null) =>
+    /// <summary>What every row carries; a statistics row of an earlier day brings that day's user, version and device.</summary>
+    IEnumerable<(string, object?)> Common(string? user = null, string? version = null, DeviceInfo? on = null) =>
     [
-        ("DeviceName", device.Name), ("DeviceId", device.Id), ("EntraDeviceId", device.EntraDeviceId), ("User", user ?? User()),
+        ("DeviceName", (on ?? device).Name), ("DeviceId", (on ?? device).Id), ("EntraDeviceId", (on ?? device).EntraDeviceId), ("User", user ?? User()),
         ("WindowsUser", $@"{Environment.UserDomainName}\{Environment.UserName}"), ("TenantId", TenantId()), ("Version", version ?? Version),
     ];
 
@@ -237,16 +302,20 @@ public sealed class Monitoring(MonitoringTarget target, DeviceInfo device, Actio
     /// <summary>True when the row was added (or was there already).</summary>
     async Task<bool> SendAsync(string table, string partitionKey, string rowKey, IEnumerable<(string Name, object? Value)> properties)
     {
-        if (target.Expires is { } expires && expires <= DateTimeOffset.UtcNow)
+        if (current is not { } to)
         {
-            FailOnce($"the SAS expired on {expires.ToLocalTime():yyyy-MM-dd HH:mm}");
+            return false;
+        }
+        if (to.Expires is { } expires && expires <= DateTimeOffset.UtcNow)
+        {
+            FailOnce(to, $"the SAS expired on {expires.ToLocalTime():yyyy-MM-dd HH:mm}");
             return false;
         }
         try
         {
             var content = new StringContent(EntityJson(partitionKey, rowKey, properties), Encoding.UTF8);
             content.Headers.ContentType = new MediaTypeHeaderValue("application/json");
-            using var request = new HttpRequestMessage(HttpMethod.Post, target.TableUri(table)) { Content = content };
+            using var request = new HttpRequestMessage(HttpMethod.Post, to.TableUri(table)) { Content = content };
             request.Headers.TryAddWithoutValidation("Accept", "application/json;odata=nometadata");
             request.Headers.TryAddWithoutValidation("Prefer", "return-no-content");
             request.Headers.TryAddWithoutValidation("x-ms-version", "2019-02-02");
@@ -258,20 +327,20 @@ public sealed class Monitoring(MonitoringTarget target, DeviceInfo device, Actio
             {
                 return true; // a conflict: that day's statistics were sent already
             }
-            FailOnce($"{(int)response.StatusCode} {Explain(await ErrorCodeAsync(response).ConfigureAwait(false), table)}");
+            FailOnce(to, $"{(int)response.StatusCode} {Explain(await ErrorCodeAsync(response).ConfigureAwait(false), table)}");
         }
         catch (Exception e) when (e is HttpRequestException or TaskCanceledException or IOException)
         {
-            FailOnce(e.Message);
+            FailOnce(to, e.Message);
         }
         return false;
     }
 
-    void FailOnce(string detail)
+    void FailOnce(MonitoringTarget to, string detail)
     {
         if (Interlocked.Exchange(ref failed, 1) == 0)
         {
-            log($"error: monitoring to {target.Account} failed: {detail}. Reports are not retried; see {Instructions}");
+            log($"error: monitoring to {to.Account} failed: {detail}. Error rows are not retried; a day's statistics are, for up to a week; see {Instructions}");
         }
     }
 

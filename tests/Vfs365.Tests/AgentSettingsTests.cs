@@ -43,7 +43,115 @@ public sealed class AgentSettingsTests : IDisposable
         Assert.Equal(DriveScope.All, settings.Scope);
         Assert.False(settings.NavigationPane);
         Assert.Equal(["*/sites/*"], settings.IncludedSites);
-        Assert.Equal(["*/sites/HR*", "*/sites/Legal*"], settings.ExcludedSites);
+        Assert.Equal(["*/sites/HR*", "*/sites/Legal*", AgentSettings.PersonalSites], settings.ExcludedSites);
+    }
+
+    [Fact]
+    public void Colleagues_onedrives_stay_hidden_when_policy_sets_its_own_exclusions()
+    {
+        Assert.Equal(["*/sites/HR*", "*/personal/*"], Load("""{ "ExcludedSites": ["*/sites/HR*"] }""").ExcludedSites);
+        Assert.Equal(["*/PERSONAL/*", "*/sites/HR*"], Load("""{ "ExcludedSites": ["*/PERSONAL/*", "*/sites/HR*"] }""").ExcludedSites);
+        Assert.Null(Load("{}").ExcludedSites); // the built-in list has it
+        Assert.Contains("*/personal/*", new Vfs365.Core.Discovery.DiscoveryOptions().ExcludedSites);
+        Assert.Contains("*/personal/*", Load("""{ "ExcludedSites": ["*/sites/HR*"] }""").Effective().Single(s => s.Name == "ExcludedSites").Value);
+    }
+
+    static AgentSettings Policy(params (string Name, object Value)[] values) =>
+        AgentSettings.FromValues(AgentSettings.ComputerPolicy, values.ToDictionary(v => v.Name, v => v.Value));
+
+    [Theory]
+    [InlineData("yes", true)]
+    [InlineData("On", true)]
+    [InlineData("enabled", true)]
+    [InlineData("1", true)]
+    [InlineData(" true ", true)]
+    [InlineData("no", false)]
+    [InlineData("off", false)]
+    [InlineData("Disabled", false)]
+    [InlineData("0", false)]
+    public void Booleans_as_text_are_read_as_people_write_them(string value, bool on)
+    {
+        var settings = Policy(("TrayIcon", value), ("NavigationPane", value));
+        Assert.Equal((on, on), (settings.TrayIcon, settings.NavigationPane));
+        Assert.Empty(settings.Adjusted());
+    }
+
+    [Fact]
+    public void Unreadable_values_keep_the_default_and_are_named()
+    {
+        // REG_SZ "maybe" used to turn the tray off; a REG_BINARY is no number
+        var settings = Policy(("TrayIcon", "maybe"), ("CacheSizeMB", new byte[] { 1, 2 }), ("ReadAheadFiles", "eight"), ("Label", 5),
+            ("HelpUrl", "intranet"), ("MonitoringUrl", 7));
+
+        Assert.True(settings.TrayIcon);
+        Assert.Equal(AgentSettings.DefaultCacheSizeMB, settings.CacheSizeMB);
+        Assert.Equal(AgentSettings.DefaultReadAheadFiles, settings.ReadAheadFiles);
+        Assert.Equal(AgentSettings.DefaultHelpUrl, settings.HelpUrl);
+        var adjusted = settings.Adjusted();
+        Assert.Contains("TrayIcon 'maybe' is not on or off (1 or 0); on is used", adjusted);
+        Assert.Contains("CacheSizeMB (binary) is not a whole number; 2048 is used", adjusted);
+        Assert.Contains("ReadAheadFiles 'eight' is not a whole number; 8 is used", adjusted);
+        Assert.Contains("Label 5 is not text; the default is used", adjusted);
+        Assert.Contains("HelpUrl 'intranet' is not an http or https address; https://jsolve.nl is used", adjusted);
+        Assert.Contains("MonitoringUrl is not text; monitoring is off", adjusted);
+        Assert.Equal(6, adjusted.Count);
+    }
+
+    [Fact]
+    public void Qword_numbers_count_like_dwords()
+    {
+        var settings = Policy(("CacheSizeMB", 4096L), ("TrayIcon", 0L), ("ChangeCheckSeconds", 1L << 40));
+        Assert.Equal(4096, settings.CacheSizeMB);
+        Assert.False(settings.TrayIcon);
+        Assert.Equal(300, settings.ChangeCheckSeconds);
+    }
+
+    [Theory]
+    [InlineData("1")]
+    [InlineData("7")]
+    [InlineData("-1")]
+    [InlineData("All, OneDrive")]
+    [InlineData("Teams")]
+    public void Choices_take_only_their_names(string value)
+    {
+        var settings = Policy(("Scope", value), ("DatabaseFiles", value), ("MonitoringDetail", value));
+        Assert.Equal((DriveScope.SharePoint, DatabaseFilePolicy.Allow, MonitoringDetail.Full), (settings.Scope, settings.DatabaseFiles, settings.MonitoringDetail));
+        Assert.Contains($"Scope '{value}' is not SharePoint, OneDrive or All; SharePoint is used", settings.Adjusted());
+        Assert.Equal(3, settings.Adjusted().Count);
+        Assert.Equal(DatabaseFilePolicy.ReadOnly, Policy(("DatabaseFiles", " readonly ")).DatabaseFiles);
+    }
+
+    [Fact]
+    public void A_json_number_that_is_not_a_whole_int_does_not_stop_the_start()
+    {
+        var settings = Load("""{ "ChangeCheckSeconds": 1.5, "CacheSizeMB": 1e3, "ReadAheadFiles": 99999999999 }""");
+
+        Assert.Equal(AgentSettings.DefaultChangeCheckSeconds, settings.ChangeCheckSeconds);
+        Assert.Equal(AgentSettings.DefaultCacheSizeMB, settings.CacheSizeMB);
+        Assert.Equal(64, settings.ReadAheadFiles);
+        Assert.Contains("ChangeCheckSeconds '1.5' is not a whole number; 20 is used", settings.Adjusted());
+    }
+
+    [Fact]
+    public void The_working_directory_config_is_only_for_user_commands()
+    {
+        var working = Directory.CreateDirectory(Path.Combine(Path.GetTempPath(), $"vfs365-cwd-{Guid.NewGuid():N}")).FullName;
+        var exe = Directory.CreateDirectory(Path.Combine(Path.GetTempPath(), $"vfs365-exe-{Guid.NewGuid():N}")).FullName;
+        try
+        {
+            File.WriteAllText(Path.Combine(working, "vfs365.local.json"), "{}");
+            Assert.Equal(Path.Combine(working, "vfs365.local.json"), AgentSettings.ConfigFile(null, true, working, exe));
+            Assert.Null(AgentSettings.ConfigFile(null, false, working, exe)); // machine-report, SYSTEM, elevated
+
+            File.WriteAllText(Path.Combine(exe, "vfs365.json"), "{}");
+            Assert.Equal(Path.Combine(exe, "vfs365.json"), AgentSettings.ConfigFile(null, false, working, exe));
+            Assert.Equal(file, AgentSettings.ConfigFile(file, false, working, exe));
+        }
+        finally
+        {
+            Directory.Delete(working, recursive: true);
+            Directory.Delete(exe, recursive: true);
+        }
     }
 
     [Fact]

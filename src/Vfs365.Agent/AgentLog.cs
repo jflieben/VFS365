@@ -21,11 +21,11 @@ public sealed class AgentLog : TextWriter
     readonly long maxBytes;
     readonly Func<DateTime> clock;
     AppendFile writer;
-    long written;
+    long written, rollAt;
 
     AgentLog(string folder, long maxBytes, Func<DateTime> clock)
     {
-        (this.folder, this.maxBytes, this.clock) = (folder, maxBytes, clock);
+        (this.folder, this.maxBytes, this.clock, rollAt) = (folder, maxBytes, clock, maxBytes);
         writer = OpenFile(out written);
     }
 
@@ -57,7 +57,7 @@ public sealed class AgentLog : TextWriter
         }
         writer.Write(value);
         written += Encoding.UTF8.GetByteCount(value);
-        if (written >= maxBytes && value.EndsWith('\n'))
+        if (written >= rollAt && value.EndsWith('\n'))
         {
             Roll();
         }
@@ -69,7 +69,10 @@ public sealed class AgentLog : TextWriter
     {
     }
 
-    /// <summary>The file is full: it moves to logs\ and the session goes on in a new one.</summary>
+    /// <summary>
+    /// The file is full: it moves to logs\ and the session goes on in a new one. When it can't be moved (another program holds it open
+    /// without delete sharing) it goes on in the same file and the next try waits for another half of MaxBytes.
+    /// </summary>
     void Roll()
     {
         writer.WriteLine($"{clock():yyyy-MM-dd HH:mm:ss} Log reached {maxBytes >> 20} MB; it continues in agent.log");
@@ -77,6 +80,13 @@ public sealed class AgentLog : TextWriter
         var archived = Archive(folder);
         Prune(folder, clock());
         writer = OpenFile(out written);
+        if (archived is null)
+        {
+            rollAt = written + Math.Max(1, maxBytes / 2);
+            writer.WriteLine($"{clock():yyyy-MM-dd HH:mm:ss} Log could not be moved to logs\\ (another program has it open); it goes on in this file");
+            return;
+        }
+        rollAt = maxBytes;
         writer.WriteLine($"{clock():yyyy-MM-dd HH:mm:ss} Log continues from logs\\{Path.GetFileName(archived)}");
     }
 
@@ -139,20 +149,20 @@ public sealed class AgentLog : TextWriter
         {
             return null;
         }
-        var logs = Directory.CreateDirectory(Path.Combine(folder, "logs")).FullName;
-        var target = Path.Combine(logs, $"agent-{info.LastWriteTime:yyyyMMdd-HHmmss}.log");
-        for (var n = 2; File.Exists(target); n++)
-        {
-            target = Path.Combine(logs, $"agent-{info.LastWriteTime:yyyyMMdd-HHmmss}-{n}.log");
-        }
         try
         {
+            var logs = Directory.CreateDirectory(Path.Combine(folder, "logs")).FullName;
+            var target = Path.Combine(logs, $"agent-{info.LastWriteTime:yyyyMMdd-HHmmss}.log");
+            for (var n = 2; File.Exists(target); n++)
+            {
+                target = Path.Combine(logs, $"agent-{info.LastWriteTime:yyyyMMdd-HHmmss}-{n}.log");
+            }
             File.Move(current, target);
             return target;
         }
-        catch (IOException)
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
         {
-            return null; // another agent of this user still writes it (a restart in progress)
+            return null; // another agent of this user still writes it (a restart in progress), or another program holds it open
         }
     }
 

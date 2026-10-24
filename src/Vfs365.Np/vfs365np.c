@@ -30,6 +30,10 @@ static const WCHAR Server[] = L"\\\\VFS365";
 static const WCHAR Provider[] = L"VFS365";
 #define PROVIDER_LENGTH 6
 
+// WinFsp's UNC provider as MUP names it: a path below it reaches WinFsp alone
+static const WCHAR WinFspMup[] = L"\\\\?\\GLOBALROOT\\Device\\WinFsp.Mup";
+#define WINFSP_MUP_LENGTH ((int)(sizeof(WinFspMup) / sizeof(WCHAR)) - 1)
+
 BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved)
 {
     (void)reserved;
@@ -70,6 +74,36 @@ static BOOL OwnedByCaller(LPCWSTR root)
     BOOL ok = GetTokenInformation(token, TokenUser, user, sizeof(user), &length);
     CloseHandle(token);
     return ok && EqualSid(((TOKEN_USER *)user)->User.Sid, owner);
+}
+
+// Writes WinFsp's provider path into path (capacity characters) and returns its length. Since 2.0 WinFsp installs side by side and
+// the provider is WinFsp.Mup+<id>, with the id from its SxsDir (...\SxS\sxs.<id>\).
+static int WinFspProvider(WCHAR *path, int capacity)
+{
+    int length = WINFSP_MUP_LENGTH;
+    lstrcpynW(path, WinFspMup, length + 1);
+    HKEY key;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\WinFsp", 0, KEY_QUERY_VALUE | KEY_WOW64_32KEY, &key) != ERROR_SUCCESS)
+        return length;
+    WCHAR dir[MAX_PATH + 1];
+    DWORD type = 0, bytes = MAX_PATH * sizeof(WCHAR);
+    LONG read = RegQueryValueExW(key, L"SxsDir", NULL, &type, (LPBYTE)dir, &bytes);
+    RegCloseKey(key);
+    if (read != ERROR_SUCCESS || type != REG_SZ)
+        return length;
+    dir[bytes / sizeof(WCHAR)] = L'\0';
+    int end = lstrlenW(dir);
+    while (end > 0 && dir[end - 1] == L'\\')
+        end--;
+    int start = end;
+    while (start > 0 && dir[start - 1] != L'\\')
+        start--;
+    int id = end - start - 4;
+    if (id <= 0 || id > 32 || length + 1 + id >= capacity || CompareStringOrdinal(dir + start, 4, L"sxs.", 4, TRUE) != CSTR_EQUAL)
+        return length;
+    path[length] = L'+';
+    lstrcpynW(path + length + 1, dir + start + 4, id + 1);
+    return length + 1 + id;
 }
 
 // A NETRESOURCEW followed by its strings. remote may be null (the network itself); system is the path below a share.
@@ -150,13 +184,17 @@ EXPORT DWORD WINAPI NPGetResourceInformation(LPNETRESOURCEW resource, LPVOID buf
         return Fill(buffer, size, Server, SERVER_LENGTH, RESOURCEDISPLAYTYPE_SERVER, RESOURCEUSAGE_CONTAINER, RESOURCETYPE_ANY,
             NULL, 0, system);
 
-    // The volume's root answers through WinFsp only while it is mounted and the caller may open it; it must be the caller's own
+    // The volume's root, asked of WinFsp directly: it answers only while the volume is mounted and the caller may open it, and it must
+    // be the caller's own. Never the UNC path itself: when the volume isn't mounted, that falls through to SMB and WebDAV, which look
+    // for a server named VFS365 on the network and sign in to whoever answers.
     WCHAR root[MAX_PATH];
-    if (shareEnd + 2 > MAX_PATH)
+    int prefix = WinFspProvider(root, MAX_PATH - 2);
+    int share = shareEnd - 1; // \VFS365\<share>: the name without its first backslash
+    if (prefix + share + 2 > MAX_PATH)
         return WN_BAD_NETNAME;
-    lstrcpynW(root, name, shareEnd + 1);
-    root[shareEnd] = L'\\';
-    root[shareEnd + 1] = L'\0';
+    lstrcpynW(root + prefix, name + 1, share + 1);
+    root[prefix + share] = L'\\';
+    root[prefix + share + 1] = L'\0';
     DWORD attributes = GetFileAttributesW(root);
     if (attributes == INVALID_FILE_ATTRIBUTES || !(attributes & FILE_ATTRIBUTE_DIRECTORY) || !OwnedByCaller(root))
         return WN_BAD_NETNAME;

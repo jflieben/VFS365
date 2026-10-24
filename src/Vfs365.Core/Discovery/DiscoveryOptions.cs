@@ -25,8 +25,11 @@ public sealed record DiscoveryOptions
 
     public int MaxParallelSites { get; init; } = 4;
 
-    /// <summary>A library's site and library metadata is reused this long after it was read; older and new ones are looked up.</summary>
-    public TimeSpan MetadataMaxAge { get; init; } = TimeSpan.FromHours(48);
+    /// <summary>
+    /// A library's site and library metadata is reused this long after it was read; older and new ones are looked up. Read-only and
+    /// locked sites, check-out and offline-client settings rarely change, and SharePoint enforces access anyway.
+    /// </summary>
+    public TimeSpan MetadataMaxAge { get; init; } = TimeSpan.FromDays(7);
 
     /// <summary>
     /// A library read for the first time counts as read up to this much earlier (a fixed share per library key), so the libraries of

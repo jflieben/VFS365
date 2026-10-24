@@ -3,38 +3,39 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; connect-src https://*.table.core.windows.net https://*.table.core.chinacloudapi.cn https://*.table.core.usgovcloudapi.net http://127.0.0.1:* http://localhost:*; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'">
 <title>VFS365 monitoring</title>
 <meta name="description" content="Dashboard for VFS365's monitoring tables: usage statistics, errors and installs, read straight from your Azure table storage.">
 <style>
 :root {
   color-scheme: light;
   --page: #f9f9f7; --surface: #fcfcfb; --surface-2: #f3f2ee;
-  --ink: #0b0b0b; --ink-2: #52514e; --muted: #898781;
+  --ink: #0b0b0b; --ink-2: #52514e; --muted: #6c6b66;
   --grid: #e1e0d9; --axis: #c3c2b7; --ring: rgba(11,11,11,0.10);
   --accent: #2a78d6; --accent-ink: #ffffff; --link: #1c5cab;
   --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a; --s4: #eda100; --s5: #e87ba4; --s6: #008300; --s7: #4a3aa7; --s8: #e34948; --other: #b4b2a9;
-  --good: #0ca30c; --warning: #fab219; --serious: #ec835a; --critical: #d03b3b; --good-ink: #006300;
+  --good: #0ca30c; --warning: #fab219; --serious: #ec835a; --critical: #d03b3b; --good-ink: #006300; --critical-ink: #d03b3b;
   --shadow: 0 8px 30px rgba(0,0,0,0.12);
 }
 @media (prefers-color-scheme: dark) {
   :root:where(:not([data-theme="light"])) {
     color-scheme: dark;
     --page: #0d0d0d; --surface: #1a1a19; --surface-2: #232321;
-    --ink: #ffffff; --ink-2: #c3c2b7; --muted: #898781;
+    --ink: #ffffff; --ink-2: #c3c2b7; --muted: #9c9a93;
     --grid: #2c2c2a; --axis: #383835; --ring: rgba(255,255,255,0.10);
     --accent: #3987e5; --accent-ink: #ffffff; --link: #86b6ef;
     --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500; --s5: #d55181; --s6: #008300; --s7: #9085e9; --s8: #e66767; --other: #5f5e59;
-    --good-ink: #0ca30c; --shadow: 0 8px 30px rgba(0,0,0,0.5);
+    --good-ink: #0ca30c; --critical-ink: #e66767; --shadow: 0 8px 30px rgba(0,0,0,0.5);
   }
 }
 :root[data-theme="dark"] {
   color-scheme: dark;
   --page: #0d0d0d; --surface: #1a1a19; --surface-2: #232321;
-  --ink: #ffffff; --ink-2: #c3c2b7; --muted: #898781;
+  --ink: #ffffff; --ink-2: #c3c2b7; --muted: #9c9a93;
   --grid: #2c2c2a; --axis: #383835; --ring: rgba(255,255,255,0.10);
   --accent: #3987e5; --accent-ink: #ffffff; --link: #86b6ef;
   --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500; --s5: #d55181; --s6: #008300; --s7: #9085e9; --s8: #e66767; --other: #5f5e59;
-  --good-ink: #0ca30c; --shadow: 0 8px 30px rgba(0,0,0,0.5);
+  --good-ink: #0ca30c; --critical-ink: #e66767; --shadow: 0 8px 30px rgba(0,0,0,0.5);
 }
 * { box-sizing: border-box; }
 html, body { margin: 0; }
@@ -42,6 +43,7 @@ body { background: var(--page); color: var(--ink); font: 14px/1.45 system-ui, -a
 a { color: var(--link); }
 button, select, input, textarea { font: inherit; color: inherit; }
 button { cursor: pointer; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .wrap { max-width: 1440px; margin: 0 auto; padding: 0 16px 48px; }
 header.top { position: sticky; top: 0; z-index: 20; background: var(--page); border-bottom: 1px solid var(--grid); }
 header.top .wrap { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; padding-top: 10px; padding-bottom: 10px; }
@@ -61,6 +63,7 @@ select, input[type=search] { border: 1px solid var(--ring); background: var(--su
 .seg button { border: 0; background: none; padding: 6px 12px; }
 .seg button[aria-pressed=true] { background: var(--surface-2); font-weight: 650; }
 .seg button[aria-pressed=true]::before { content: "✓ "; font-weight: 700; }
+.seg.small button { padding: 3px 9px; font-size: 12.5px; }
 .card { background: var(--surface); border: 1px solid var(--ring); border-radius: 12px; padding: 16px; min-width: 0; }
 .card h2 { font-size: 15px; margin: 0; font-weight: 650; }
 .card .sub { color: var(--ink-2); font-size: 12.5px; margin-top: 2px; }
@@ -77,7 +80,7 @@ select, input[type=search] { border: 1px solid var(--ring); background: var(--su
 .kpi .value { font-size: 26px; font-weight: 650; margin-top: 2px; }
 .kpi .note { color: var(--ink-2); font-size: 12.5px; min-height: 18px; }
 .kpi svg { display: block; margin-top: 6px; width: 100%; height: 28px; }
-.delta-good { color: var(--good-ink); } .delta-bad { color: var(--critical); }
+.delta-good { color: var(--good-ink); } .delta-bad { color: var(--critical-ink); }
 .insights { margin-top: 12px; }
 .insight { display: flex; gap: 10px; align-items: flex-start; padding: 8px 0; border-top: 1px solid var(--grid); }
 .insight:first-of-type { border-top: 0; }
@@ -99,8 +102,9 @@ select, input[type=search] { border: 1px solid var(--ring); background: var(--su
 table.data { width: 100%; border-collapse: collapse; font-size: 13px; }
 table.data th, table.data td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--grid); vertical-align: top; }
 table.data th { color: var(--ink-2); font-weight: 600; font-size: 12.5px; white-space: nowrap; user-select: none; }
-table.data th.sortable { cursor: pointer; }
-table.data th.sortable:hover { color: var(--ink); }
+table.data th button.sort, table.data td button.open { border: 0; background: none; padding: 0; color: inherit; font-weight: inherit; text-align: inherit; }
+table.data th button.sort:hover { color: var(--ink); }
+table.data td button.open, .src { white-space: nowrap; }
 table.data td.num, table.data th.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
 table.data tr.click { cursor: pointer; }
 table.data tr.click:hover td { background: var(--surface-2); }
@@ -122,6 +126,7 @@ table.data tr.click:hover td { background: var(--surface-2); }
 pre.cmd { background: var(--surface-2); border-radius: 8px; padding: 10px; overflow-x: auto; font-size: 12.5px; white-space: pre-wrap; overflow-wrap: anywhere; }
 .drawer-back { position: fixed; inset: 0; background: rgba(0,0,0,0.35); z-index: 30; display: none; }
 .drawer { position: fixed; top: 0; right: 0; bottom: 0; width: min(760px, 100%); background: var(--page); z-index: 31; overflow-y: auto; box-shadow: var(--shadow); display: none; }
+.drawer:focus { outline: none; }
 .drawer .wrap { padding-top: 16px; }
 .drawer h2 { margin: 0; font-size: 18px; }
 .loading { opacity: 0.55; transition: opacity 0.2s; }
@@ -136,7 +141,7 @@ details.note dd { margin: 0; }
 </style>
 </head>
 <body>
-<header class="top"><div class="wrap">
+<header class="top" id="top"><div class="wrap">
   <div class="brand"><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="var(--accent)" d="M7 18a5 5 0 0 1-.6-9.96A6 6 0 0 1 18 9a4.5 4.5 0 0 1-.5 9z"/><rect x="7" y="13.5" width="10" height="1.6" rx=".8" fill="var(--surface)"/></svg>VFS365 monitoring</div>
   <div class="status-line" id="statusLine"></div>
   <div class="spacer"></div>
@@ -153,7 +158,7 @@ details.note dd { margin: 0; }
 <main class="wrap" id="main"></main>
 <div class="tooltip" id="tooltip" role="status"></div>
 <div class="drawer-back" id="drawerBack"></div>
-<aside class="drawer" id="drawer" aria-modal="true" role="dialog"><div class="wrap" id="drawerBody"></div></aside>
+<aside class="drawer" id="drawer" aria-modal="true" role="dialog" aria-labelledby="drawerTitle" tabindex="-1"><div class="wrap" id="drawerBody"></div></aside>
 
 <script>
 "use strict";
@@ -222,6 +227,13 @@ const store = {
   get(k) { try { return localStorage.getItem("vfs365mon." + k); } catch { return null; } },
   set(k, v) { try { v == null ? localStorage.removeItem("vfs365mon." + k) : localStorage.setItem("vfs365mon." + k, v); } catch { } },
 };
+/* Opened from disk, every local page shares this page's localStorage (Chromium), so there the SAS is kept for the tab only */
+const fromDisk = location.protocol === "file:";
+const saved = {
+  area() { return fromDisk ? sessionStorage : localStorage; },
+  get() { try { return this.area().getItem("vfs365mon.connection"); } catch { return null; } },
+  set(v) { try { v == null ? this.area().removeItem("vfs365mon.connection") : this.area().setItem("vfs365mon.connection", v); } catch { } },
+};
 
 /* ---------- Connection and SAS ---------- */
 const TABLES = ["statistics", "errors", "devices"];
@@ -247,7 +259,7 @@ function parseConnection(input) {
       if (at > 0) parts[segment.slice(0, at).trim().toLowerCase()] = segment.slice(at + 1).trim();
     }
     if (parts.accountkey && !parts.sharedaccesssignature) {
-      throw new Problem("Account keys are not used here", ["This connection string holds the storage account key, which gives full control. Create a SAS with only Read and List instead (see below) and paste its connection string or URL."]);
+      throw new Problem("Account keys are not used here", ["This connection string holds the storage account key, which gives full control. Create a SAS with only Read instead (see below) and paste its connection string or URL."]);
     }
     if (!parts.sharedaccesssignature) throw new Problem("No SharedAccessSignature in this connection string", ["Paste the connection string of a SAS (it contains SharedAccessSignature=sv=...), or the Table service SAS URL."]);
     sas = parts.sharedaccesssignature.replace(/^\?/, "");
@@ -256,11 +268,16 @@ function parseConnection(input) {
     else throw new Problem("No TableEndpoint in this connection string", ["The SAS connection string needs TableEndpoint=https://<account>.table.core.windows.net/ (it is there when Table is one of the allowed services)."]);
   }
   const params = Object.fromEntries(new URLSearchParams(sas));
-  const host = new URL(base).hostname;
-  return { base, sas, params, account: host.split(".")[0], host };
+  const endpoint = new URL(base), host = endpoint.hostname, local = host === "localhost" || host === "127.0.0.1";
+  // http only for Azurite on this computer; anything else must be an Azure table endpoint (the page's CSP allows no other)
+  if (endpoint.protocol !== "https:" && !(local && endpoint.protocol === "http:"))
+    throw new Problem("Only https addresses are used", [`The table endpoint starts with ${endpoint.protocol}//. Use the https Table service SAS URL; http is only accepted for Azurite on localhost or 127.0.0.1.`]);
+  if (!local && !/\.table\.core\.(windows\.net|chinacloudapi\.cn|usgovcloudapi\.net)$/i.test(host))
+    throw new Problem("Not an Azure Table service address", [`${host} is not <account>.table.core.windows.net. This page only reads Azure Table storage, or Azurite on this computer.`]);
+  return { base, sas, params, account: local ? endpoint.pathname.split("/")[1] || host : host.split(".")[0], host };
 }
 const Fix = {
-  sas: "Create a SAS in the Azure portal: Storage account > Security + networking > Shared access signature. Allowed services: Table. Allowed resource types: Container and Object. Allowed permissions: Read and List. Allowed protocols: HTTPS only. Set an expiry date, then Generate and copy the Table service SAS URL.",
+  sas: "Create a SAS in the Azure portal: Storage account > Security + networking > Shared access signature. Allowed services: Table. Allowed resource types: Object. Allowed permissions: Read. Allowed protocols: HTTPS only. Set an expiry date, then Generate and copy the Table service SAS URL.",
 };
 function sasFindings(c, now = new Date()) {
   const p = c.params, out = [];
@@ -270,7 +287,8 @@ function sasFindings(c, now = new Date()) {
   if (p.ss && !p.ss.includes("t")) out.push({ level: "critical", text: `The SAS is not for the Table service (allowed services: ${p.ss}).` });
   if (p.srt && !p.srt.includes("o")) out.push({ level: "critical", text: "The SAS lacks resource type Object (srt has no o), which reading rows needs." });
   if (p.sp && !p.sp.includes("r")) out.push({ level: "critical", text: "The SAS lacks the Read permission (sp has no r)." });
-  if (p.sp && /[wdaucp]/.test(p.sp)) out.push({ level: "warning", text: `This SAS can also change data (sp=${p.sp}). A dashboard needs only Read and List: create one with just those.` });
+  if (p.sp && /[wdaucp]/.test(p.sp)) out.push({ level: "warning", text: `This SAS can also change data (sp=${p.sp}). The dashboard needs only Read: create one with just that.` });
+  else if ((p.sp && p.sp.includes("l")) || (p.srt && /[sc]/.test(p.srt))) out.push({ level: "info", text: "The dashboard needs only resource type Object and the Read permission; it doesn't use List or the Service and Container types." });
   if (p.sip) out.push({ level: "info", text: `The SAS only works from IP addresses ${p.sip}.` });
   if (p.spr === "http") out.push({ level: "warning", text: "The SAS allows HTTP only; use HTTPS." });
   if (p.st) {
@@ -286,28 +304,39 @@ function sasFindings(c, now = new Date()) {
   }
   return out;
 }
+/* A page opened from disk sends Origin "null", which only a rule for all origins (*) matches */
+const corsOrigins = () => fromDisk ? "Allowed origins *" : `Allowed origins ${location.origin} (or *)`;
+const corsDisk = "This page is opened from disk (file://), so the browser sends no address of its own and only Allowed origins * works. To allow just one address, host the page on https and allow that address.";
 function corsFix(c) {
   return [
     "Browsers only let a page read storage that allows it (CORS), and this storage account does not allow it for the Table service yet.",
-    "In the Azure portal: Storage account > Settings > Resource sharing (CORS) > Table service. Add a rule: Allowed origins * (or the address this page is opened from), Allowed methods GET and OPTIONS, Allowed headers *, Exposed headers *, Max age 3600. Save, wait a minute, then Refresh.",
-    { cmd: `az storage cors add --account-name ${c.account} --services t --methods GET OPTIONS --origins "*" --allowed-headers "*" --exposed-headers "*" --max-age 3600` },
-    "A rule only allows reading in a browser; the SAS still decides what can be read. Exposed headers * lets the dashboard read days with more than 1000 rows.",
-  ];
+    `In the Azure portal: Storage account > Settings > Resource sharing (CORS) > Table service. Add a rule: ${corsOrigins()}, Allowed methods GET and OPTIONS, Allowed headers *, Exposed headers *, Max age 3600. Save, wait a minute, then Refresh.`,
+    fromDisk ? corsDisk : null,
+    { cmd: `az storage cors add --account-name ${c.account} --services t --methods GET OPTIONS --origins "${fromDisk ? "*" : location.origin}" --allowed-headers "*" --exposed-headers "*" --max-age 3600` },
+    "A rule only allows reading in a browser; the SAS still decides what can be read. Exposed headers * lets the dashboard see when Azure splits a day's rows over several answers.",
+  ].filter(Boolean);
 }
 
 /* ---------- Table client ---------- */
-let pagingHidden = false;
-async function query(c, table, filter, onPage) {
+/* Only the columns the page uses */
+const IDENTITY = "PartitionKey,Timestamp,DeviceName,DeviceId,EntraDeviceId,User,WindowsUser,TenantId,Version";
+const SELECT = {
+  statistics: IDENTITY + ",GraphRequests,SharePointRequests,ResourceUnits,BytesReceived,BytesSent,Throttled,ThrottledSeconds,BudgetWaitSeconds,BudgetWaitForegroundSeconds,BudgetWaitBackgroundSeconds,Errors,MinutesRunning",
+  errors: IDENTITY + ",Source,Message,OccurredAt,ThrottledUntil,Responses,HeldSeconds,LongestWaitSeconds,GraphResponses,SharePointResponses,BackgroundResponses",
+  devices: "PartitionKey,RowKey,Timestamp,DeviceName,DeviceId,EntraDeviceId,Users,Version,Action,OccurredAt",
+};
+async function query(c, table, filter, { signal, flags, onPage } = {}) {
   const rows = [];
   let next = null;
   do {
-    let url = `${c.base}/${table}()?${c.sas}`;
+    let url = `${c.base}/${table}()?${c.sas}&$select=${encodeURIComponent(SELECT[table])}`;
     if (filter) url += "&$filter=" + encodeURIComponent(filter);
     if (next) url += `&NextPartitionKey=${encodeURIComponent(next.pk)}${next.rk ? "&NextRowKey=" + encodeURIComponent(next.rk) : ""}`;
     let response;
     try {
-      response = await fetch(url, { headers: { Accept: "application/json;odata=nometadata" }, cache: "no-store" });
-    } catch {
+      response = await fetch(url, { headers: { Accept: "application/json;odata=nometadata" }, cache: "no-store", signal });
+    } catch (e) {
+      if (signal?.aborted) throw e;
       throw await networkProblem(c);
     }
     if (!response.ok) throw await serviceProblem(c, table, response);
@@ -316,7 +345,8 @@ async function query(c, table, filter, onPage) {
     onPage?.(rows.length);
     const pk = response.headers.get("x-ms-continuation-NextPartitionKey");
     next = pk ? { pk, rk: response.headers.get("x-ms-continuation-NextRowKey") } : null;
-    if (!next && body.value.length === 1000) pagingHidden = true;
+    // Azure always sends a request ID: when the browser can't read it, it can't read continuation headers either
+    if (flags && (!response.headers.get("x-ms-request-id") || (!next && body.value.length === 1000))) flags.pagingHidden = true;
   } while (next);
   return rows;
 }
@@ -356,9 +386,19 @@ async function serviceProblem(c, table, response) {
 }
 
 /* ---------- Data loading ----------
-   One query per day partition, 8 at a time: only a day with more than 1000 rows needs paging, so data is complete even
-   when the browser can't see continuation headers. Days already read are kept between refreshes, except recent ones. */
-const data = { statistics: new Map(), errors: new Map(), devices: [], from: {}, missing: new Set(), loadedAt: null, sample: false };
+   One query per day partition, 8 at a time. Days already read are kept between refreshes, except recent ones; after the
+   first read the devices table is read only for rows written since. A load fills its own object, which replaces `data` at the end. */
+const data = { statistics: new Map(), errors: new Map(), devices: [], devicesAt: 0, range: 0, missing: new Set(), pagingHidden: false, loadedAt: null, sample: false };
+/* One statistics row per day, device and Windows user, the newest: a day sent again (its answer lost) or written by someone else
+   with the agents' SAS counts once. `dropped` says how many were left out. */
+function newestOnly(rows) {
+  const keep = new Map();
+  for (const r of rows) {
+    const key = [r.DeviceId, r.DeviceName, r.WindowsUser].map(v => String(v || "").toLowerCase()).join("|"), had = keep.get(key);
+    if (!had || (Date.parse(r.Timestamp) || 0) > (Date.parse(had.Timestamp) || 0)) keep.set(key, r);
+  }
+  return Object.assign([...keep.values()], { dropped: rows.length - keep.size });
+}
 function dayRange(first, last) {
   const out = [];
   for (let t = Date.parse(first + "T00:00:00Z"), d; (d = new Date(t).toISOString().slice(0, 10)) <= last; t += 86400000) out.push(d);
@@ -368,9 +408,9 @@ async function pool(items, limit, work) {
   let next = 0;
   await Promise.all(Array.from({ length: Math.min(limit, items.length) }, async () => { while (next < items.length) await work(items[next++]); }));
 }
-async function loadAll(c, days, refresh, progress) {
-  pagingHidden = false;
-  const today = new Date();
+async function loadAll(c, days, refresh, progress, signal) {
+  const today = new Date(), flags = { pagingHidden: false };
+  const next = { statistics: new Map(), errors: new Map(), devices: [], devicesAt: 0, range: days, missing: new Set() };
   // Statistics: local days, sent the day after and up to a week late. Errors: UTC days, sent at once; twice the range for the comparison.
   const span = {
     statistics: { from: localDay(addDays(today, -days)), to: localDay(addDays(today, -1)), recent: localDay(addDays(today, -8)) },
@@ -379,39 +419,46 @@ async function loadAll(c, days, refresh, progress) {
   const counts = { statistics: 0, errors: 0, devices: 0 };
   const tick = () => progress(Object.entries(counts).filter(([, n]) => n).map(([t, n]) => `${t} ${fmtInt(n)}`).join(", "));
   const load = async table => {
-    const r = span[table], read = new Map();
-    if (refresh && data.from[table] && data.from[table] <= r.from)
-      for (const [day, rows] of data[table]) if (day >= r.from && day < r.recent) read.set(day, rows);
+    const r = span[table], read = next[table];
+    if (refresh) for (const [day, rows] of data[table]) if (day >= r.from && day < r.recent) read.set(day, rows);
     try {
       await pool(dayRange(r.from, r.to).filter(day => !read.has(day)), 8, async day => {
-        const rows = await query(c, table, `PartitionKey eq '${day}'`);
-        read.set(day, rows);
+        const rows = await query(c, table, `PartitionKey eq '${day}'`, { signal, flags });
+        read.set(day, table === "statistics" ? newestOnly(rows) : rows);
         counts[table] += rows.length; tick();
       });
-      data[table] = read;
-      data.from[table] = r.from;
-      data.missing.delete(table);
     } catch (e) {
-      if (e.missingTable) { data[table] = new Map(); data.missing.add(table); return; }
-      throw e;
+      if (!e.missingTable) throw e;
+      read.clear(); next.missing.add(table);
     }
   };
   const loadDevices = async () => {
-    try { data.devices = await query(c, "devices", null, n => { counts.devices = n; tick(); }); data.missing.delete("devices"); }
-    catch (e) { if (e.missingTable) { data.devices = []; data.missing.add("devices"); return; } throw e; }
+    // Rows written since the last read, with a margin; merged by row key
+    const since = refresh && data.devicesAt ? new Date(data.devicesAt - 600000).toISOString().replace(/\.\d+Z$/, "Z") : null;
+    try {
+      const rows = await query(c, "devices", since ? `Timestamp ge datetime'${since}'` : null, { signal, flags, onPage: n => { counts.devices = n; tick(); } });
+      const merged = new Map((since ? data.devices : []).concat(rows).map(r => [r.PartitionKey + "|" + r.RowKey, r]));
+      next.devices = [...merged.values()];
+      next.devicesAt = next.devices.reduce((t, r) => Math.max(t, Date.parse(r.Timestamp) || 0), 0);
+    } catch (e) {
+      if (!e.missingTable) throw e;
+      next.missing.add("devices");
+    }
   };
   await Promise.all([load("statistics"), load("errors"), loadDevices()]);
-  data.loadedAt = new Date();
+  return { ...next, pagingHidden: flags.pagingHidden };
 }
 
 /* ---------- Model: everything the page shows, for the current range and filters ---------- */
-/* Crash and start errors may come before sign-in, with only the Windows user; statistics rows link it to the UPN */
-const upnOf = new Map();
-const userOf = r => r.User || upnOf.get(r.WindowsUser) || r.WindowsUser || "(unknown)";
 /* A device by its name: a host rebuilt from an image (AVD) keeps its name and Entra ID but gets a new MachineGuid (DeviceId) */
 const deviceOf = r => String(r.DeviceName || r.EntraDeviceId || r["DeviceId"] || "?").toLowerCase();
-/* Sources the agent reports, each with a fixed color; anything else is "other" */
-const SOURCE_COLOR = { upload: "--s1", "conflict copy": "--s2", "sign-in": "--s3", "file system": "--s4", discovery: "--s5", start: "--s6", "drive letter": "--s7", crash: "--s8", security: "--s8" };
+/* Crash and start errors may come before sign-in, with only the Windows user; statistics rows of the same device link it to the UPN
+   (a Windows user name like AzureAD\name alone is not unique across devices) */
+const upnOf = new Map();
+const upnKey = r => deviceOf(r) + "|" + String(r.WindowsUser || "").toLowerCase();
+const userOf = r => r.User || upnOf.get(upnKey(r)) || r.WindowsUser || "(unknown)";
+/* Sources the agent reports, each with a fixed color (8 at most); the rarer ones (drive letter, security, agent) and unknown ones are "other" */
+const SOURCE_COLOR = { upload: "--s1", "conflict copy": "--s2", "sign-in": "--s3", "file system": "--s4", discovery: "--s5", start: "--s6", delete: "--s7", crash: "--s8" };
 const KNOWN_SOURCES = Object.keys(SOURCE_COLOR);
 const clip = (text, n) => { const t = String(text || ""); return t.length > n ? t.slice(0, n - 1) + "…" : t; };
 function errorPattern(message) {
@@ -431,7 +478,8 @@ function buildModel(range, filters) {
   for (let back = range; back >= 0; back--) allDays.push(localDay(addDays(today, -back)));
   let days = allDays.slice(1), statDays = allDays.slice(0, -1);
   const rangeStart = dayToDate(days[0]); rangeStart.setHours(0, 0, 0, 0);
-  const prevStart = addDays(rangeStart, -range);
+  // The period before is just as long: it ends `range` days ago at this time of day, so a partial today compares with a partial day
+  const prevStart = addDays(rangeStart, -range), prevEnd = addDays(today, -range);
   // When monitoring began within the period, charts start at the first report (at least two days)
   const firstDay = [...[...data.statistics].filter(([, rows]) => rows.length).map(([day]) => day),
     ...[...data.errors.values()].flat().map(r => localDay(new Date(r.OccurredAt || r.Timestamp)))].sort()[0];
@@ -442,28 +490,34 @@ function buildModel(range, filters) {
   }
   const start = rangeStart;
   const earlierData = !!firstDay && firstDay <= localDay(prevStart);
-  // Devices send a day's statistics during the next day: yesterday is still arriving
-  const provisional = statDays.slice(-1).filter(d => d === localDay(addDays(today, -1)));
+  // Devices send a day's statistics when they next run: the last 3 days (laptops off over a weekend) are still arriving
+  const provisional = statDays.filter(d => d >= localDay(addDays(today, -3)));
+  const allStats = [...data.statistics.values()].flat(), allRows = allStats.concat(...data.errors.values());
+  upnOf.clear();
+  for (const r of allRows) if (r.User && r.WindowsUser) upnOf.set(upnKey(r), r.User);
+  // Install rows carry no tenant, nor do errors before sign-in: a device's tenants come from its other rows
+  const tenantsOf = new Map();
+  for (const r of allRows) if (r.TenantId) { const key = deviceOf(r); if (!tenantsOf.has(key)) tenantsOf.set(key, new Set()); tenantsOf.get(key).add(r.TenantId); }
   const text = filters.text.trim().toLowerCase();
-  const pass = r => (!filters.tenant || r.TenantId === filters.tenant) && (!filters.version || r.Version === filters.version)
+  const pass = r => (!filters.tenant || (r.TenantId ? r.TenantId === filters.tenant : !!tenantsOf.get(deviceOf(r))?.has(filters.tenant)))
+    && (!filters.version || r.Version === filters.version)
     && (!text || [r.DeviceName, r.User, r.WindowsUser, r.Users, r.Version, r.Message, r.Source].some(v => v && String(v).toLowerCase().includes(text)));
 
-  upnOf.clear();
-  for (const r of [...data.statistics.values()].flat().concat(...data.errors.values())) if (r.User && r.WindowsUser) upnOf.set(r.WindowsUser, r.User);
-  const stats = [...data.statistics.values()].flat().filter(r => r.PartitionKey >= statDays[0] && r.PartitionKey <= statDays[statDays.length - 1] && pass(r));
+  const stats = allStats.filter(r => r.PartitionKey >= statDays[0] && r.PartitionKey <= statDays[statDays.length - 1] && pass(r));
+  const duplicates = statDays.reduce((t, d) => t + (data.statistics.get(d)?.dropped || 0), 0);
   const allEvents = [...data.errors.values()].flat().map(r => ({ ...r, at: new Date(r.OccurredAt || r.Timestamp) })).filter(pass);
   // Throttling episodes (agents from 0.4.1) share the errors table but aren't errors
   const allErrors = allEvents.filter(r => r.Source !== "throttled");
   const episodes = allEvents.filter(r => r.Source === "throttled" && r.at >= rangeStart).map(r => ({ ...r, until: new Date(r.ThrottledUntil || r.at) })).sort((a, b) => b.at - a.at);
   const errors = allErrors.filter(r => r.at >= start).sort((a, b) => b.at - a.at);
-  const previousErrors = allErrors.filter(r => r.at >= prevStart && r.at < start);
+  const previousErrors = allErrors.filter(r => r.at >= prevStart && r.at < prevEnd);
   const installs = data.devices.map(r => ({ ...r, at: new Date(r.OccurredAt || r.Timestamp) })).filter(pass).sort((a, b) => b.at - a.at);
 
-  const perDay = Object.fromEntries(allDays.map(d => [d, { graph: 0, sp: 0, ru: 0, rx: 0, tx: 0, throttled: 0, throttledSec: 0, budgetUser: 0, budgetBackground: 0, budgetUnsplit: 0, minutes: 0, users: new Set(), devices: new Set(), errors: {} }]));
+  const perDay = Object.fromEntries(allDays.map(d => [d, { graph: 0, sp: 0, ru: 0, rx: 0, tx: 0, throttled: 0, throttledSec: 0, budgetUser: 0, budgetBackground: 0, budgetUnsplit: 0, minutes: 0, counted: 0, users: new Set(), devices: new Set(), errors: {} }]));
   const devices = new Map(), users = new Map();
   const device = r => {
     const key = deviceOf(r);
-    if (!devices.has(key)) devices.set(key, { id: key, name: r.DeviceName || r["DeviceId"], entra: r.EntraDeviceId || "", machineIds: new Set(), users: new Set(), version: "", versionDay: "", lastSeen: null, errors: 0, crashes: 0, ru: 0, requests: 0, rx: 0, tx: 0, throttled: 0, budgetUser: 0, budgetBackground: 0, budgetUnsplit: 0, minutes: 0, days: new Set(), install: null });
+    if (!devices.has(key)) devices.set(key, { id: key, name: r.DeviceName || r["DeviceId"] || key, entra: r.EntraDeviceId || "", machineIds: new Set(), users: new Set(), version: "", versionDay: "", lastSeen: null, errors: 0, crashes: 0, ru: 0, requests: 0, rx: 0, tx: 0, throttled: 0, budgetUser: 0, budgetBackground: 0, budgetUnsplit: 0, minutes: 0, days: new Set(), install: null });
     const d = devices.get(key); if (r.DeviceName) d.name = r.DeviceName; if (r.EntraDeviceId) d.entra = r.EntraDeviceId; if (r["DeviceId"]) d.machineIds.add(r["DeviceId"]); return d;
   };
   const user = r => {
@@ -480,13 +534,13 @@ function buildModel(range, filters) {
     const wait = { budgetUser: num(r.BudgetWaitForegroundSeconds), budgetBackground: num(r.BudgetWaitBackgroundSeconds) };
     wait.budgetUnsplit = Math.max(0, num(r.BudgetWaitSeconds) - wait.budgetUser - wait.budgetBackground);
     for (const [key, value] of Object.entries(wait)) p[key] += value;
-    p.minutes += num(r.MinutesRunning); p.users.add(userOf(r)); p.devices.add(deviceOf(r));
+    p.minutes += num(r.MinutesRunning); p.counted += num(r.Errors); p.users.add(userOf(r)); p.devices.add(deviceOf(r));
     const reported = r.Timestamp ? new Date(r.Timestamp) : new Date(r.PartitionKey + "T23:59:59");
     const d = device(r), u = user(r);
     for (const x of [d, u]) { x.ru += ru; x.requests += graph + sp; x.rx += rx; x.tx += tx; x.throttled += num(r.Throttled); x.minutes += num(r.MinutesRunning); x.days.add(r.PartitionKey); seen(x, reported); for (const [key, value] of Object.entries(wait)) x[key] += value; }
     d.users.add(userOf(r)); u.devices.add(deviceOf(r));
     // The latest day's version; a host reporting two versions that day (rolled out meanwhile) counts as the newer one
-    if (r.PartitionKey > d.versionDay || (r.PartitionKey === d.versionDay && semverCompare(r.Version, d.version) > 0)) { d.version = r.Version; d.versionDay = r.PartitionKey; }
+    if (r.Version && (r.PartitionKey > d.versionDay || (r.PartitionKey === d.versionDay && semverCompare(r.Version, d.version) > 0))) { d.version = r.Version; d.versionDay = r.PartitionKey; }
   }
   for (const r of errors) {
     const day = localDay(r.at), p = perDay[day], source = r.Source || "other";
@@ -494,17 +548,19 @@ function buildModel(range, filters) {
     const d = device(r), u = user(r);
     d.errors++; u.errors++; if (source === "crash") d.crashes++;
     d.users.add(userOf(r)); u.devices.add(deviceOf(r)); seen(d, r.at); seen(u, r.at);
-    if (!d.version || localDay(r.at) > d.versionDay || (localDay(r.at) === d.versionDay && semverCompare(r.Version, d.version) > 0)) { d.version = r.Version; d.versionDay = localDay(r.at); }
+    if (r.Version && (!d.version || localDay(r.at) > d.versionDay || (localDay(r.at) === d.versionDay && semverCompare(r.Version, d.version) > 0))) { d.version = r.Version; d.versionDay = localDay(r.at); }
   }
   for (const r of installs) {
     const d = device(r);
     if (!d.install || r.at > d.install.at) d.install = r;
-    if (r.Action !== "uninstall" && (!d.version || localDay(r.at) > d.versionDay)) { d.version = r.Version; d.versionDay = localDay(r.at); }
+    if (r.Action !== "uninstall" && r.Version && (!d.version || localDay(r.at) > d.versionDay)) { d.version = r.Version; d.versionDay = localDay(r.at); }
   }
 
-  const versions = [...new Set([...devices.values()].map(d => d.version).filter(Boolean))].sort(semverCompare).reverse();
+  // Versions count devices seen or installed in this period, not ones gone for months
+  const current = [...devices.values()].filter(d => d.version && d.install?.Action !== "uninstall" && (d.lastSeen || d.install?.at >= start));
+  const versions = [...new Set(current.map(d => d.version))].sort(semverCompare).reverse();
   const latest = versions[0] || "";
-  const versionCounts = versions.map(v => ({ version: v, devices: [...devices.values()].filter(d => d.version === v && d.install?.Action !== "uninstall").length }));
+  const versionCounts = versions.map(v => ({ version: v, devices: current.filter(d => d.version === v).length }));
 
   const groups = new Map();
   for (const r of errors) {
@@ -517,18 +573,33 @@ function buildModel(range, filters) {
   const activeDevices = new Set([...stats.map(r => deviceOf(r)), ...errors.map(r => deviceOf(r))]);
   const activeUsers = new Set([...stats.map(userOf), ...errors.map(userOf)]);
   const userDays = stats.length;
-  const statsWithoutUpn = stats.filter(r => !r.User && !upnOf.get(r.WindowsUser)).length;
+  // People a day, over the days that are complete (or all days when none is yet)
+  const complete = statDays.filter(d => perDay[d].users.size && !provisional.includes(d)), averaged = complete.length ? complete : statDays.filter(d => perDay[d].users.size);
+  const usersPerDay = averaged.length ? averaged.reduce((t, d) => t + perDay[d].users.size, 0) / averaged.length : 0;
+  const statsWithoutUpn = stats.filter(r => !r.User && !upnOf.get(upnKey(r))).length;
   const throttledUserDays = stats.filter(r => num(r.Throttled) > 0).sort((a, b) => b.PartitionKey.localeCompare(a.PartitionKey) || num(b.Throttled) - num(a.Throttled));
+  // Statistics end yesterday, so today's throttling comes from the episodes alone
+  const laterEpisodes = episodes.filter(r => localDay(r.at) > statDays[statDays.length - 1]);
+  const throttledBy = new Map();
+  for (const [r, n] of [...throttledUserDays.map(r => [r, num(r.Throttled)]), ...laterEpisodes.map(r => [r, num(r.Responses)])]) throttledBy.set(userOf(r), (throttledBy.get(userOf(r)) || 0) + n);
+  const throttling = {
+    responses: sum(p => p.throttled) + laterEpisodes.reduce((t, r) => t + num(r.Responses), 0),
+    users: [...throttledBy].sort((a, b) => b[1] - a[1]),
+    days: new Set([...statDays.filter(d => perDay[d].throttled > 0), ...episodes.map(r => localDay(r.at))]).size,
+    // How long requests were held back, from the episodes; null when agents before 0.4.1 (no episodes) were throttled too
+    held: episodes.length && !throttledUserDays.some(r => semverCompare(r.Version, "0.4.1") < 0) ? episodes.reduce((t, r) => t + num(r.HeldSeconds), 0) : null,
+  };
   const sourceTotals = {};
   for (const r of errors) sourceTotals[r.Source || "other"] = (sourceTotals[r.Source || "other"] || 0) + 1;
-  const tenants = [...new Set([...data.statistics.values()].flat().concat(...data.errors.values(), data.devices).map(r => r.TenantId).filter(Boolean))];
-  const allVersions = [...new Set([...data.statistics.values()].flat().concat(...data.errors.values(), data.devices).map(r => r.Version).filter(Boolean))].sort(semverCompare).reverse();
+  const tenants = [...new Set(allRows.map(r => r.TenantId).filter(Boolean))];
+  const allVersions = [...new Set(allRows.concat(data.devices).map(r => r.Version).filter(Boolean))].sort(semverCompare).reverse();
 
   return {
-    range, days, statDays, perDay, start, firstDay, earlierData, provisional, statsWithoutUpn, episodes, throttledUserDays, devices: [...devices.values()], users: [...users.values()], errors, previousErrors, installs, groups: [...groups.values()].sort((a, b) => b.rows.length - a.rows.length),
+    range, days, statDays, perDay, start, firstDay, earlierData, provisional, statsWithoutUpn, duplicates, episodes, throttledUserDays, throttling, usersPerDay,
+    devices: [...devices.values()], current, users: [...users.values()], errors, previousErrors, installs, groups: [...groups.values()].sort((a, b) => b.rows.length - a.rows.length),
     versions: versionCounts, latest, tenants, allVersions, sourceTotals,
     totals: {
-      devices: activeDevices.size, users: activeUsers.size, userDays, errors: errors.length, previousErrors: previousErrors.length,
+      devices: activeDevices.size, users: activeUsers.size, userDays, errors: errors.length, previousErrors: previousErrors.length, counted: sum(p => p.counted),
       crashes: errors.filter(r => r.Source === "crash").length,
       graph: sum(p => p.graph), sp: sum(p => p.sp), ru: sum(p => p.ru), rx: sum(p => p.rx), tx: sum(p => p.tx),
       throttled: sum(p => p.throttled), throttledSec: sum(p => p.throttledSec), budgetUser: sum(p => p.budgetUser), budgetBackground: sum(p => p.budgetBackground), budgetUnsplit: sum(p => p.budgetUnsplit), minutes: sum(p => p.minutes),
@@ -545,7 +616,8 @@ function mostly(rows) {
   return count * 2 >= rows.length ? ` Mostly ${who} (${count}).` : "";
 }
 /* Plain words for messages that need explaining */
-function hintFor(message) {
+function hintFor(message, source) {
+  if (source === "delete") return " Microsoft 365 refused to delete these files (often a retention policy, a lock or missing rights); they are back in their folders.";
   return /cancel+ed authentication|authentication_canceled/i.test(message || "")
     ? " A sign-in window was closed without signing in; often an admin or service account that doesn't use the drive."
     : "";
@@ -571,27 +643,30 @@ function insights(m, c) {
     const top = Object.entries(recent.reduce((t, r) => (t[r.Source || "other"] = (t[r.Source || "other"] || 0) + 1, t), {})).sort((a, b) => b[1] - a[1])[0];
     out.push({ level: "warning", label: "Last 24 hours", text: `${recent.length} error(s) on ${new Set(recent.map(r => deviceOf(r))).size} device(s); most: ${top[0]} (${top[1]}).`, action: () => showTab("errors") });
   }
-  for (const [source, label] of [["sign-in", "Sign-in problems"], ["start", "Drive didn't start"], ["drive letter", "Drive letter"], ["upload", "Uploads waiting"], ["conflict copy", "Conflict copies"]]) {
+  for (const [source, label] of [["sign-in", "Sign-in problems"], ["start", "Drive didn't start"], ["drive letter", "Drive letter"], ["upload", "Uploads waiting"], ["delete", "Deletes refused"], ["conflict copy", "Conflict copies"]]) {
     const rows = m.errors.filter(r => r.Source === source);
-    if (rows.length) out.push({ level: source === "conflict copy" ? "info" : "warning", label, text: `${rows.length} report(s) from ${new Set(rows.map(r => deviceOf(r))).size} device(s).${mostly(rows)} Latest: ${clip(rows[0].Message, 160)}${hintFor(rows[0].Message)}`, action: () => openGroupBySource(source) });
+    if (rows.length) out.push({ level: source === "conflict copy" ? "info" : "warning", label, text: `${rows.length} report(s) from ${new Set(rows.map(r => deviceOf(r))).size} device(s).${mostly(rows)} Latest: ${clip(rows[0].Message, 160)}${hintFor(rows[0].Message, source)}`, action: () => openGroupBySource(source) });
   }
   const unnamed = m.statsWithoutUpn;
   if (unnamed) out.push({ level: "info", label: "Data", text: `${unnamed} user-day(s) of statistics came without the signed-in account (agents before 0.4.1 sent them before the first sign-in of the day); they show by Windows account.` });
-  const throttledDays = m.statDays.filter(d => m.perDay[d].throttled > 0);
-  if (throttledDays.length || m.episodes.length) {
-    const byUser = Object.entries(m.throttledUserDays.reduce((t, r) => (t[userOf(r)] = (t[userOf(r)] || 0) + num(r.Throttled), t), {})).sort((a, b) => b[1] - a[1]);
-    const most = byUser.slice(0, 3).map(([who, count]) => `${who} (${fmtInt(count)})`).join(", ");
-    out.push({ level: "warning", label: "Throttling", text: `Microsoft throttled VFS365 on ${throttledDays.length} day(s) for ${byUser.length} user(s): ${fmtInt(m.totals.throttled)} response(s), ${duration(m.totals.throttledSec)} waited${most ? `; most: ${most}` : ""}. Lower ApiBudgetPerMinute or spread sign-ins if this repeats.`, action: () => showTab("throttling") });
+  const th = m.throttling;
+  if (th.responses || m.episodes.length) {
+    const most = th.users.slice(0, 3).map(([who, count]) => `${who} (${fmtInt(count)})`).join(", ");
+    const time = th.held != null ? `requests held back ${duration(th.held)} in all` : `waits adding up to ${duration(m.totals.throttledSec)} (added up over responses)`;
+    out.push({ level: "warning", label: "Throttling", text: `Microsoft throttled VFS365 on ${th.days} day(s) for ${th.users.length} user(s): ${fmtInt(th.responses)} response(s), ${time}${most ? `; most: ${most}` : ""}. Lower ApiBudgetPerMinute or spread sign-ins if this repeats.`, action: () => showTab("throttling") });
   }
   const waitedUsers = m.users.filter(u => u.budgetUser > 0).length;
   if (m.totals.budgetUser > 0) out.push({ level: m.totals.budgetUser >= 60 ? "warning" : "info", label: "Users waited", text: `Opening and saving files waited ${duration(m.totals.budgetUser)} for the per-user API budget (ApiBudgetPerMinute), for ${waitedUsers} user(s). When Microsoft isn't throttling, a higher budget removes this.`, action: () => showTab("users") });
   if (m.totals.budgetBackground > 60) out.push({ level: "info", label: "Background pacing", text: `Background work (discovery after sign-in, change checks, loading ahead) waited ${duration(m.totals.budgetBackground)} for the API budget. Users don't wait for this; it spreads VFS365's calls over time.` });
-  const outdated = m.devices.filter(d => d.version && m.latest && semverCompare(d.version, m.latest) < 0 && d.install?.Action !== "uninstall");
-  if (outdated.length) out.push({ level: "info", label: "Versions", text: `${outdated.length} device(s) run a version older than ${m.latest}.`, action: () => showTab("devices") });
-  const silent = m.devices.filter(d => d.install && d.install.Action !== "uninstall" && (!d.lastSeen || Date.now() - d.lastSeen > 3 * 86400000));
-  if (silent.length) out.push({ level: "info", label: "Not seen", text: `${silent.length} installed device(s) sent nothing for 3 days or more (switched off, or VFS365 not starting).`, action: () => showTab("devices") });
+  const outdated = m.current.filter(d => m.latest && semverCompare(d.version, m.latest) < 0);
+  if (outdated.length) out.push({ level: "info", label: "Versions", text: `${outdated.length} device(s) seen in this period run a version older than ${m.latest}.`, action: () => showTab("devices") });
+  // Devices that reported or were installed in this period, then went quiet; the 2-day period is too short to tell
+  const quiet = 3 * 86400000, now = Date.now();
+  const silent = m.range < 7 ? [] : m.devices.filter(d => d.install?.Action !== "uninstall" && (d.lastSeen ? now - d.lastSeen > quiet : d.install && d.install.at >= m.start && now - d.install.at > quiet));
+  if (silent.length) out.push({ level: "info", label: "Not seen", text: `${silent.length} device(s) that reported or were installed in this period sent nothing for 3 days or more (switched off, or VFS365 not starting).`, action: () => showTab("devices") });
   if (!data.sample) for (const f of sasFindings(c)) if (f.level !== "info") out.push({ level: f.level, label: "SAS", text: f.text });
-  if (pagingHidden) out.push({ level: "warning", label: "Incomplete", text: "A day has more than 1000 rows, and the browser can't see where the next rows start: set Exposed headers to * in the storage account's CORS rule for the Table service. Until then, rows after the first 1000 of such a day are missing." });
+  if (data.pagingHidden) out.push({ level: "warning", label: "Incomplete", text: "The browser can't read the storage account's response headers, so it can't tell when Azure splits a day's rows over several answers (after 1000 rows, sometimes sooner): rows may be missing. In the storage account's CORS rule for the Table service, set Exposed headers to *." });
+  if (m.duplicates) out.push({ level: "info", label: "Data", text: `${fmtInt(m.duplicates)} statistics row(s) for a day, device and Windows user that already had one were left out; the newest counts. Agents send a day again when its answer was lost, and anyone with the agents' SAS can add rows.` });
   if (data.missing.size) out.push({ level: "info", label: "Tables", text: `No table yet for ${[...data.missing].join(", ")}: nothing was reported there, or the tables weren't created (errors, statistics, devices).` });
   if (!out.some(i => i.level === "critical" || i.level === "warning")) out.unshift({ level: "good", label: "All clear", text: "No crashes, throttling or recent errors in this period." });
   return out;
@@ -686,8 +761,8 @@ function timeChart(host, { days, series, type, format, kind, alwaysLegend, provi
     const rect = svg.getBoundingClientRect(), px = (e.clientX - rect.left) * (width / rect.width);
     const i = Math.max(0, Math.min(days.length - 1, Math.floor((px - left) / band)));
     cross.setAttribute("x1", xc(i)); cross.setAttribute("x2", xc(i)); cross.setAttribute("visibility", "visible");
-    // With many series (error sources) only the ones that occurred that day
-    const shown = series.filter(sr => series.length <= 2 || sr.values[i] > 0);
+    // With many series (error sources) only the ones that occurred that day; "other" lists its sources
+    const shown = series.flatMap(sr => sr.parts ? sr.parts.map(p => ({ ...p, color: sr.color })) : [sr]).filter(sr => series.length <= 2 || sr.values[i] > 0);
     showTip(e, longDay(days[i]) + (provisional.includes(days[i]) ? " (still arriving)" : ""), shown.length ? shown.map(sr => ({ label: sr.label, value: format(sr.values[i]), color: css(sr.color), line: type === "lines" })) : [{ label: "none", value: "", color: "transparent" }]);
   });
   hit.addEventListener("pointerleave", () => { cross.setAttribute("visibility", "hidden"); hideTip(); });
@@ -723,34 +798,49 @@ function sparkline(values) {
   svg.append(s("circle", { cx: x(values.length - 1), cy: y(values[values.length - 1]), r: 2.5, fill: css("--s1") }));
   return svg;
 }
-/* A chart card with a Chart / Table switch: every value stays reachable without hovering */
+/* A chart card with a Chart / Table switch: every value stays reachable without hovering. The choice survives refreshes (ui.asTable). */
 function chartCard(title, subtitle, draw, tableRows, columns, note) {
-  const body = h("div");
-  let asTable = false;
-  const toggle = h("button", { class: "btn small", "aria-pressed": "false", onclick: () => { asTable = !asTable; toggle.textContent = asTable ? "Chart" : "Table"; render(); } }, "Table");
-  const render = () => asTable ? body.replaceChildren(h("div", { class: "table-scroll" }, dataTable(columns, tableRows(), { limit: 400 }))) : draw(body);
-  const card = h("section", { class: "card" }, h("div", { class: "card-head" }, h("div", {}, h("h2", {}, title), subtitle ? h("div", { class: "sub" }, subtitle) : null), toggle), body,
-    note ? h("details", { class: "note" }, h("summary", {}, "How to read this"), note) : null);
-  chartRenders.push(() => { if (!asTable) draw(body); });
-  requestAnimationFrame(render);
+  const body = h("div"), asTable = () => ui.asTable.has(title);
+  const views = [["chart", "Chart"], ["table", "Table"]].map(([key, label]) => h("button", { "data-key": `view:${title}:${key}`, "aria-pressed": String(asTable() === (key === "table")),
+    onclick: () => { key === "table" ? ui.asTable.add(title) : ui.asTable.delete(title); views.forEach((b, i) => b.setAttribute("aria-pressed", String(asTable() === (i === 1)))); paint(); } }, label));
+  const paint = () => asTable() ? body.replaceChildren(h("div", { class: "table-scroll" }, dataTable(columns, tableRows(), { limit: 400, id: "chart:" + title }))) : draw(body);
+  const card = h("section", { class: "card" }, h("div", { class: "card-head" }, h("div", {}, h("h2", {}, title), subtitle ? h("div", { class: "sub" }, subtitle) : null),
+    h("div", { class: "seg small", role: "group", "aria-label": `${title}: show as` }, views)), body,
+    note ? h("details", { class: "note", open: ui.notesOpen.has(title), ontoggle: e => e.target.open ? ui.notesOpen.add(title) : ui.notesOpen.delete(title) }, h("summary", {}, "How to read this"), note) : null);
+  chartRenders.push(() => { if (!asTable()) draw(body); });
+  requestAnimationFrame(paint);
   return card;
 }
 let chartRenders = [];
+/* Charts in the drawer, drawn again on a theme change or resize while they are shown */
+const drawerCharts = [];
+function drawerChart(body, paint) { drawerCharts.push(() => { if (body.isConnected) paint(); }); requestAnimationFrame(paint); }
 
 /* ---------- Tables ---------- */
-function dataTable(columns, rows, { onClick, limit = 50, sort } = {}) {
-  let sortCol = sort ? columns.findIndex(c => c.label === sort.label) : -1, dir = sort?.dir || -1, shown = limit;
+/* A sortable table; with an `id`, its sort order and "Show more" survive refreshes (ui.tables). With onClick, a row opens its
+   details: by mouse anywhere on the row, by keyboard through the button in its first cell. */
+function dataTable(columns, rows, { onClick, limit = 50, sort, id } = {}) {
+  const fresh = { sort: sort?.label, dir: sort?.dir || -1, shown: limit };
+  const state = id ? (ui.tables[id] ??= fresh) : fresh;
   const table = h("table", { class: "data" });
   const draw = () => {
+    const sortCol = columns.findIndex(c => c.label === state.sort), dir = state.dir;
     const sorted = sortCol < 0 ? rows : [...rows].sort((a, b) => {
       const c = columns[sortCol], va = c.sort ? c.sort(a) : c.value(a), vb = c.sort ? c.sort(b) : c.value(b);
       return (va > vb ? 1 : va < vb ? -1 : 0) * dir;
     });
-    const head = h("tr", {}, columns.map((c, i) => h("th", { class: (c.num ? "num " : "") + "sortable" + (c.narrow ? " hide-narrow" : ""), title: "Sort", onclick: () => { dir = sortCol === i ? -dir : -1; sortCol = i; draw(); } },
-      c.label, sortCol === i ? (dir > 0 ? " ▲" : " ▼") : "")));
-    const body = sorted.slice(0, shown).map(r => h("tr", { class: onClick ? "click" : "", onclick: onClick ? () => onClick(r) : null },
-      columns.map(c => h("td", { class: (c.num ? "num" : c.wrap ? "msg" : "") + (c.narrow ? " hide-narrow" : "") }, c.render ? c.render(r) : c.value(r)))));
-    const more = sorted.length > shown ? h("tr", {}, h("td", { colspan: columns.length }, h("button", { class: "btn small more", onclick: () => { shown += 200; draw(); } }, `Show more (${fmtInt(sorted.length - shown)} left)`))) : null;
+    const head = h("tr", {}, columns.map((c, i) => h("th", { class: (c.num ? "num" : "") + (c.narrow ? " hide-narrow" : ""), scope: "col", "aria-sort": sortCol === i ? (dir > 0 ? "ascending" : "descending") : null },
+      h("button", { class: "sort", title: "Sort", "data-key": id ? `${id}:sort:${c.label}` : null, onclick: () => { state.dir = sortCol === i ? -dir : -1; state.sort = c.label; draw(); table.querySelectorAll("th button")[i].focus(); } },
+        c.label, sortCol === i ? h("span", { "aria-hidden": "true" }, dir > 0 ? " ▲" : " ▼") : ""))));
+    const body = sorted.slice(0, state.shown).map((r, k) => h("tr", { class: onClick ? "click" : "", onclick: onClick ? () => onClick(r) : null },
+      columns.map((c, i) => {
+        const content = c.render ? c.render(r) : c.value(r);
+        return h("td", { class: (c.num ? "num" : c.wrap ? "msg" : "") + (c.narrow ? " hide-narrow" : "") },
+          onClick && i === 0 ? h("button", { class: "open", title: "Show details", "data-key": id ? `${id}:row:${k}` : null }, content) : content);
+      })));
+    const more = sorted.length > state.shown ? h("tr", {}, h("td", { colspan: columns.length }, h("button", { class: "btn small more", "data-key": id ? `${id}:more` : null,
+      onclick: () => { const from = state.shown; state.shown += 200; draw(); (table.querySelectorAll("tbody tr")[from]?.querySelector("button") || table.querySelector(".more"))?.focus(); } },
+      `Show more (${fmtInt(sorted.length - state.shown)} left)`))) : null;
     table.replaceChildren(h("thead", {}, head), h("tbody", {}, body, more));
     if (!rows.length) table.querySelector("tbody").append(h("tr", {}, h("td", { colspan: columns.length, class: "empty" }, "Nothing in this period")));
   };
@@ -758,11 +848,17 @@ function dataTable(columns, rows, { onClick, limit = 50, sort } = {}) {
   return table;
 }
 const versionBadge = (v, latest) => v ? h("span", { class: "badge", title: latest && semverCompare(v, latest) < 0 ? `Older than ${latest}` : "" }, v + (latest && semverCompare(v, latest) < 0 ? " · older" : "")) : "";
-function sourceDot(source) { return h("span", {}, h("span", { class: "dot", style: `background:${css(SOURCE_COLOR[source] || "--other")}` }), source); }
+function sourceDot(source) { return h("span", { class: "src" }, h("span",{ class: "dot", style: `background:${css(SOURCE_COLOR[source] || "--other")}` }), source); }
 
 /* ---------- Page ---------- */
-const ui = { range: Number(store.get("range")) || 30, tab: "devices", filters: { tenant: "", version: "", text: "" }, conn: null, model: null, errorView: "groups", throttleView: "episodes" };
-let refreshTimer = null, nextRefreshAt = null, loading = false;
+/* view: what main shows (connect, loading, problem or dashboard). tables, asTable and notesOpen keep table and chart choices across refreshes. */
+const ui = { range: Number(store.get("range")) || 30, tab: "devices", filters: { tenant: "", version: "", text: "" }, conn: null, model: null, errorView: "groups", throttleView: "episodes",
+  view: "connect", tables: {}, asTable: new Set(), notesOpen: new Set() };
+let refreshTimer = null, nextRefreshAt = null;
+/* The load in progress, a generation number that drops the result of a load superseded meanwhile, and a reload asked for during it */
+let current = null, generation = 0, queued = null, progressText = "";
+/* The days the data covers: a wider period chosen during a load shows once its own load has read them */
+const shownRange = () => data.sample || !data.range ? ui.range : Math.min(ui.range, data.range);
 
 function statusLine(c) {
   const line = $("statusLine");
@@ -787,52 +883,79 @@ setInterval(() => {
   const last = $("lastRefresh"); if (last && data.loadedAt) last.textContent = `Read ${ago(data.loadedAt)}`;
 }, 15000);
 
+function showProgress(text) {
+  progressText = text;
+  let line = $("progress");
+  if (!line) { line = h("div", { class: "progress", id: "progress", role: "status" }); $("main").prepend(line); }
+  line.textContent = text;
+}
 async function refresh(isRefresh) {
-  if (!ui.conn || loading) return;
+  if (!ui.conn) return;
   if (data.sample) { render(); return; }
-  loading = true;
+  // One load at a time; a refresh asked for meanwhile runs when it ends (a full one when any asked for that)
+  if (current) { queued = { isRefresh: isRefresh && (queued?.isRefresh ?? true) }; return; }
+  const gen = ++generation, controller = new AbortController(), conn = ui.conn, range = ui.range;
+  current = controller;
+  clearTimeout(refreshTimer); nextRefreshAt = null;
   const main = $("main");
   main.classList.add("loading");
-  let progress = $("progress");
-  if (!progress) { progress = h("div", { class: "progress", id: "progress" }, "Reading tables..."); main.prepend(progress); }
+  showProgress("Reading tables...");
   try {
-    const blocking = sasFindings(ui.conn).filter(f => f.level === "critical");
+    const blocking = sasFindings(conn).filter(f => f.level === "critical");
     if (blocking.length) throw new Problem("This SAS can't work", blocking.map(f => f.text).concat([Fix.sas]));
-    await loadAll(ui.conn, ui.range, isRefresh, text => { progress.textContent = `Reading tables... ${text}`; });
-    render();
+    const next = await loadAll(conn, range, isRefresh, text => { if (gen === generation) showProgress(`Reading tables... ${text}`); }, controller.signal);
+    if (gen !== generation) return;
+    Object.assign(data, next, { loadedAt: new Date() });
+    // A wider period chosen during this load is read first, so it never shows with this load's days
+    if (!(queued && ui.range > range)) render();
   } catch (e) {
-    showProblem(e);
+    controller.abort();
+    if (gen === generation) showProblem(e);
   } finally {
-    loading = false;
-    main.classList.remove("loading");
-    $("progress")?.remove();
-    scheduleRefresh();
-    statusLine(ui.conn);
+    if (gen === generation) {
+      current = null;
+      main.classList.remove("loading");
+      $("progress")?.remove();
+      const again = queued; queued = null;
+      if (again) refresh(again.isRefresh); else scheduleRefresh();
+      statusLine(ui.conn);
+    }
   }
+}
+/* Drops the load in progress: what it read never reaches `data` */
+function cancelLoad() {
+  current?.abort();
+  current = null; queued = null; generation++;
+  $("main").classList.remove("loading");
+  $("progress")?.remove();
 }
 
 function showProblem(e) {
   const problem = e instanceof Problem ? e : new Problem("Something went wrong", [String(e?.message || e)]);
   const findings = ui.conn && !data.sample ? sasFindings(ui.conn).filter(f => !problem.details.includes(f.text)) : [];
+  ui.view = "problem"; chartRenders = [];
   $("main").replaceChildren(h("div", { class: "panel" },
     h("section", { class: "card problem" + (problem.level === "warning" ? " warning" : "") },
       h("h2", {}, problem.title),
       problem.details.map(d => typeof d === "object" ? h("pre", { class: "cmd" }, d.cmd) : h("p", {}, d)),
       findings.length ? h("div", {}, h("p", {}, h("strong", {}, "About this SAS")), h("ul", {}, findings.map(f => h("li", {}, f.text)))) : null,
-      h("div", { class: "row" }, h("button", { class: "btn primary", onclick: () => refresh(false) }, "Try again"), h("button", { class: "btn", onclick: connectionPanel }, "Change connection"))),
+      h("div", { class: "row" }, h("button", { class: "btn primary", onclick: () => refresh(false) }, "Try again"), h("button", { class: "btn", onclick: changeConnection }, "Change connection"))),
     data.loadedAt ? h("p", { class: "footer" }, `The data shown before was read ${ago(data.loadedAt)}.`) : null));
 }
 
+const sampleConnection = () => ({ base: "", sas: "", params: {}, account: "sample", host: "sample", sample: true });
+function changeConnection() { cancelLoad(); data.sample = false; ui.conn = null; statusLine(null); connectionPanel(); }
 function connectionPanel() {
   clearTimeout(refreshTimer); nextRefreshAt = null;
-  const input = h("textarea", { id: "connInput", placeholder: "https://<account>.table.core.windows.net/?sv=...&ss=t&srt=co&sp=rl&se=...&sig=...\nor\nTableEndpoint=https://<account>.table.core.windows.net/;SharedAccessSignature=sv=...", spellcheck: "false", autocomplete: "off" });
-  input.value = store.get("connection") || "";
-  const remember = h("input", { type: "checkbox", id: "remember" }); remember.checked = !!store.get("connection");
+  ui.view = "connect"; chartRenders = [];
+  const input = h("textarea", { id: "connInput", placeholder: "https://<account>.table.core.windows.net/?sv=...&ss=t&srt=o&sp=r&se=...&sig=...\nor\nTableEndpoint=https://<account>.table.core.windows.net/;SharedAccessSignature=sv=...", spellcheck: "false", autocomplete: "off" });
+  input.value = saved.get() || "";
+  const remember = h("input", { type: "checkbox", id: "remember" }); remember.checked = !!saved.get();
   const errorBox = h("div");
   const connect = () => {
     try {
       const c = parseConnection(input.value);
-      store.set("connection", remember.checked ? input.value.trim() : null);
+      saved.set(remember.checked ? input.value.trim() : null);
       startWith(c);
     } catch (e) {
       errorBox.replaceChildren(h("section", { class: "card problem", style: "margin-top:12px" }, h("h2", {}, e.title || "Not a valid connection"), (e.details || [e.message]).map(d => h("p", {}, d))));
@@ -845,39 +968,49 @@ function connectionPanel() {
       h("label", { for: "connInput" }, h("strong", {}, "Table service SAS URL or SAS connection string")),
       input,
       h("div", { class: "row" },
-        h("label", {}, remember, " Remember on this computer (stored in this browser; anyone using it can read the data)"),
+        h("label", {}, remember, fromDisk ? " Keep while this tab is open" : " Remember on this computer (stored in this browser; anyone using it can read the data)"),
         h("div", { class: "spacer" }),
-        h("button", { class: "btn", onclick: () => { data.sample = true; makeSample(); startWith({ base: "", sas: "", params: {}, account: "sample", host: "sample" }); } }, "Show sample data"),
+        h("button", { class: "btn", onclick: () => { cancelLoad(); makeSample(); startWith(sampleConnection()); } }, "Show sample data"),
         h("button", { class: "btn primary", onclick: connect }, "Connect")),
+      fromDisk ? h("p", { class: "sub" }, "This page is opened from disk. In this browser every page opened from disk can read what such a page stores, so the SAS is kept for this tab only, never on the computer. To remember it, host the page on https (any web server or static website)."
+        + (ui.forgotSaved ? " A SAS that an earlier version of this page stored was removed." : "")) : null,
       errorBox),
     h("section", { class: "card", style: "margin-top:12px" },
       h("h2", {}, "What the SAS needs"),
       h("ul", {},
-        h("li", {}, "Allowed services: Table. Allowed resource types: Container and Object. Allowed permissions: Read and List (nothing else; the agents use their own SAS with Add)."),
+        h("li", {}, "Allowed services: Table. Allowed resource types: Object. Allowed permissions: Read. Nothing else: the page only reads rows (no List, no Service or Container), and the agents use their own SAS with Add."),
         h("li", {}, "HTTPS only, and an expiry date. The page warns three days before it expires."),
         h("li", {}, "Azure portal: Storage account > Security + networking > Shared access signature > Generate, then copy the Table service SAS URL.")),
       h("h2", { style: "margin-top:12px" }, "What the storage account needs (CORS)"),
-      h("p", {}, "Browsers only let a page read storage that allows it. Under Settings > Resource sharing (CORS) > Table service, add: Allowed origins * (or the address this page is opened from), Allowed methods GET and OPTIONS, Allowed headers *, Exposed headers *, Max age 3600."),
-      h("p", { class: "sub" }, "Tip: open this page with #connect=<URL-encoded SAS URL> at the end of its address to connect right away; that address then holds the SAS, so keep it private."))));
+      h("p", {}, `Browsers only let a page read storage that allows it. Under Settings > Resource sharing (CORS) > Table service, add: ${corsOrigins()}, Allowed methods GET and OPTIONS, Allowed headers *, Exposed headers *, Max age 3600.`),
+      fromDisk ? h("p", { class: "sub" }, corsDisk) : null,
+      h("h2", { style: "margin-top:12px" }, "Good to know"),
+      h("ul", {},
+        h("li", {}, "Open this page with #connect=<URL-encoded SAS URL> at the end of its address to connect right away, for example on a wall screen. The page then removes it from the address bar, but the browser's history keeps that address with the SAS: use it only on a computer you control, or in a private window, and keep the link private."),
+        h("li", {}, "Rows are not signed: any device or person with the agents' Add SAS can write them, so a row shows what was reported, not proof of who sent it.")))));
   input.focus();
 }
 
 function startWith(c) {
-  ui.conn = c;
-  if (!data.sample) { data.statistics = new Map(); data.errors = new Map(); data.devices = []; data.from = {}; data.loadedAt = null; }
-  $("main").replaceChildren(h("div", { class: "progress", id: "progress" }, "Reading tables..."));
+  cancelLoad();
+  ui.conn = c; ui.view = "loading"; chartRenders = [];
+  if (!c.sample) Object.assign(data, { statistics: new Map(), errors: new Map(), devices: [], devicesAt: 0, range: 0, missing: new Set(), pagingHidden: false, loadedAt: null, sample: false });
+  $("main").replaceChildren();
+  showProgress("Reading tables...");
   statusLine(c);
   refresh(false);
 }
 
 function filterRow(m) {
   const ranges = [[2, "2 days"], [7, "7 days"], [30, "30 days"], [90, "90 days"]];
-  const seg = h("div", { class: "seg", role: "group", "aria-label": "Period" }, ranges.map(([d, label]) => h("button", { "aria-pressed": String(ui.range === d), onclick: () => { const wider = d > ui.range; ui.range = d; store.set("range", d); wider && !data.sample ? refresh(false) : render(); } }, label)));
-  const version = h("select", { "aria-label": "Version", onchange: e => { ui.filters.version = e.target.value; render(); } }, h("option", { value: "" }, "All versions"), m.allVersions.map(v => h("option", { value: v, selected: ui.filters.version === v }, v)));
-  const tenant = m.tenants.length > 1 ? h("select", { "aria-label": "Tenant", onchange: e => { ui.filters.tenant = e.target.value; render(); } }, h("option", { value: "" }, "All tenants"), m.tenants.map(t => h("option", { value: t, selected: ui.filters.tenant === t }, t))) : null;
-  const search = h("input", { type: "search", placeholder: "Device, user or text", value: ui.filters.text, "aria-label": "Search" });
-  let debounce; search.addEventListener("input", () => { clearTimeout(debounce); debounce = setTimeout(() => { ui.filters.text = search.value; render(); setTimeout(() => { const s2 = document.querySelector("input[type=search]"); s2?.focus(); s2?.setSelectionRange(s2.value.length, s2.value.length); }); }, 250); });
-  return h("div", { class: "filters" }, seg, version, tenant, search, ui.filters.text || ui.filters.version || ui.filters.tenant ? h("button", { class: "btn link", onclick: () => { ui.filters = { tenant: "", version: "", text: "" }; render(); } }, "Clear filters") : null);
+  // A wider period reads only the days it lacks; a narrower one shows from what was read
+  const seg = h("div", { class: "seg", role: "group", "aria-label": "Period" }, ranges.map(([d, label]) => h("button", { "aria-pressed": String(ui.range === d), "data-key": `range:${d}`,
+    onclick: () => { ui.range = d; store.set("range", d); d > data.range && !data.sample ? refresh(true) : render(); } }, label)));
+  const version = h("select", { "aria-label": "Version", "data-key": "version", onchange: e => { ui.filters.version = e.target.value; render(); } }, h("option", { value: "" }, "All versions"), m.allVersions.map(v => h("option", { value: v, selected: ui.filters.version === v }, v)));
+  const tenant = m.tenants.length > 1 ? h("select", { "aria-label": "Tenant", "data-key": "tenant", onchange: e => { ui.filters.tenant = e.target.value; render(); } }, h("option", { value: "" }, "All tenants"), m.tenants.map(t => h("option", { value: t, selected: ui.filters.tenant === t }, t))) : null;
+  const search = h("input", { type: "search", placeholder: "Device, user or text", value: ui.filters.text, "aria-label": "Search", "data-key": "search" });
+  let debounce; search.addEventListener("input", () => { clearTimeout(debounce); debounce = setTimeout(() => { ui.filters.text = search.value; render(); }, 250); });
+  return h("div", { class: "filters" }, seg, version, tenant, search, ui.filters.text || ui.filters.version || ui.filters.tenant ? h("button", { class: "btn link", "data-key": "clear", onclick: () => { ui.filters = { tenant: "", version: "", text: "" }; render(); } }, "Clear filters") : null);
 }
 
 function icon(level) {
@@ -893,36 +1026,47 @@ function icon(level) {
 function render() {
   if (!ui.conn) return;
   hideTip();
+  // A rebuild keeps focus (by data-key), the caret in the search box and the scroll position
+  const active = document.activeElement, focusKey = $("main").contains(active) ? active.dataset.key : null;
+  const caret = focusKey && active.matches("input") ? [active.selectionStart, active.selectionEnd] : null, scroll = scrollY;
   chartRenders = [];
-  const m = buildModel(ui.range, ui.filters);
+  ui.view = "dashboard";
+  const m = buildModel(shownRange(), ui.filters);
   ui.model = m;
-  const t = m.totals, perDay = d => m.perDay[d];
+  const t = m.totals, th = m.throttling, perDay = d => m.perDay[d];
   const errorsDelta = t.errors - t.previousErrors;
   const peakUsers = m.statDays.map(d => ({ day: d, size: perDay(d).users.size })).filter(p => p.size && !m.provisional.includes(p.day)).sort((a, b) => b.size - a.size)[0]
     ?? m.statDays.map(d => ({ day: d, size: perDay(d).users.size })).filter(p => p.size).sort((a, b) => b.size - a.size)[0];
   const kpi = (label, value, note, spark, title, action) => h("section", { class: action ? "card kpi click" : "card kpi", title: title || "", onclick: action, role: action ? "button" : null, tabindex: action ? "0" : null,
-    onkeydown: action ? e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); action(); } } : null },
+    "data-key": action ? `kpi:${label}` : null, onkeydown: action ? e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); action(); } } : null },
     h("div", { class: "label" }, label), h("div", { class: "value" }, value), h("div", { class: "note" }, note), spark ? sparkline(spark) : null);
+  const counted = t.counted ? `; agents counted ${compact(t.counted)} errors up to yesterday` : "";
   const kpis = h("div", { class: "grid kpis" },
     kpi("Devices", fmtInt(t.devices), t.installed ? `${fmtInt(t.installed)} installed` : "with data in this period", m.statDays.map(d => perDay(d).devices.size), "Devices that sent statistics or errors in this period"),
-    kpi("Users", fmtInt(t.users), peakUsers ? `${(t.userDays / Math.max(1, m.statDays.filter(d => perDay(d).users.size).length)).toFixed(1)} a day on average, most ${fmtInt(peakUsers.size)} on ${shortDay(peakUsers.day)}` : "", m.statDays.map(d => perDay(d).users.size)),
-    kpi("Errors", fmtInt(t.errors), m.earlierData
-      ? h("span", {}, h("span", { class: errorsDelta > 0 ? "delta-bad" : errorsDelta < 0 ? "delta-good" : "" }, `${errorsDelta > 0 ? "+" : ""}${fmtInt(errorsDelta)}`), ` vs the ${ui.range} days before${t.crashes ? `, ${t.crashes} crash(es)` : ""}`)
-      : `no earlier reports to compare${t.crashes ? `; ${t.crashes} crash(es)` : ""}`, m.days.map(d => Object.values(perDay(d).errors).reduce((a, b) => a + b, 0))),
+    kpi("Users", fmtInt(t.users), peakUsers ? `${m.usersPerDay.toFixed(1)} a day on average, most ${fmtInt(peakUsers.size)} on ${shortDay(peakUsers.day)}` : "", m.statDays.map(d => perDay(d).users.size), "People who used VFS365 in this period; the average leaves out days still arriving"),
+    kpi("Error reports", fmtInt(t.errors), m.earlierData
+      ? h("span", {}, h("span", { class: errorsDelta > 0 ? "delta-bad" : errorsDelta < 0 ? "delta-good" : "" }, `${errorsDelta > 0 ? "+" : ""}${fmtInt(errorsDelta)}`), ` vs the ${m.range} days before${t.crashes ? `, ${t.crashes} crash(es)` : ""}${counted}`)
+      : `no earlier reports to compare${t.crashes ? `; ${t.crashes} crash(es)` : ""}${counted}`, m.days.map(d => Object.values(perDay(d).errors).reduce((a, b) => a + b, 0)),
+      "Rows in the errors table: at most 20 an hour per user, and the same error once an hour. The daily statistics count every error."),
     kpi("API requests", compact(t.graph + t.sp), `${compact(t.ru)} resource units${t.userDays ? `, ${compact(t.ru / t.userDays)} per user-day` : ""}`, m.statDays.map(d => perDay(d).graph + perDay(d).sp), "Graph and SharePoint requests; Microsoft limits resource units per app per tenant"),
-    kpi("Throttled", fmtInt(t.throttled), t.throttled ? `${duration(t.throttledSec)} waited, ${fmtInt(new Set(m.throttledUserDays.map(userOf)).size)} user(s)` : "Microsoft didn't throttle", m.statDays.map(d => perDay(d).throttled), "429 and 503 answers from Microsoft 365: who, when and how much", () => showTab("throttling")),
+    kpi("Throttled", fmtInt(th.responses), th.responses
+      ? `${th.held != null ? `${duration(th.held)} held back` : `waits add up to ${duration(t.throttledSec)}`}, ${fmtInt(th.users.length)} user(s)` : "Microsoft didn't throttle",
+      m.statDays.map(d => perDay(d).throttled), "429 and 503 answers from Microsoft 365, today's included: who, when and how much. Held back: from the first throttled answer until the last wait ended, added up over users.", () => showTab("throttling")),
     kpi("Data", bytes(t.rx + t.tx), `${bytes(t.rx)} in, ${bytes(t.tx)} out`, m.statDays.map(d => perDay(d).rx + perDay(d).tx)),
     kpi("Running", `${fmtInt(t.minutes / 60)} h`, t.userDays ? `${(t.minutes / t.userDays / 60).toFixed(1)} h per user-day` : "", m.statDays.map(d => perDay(d).minutes), "Time the agent ran"));
 
   const insightCard = h("section", { class: "card insights" }, h("div", { class: "card-head" }, h("div", {}, h("h2", {}, "Needs attention"), h("div", { class: "sub" }, periodText(m)))),
-    insights(m, ui.conn).map(i => h("div", { class: "insight" }, icon(i.level), h("div", { class: "text" }, h("span", { class: "label" }, i.label), i.text, i.action ? [" ", h("button", { class: "btn link", onclick: i.action }, "Show")] : null))));
+    insights(m, ui.conn).map(i => h("div", { class: "insight" }, icon(i.level), h("div", { class: "text" }, h("span", { class: "label" }, i.label), i.text,
+      i.action ? [" ", h("button", { class: "btn link", onclick: i.action, "aria-label": `Show: ${i.label}`, "data-key": `insight:${i.label}` }, "Show")] : null))));
 
   const dayTable = cols => () => m.statDays.map(d => ({ day: d, ...cols(perDay(d)) }));
   const sources = Object.keys(m.sourceTotals).sort((a, b) => m.sourceTotals[b] - m.sourceTotals[a]);
   const shownSources = KNOWN_SOURCES.filter(src => sources.includes(src));
   const otherSources = sources.filter(src => !shownSources.includes(src));
   const errorSeries = shownSources.map(src => ({ label: src, color: SOURCE_COLOR[src], values: m.days.map(d => perDay(d).errors[src] || 0) }));
-  if (otherSources.length) errorSeries.push({ label: "other", color: "--other", values: m.days.map(d => otherSources.reduce((t2, src) => t2 + (perDay(d).errors[src] || 0), 0)) });
+  if (otherSources.length) errorSeries.push({ label: `other (${otherSources.join(", ")})`, color: "--other", values: m.days.map(d => otherSources.reduce((t2, src) => t2 + (perDay(d).errors[src] || 0), 0)),
+    parts: otherSources.map(src => ({ label: src, values: m.days.map(d => perDay(d).errors[src] || 0) })) });
+  const arriving = m.provisional.length ? `; the last ${m.provisional.length === 1 ? "day is" : `${m.provisional.length} days are`} still arriving (lighter)` : "";
   const waitSeries = [
     { label: "Throttled by Microsoft", color: "--s1", values: m.statDays.map(d => perDay(d).throttledSec) },
     { label: "Budget: user actions", color: "--s2", values: m.statDays.map(d => perDay(d).budgetUser) },
@@ -931,22 +1075,22 @@ function render() {
   if (m.totals.budgetUnsplit) waitSeries.push({ label: "Budget: not split", color: "--s4", values: m.statDays.map(d => perDay(d).budgetUnsplit) });
 
   const charts = h("div", { class: "grid charts" },
-    chartCard("Microsoft 365 requests per day", "Graph (files) and SharePoint (discovery and transfers), up to yesterday",
+    chartCard("Microsoft 365 requests per day", `Graph (files) and SharePoint (discovery and transfers), up to yesterday${arriving}`,
       el => timeChart(el, { days: m.statDays, provisional: m.provisional, type: "columns", format: compact, series: [{ label: "Graph", color: "--s1", values: m.statDays.map(d => perDay(d).graph) }, { label: "SharePoint", color: "--s2", values: m.statDays.map(d => perDay(d).sp) }] }),
       dayTable(p => ({ graph: p.graph, sp: p.sp, ru: p.ru })), [{ label: "Day", value: r => r.day, render: r => shortDay(r.day) }, { label: "Graph", num: true, value: r => r.graph, render: r => fmtInt(r.graph) }, { label: "SharePoint", num: true, value: r => r.sp, render: r => fmtInt(r.sp) }, { label: "Resource units", num: true, value: r => r.ru, render: r => fmtInt(r.ru) }]),
-    chartCard("Errors per day", "By source; the most frequent first",
+    chartCard("Error reports per day", "By source; each user's agent reports at most 20 an hour, the same error once an hour",
       el => timeChart(el, { days: m.days, type: "columns", format: fmtInt, series: errorSeries, alwaysLegend: true }),
       () => m.days.map(d => ({ day: d, ...perDay(d).errors })), [{ label: "Day", value: r => r.day, render: r => shortDay(r.day) }, ...sources.map(src => ({ label: src, num: true, value: r => r[src] || 0 }))]),
-    chartCard("Active users and devices per day", "Who used VFS365 that day; devices send a day's statistics the next day, so the last day is still arriving (dashed)",
+    chartCard("Active users and devices per day", `Who used VFS365 that day; devices send a day's statistics when they next run${m.provisional.length ? `, so the last ${m.provisional.length === 1 ? "day is" : `${m.provisional.length} days are`} still arriving (dashed)` : ""}`,
       el => timeChart(el, { days: m.statDays, provisional: m.provisional, type: "lines", format: fmtInt, series: [{ label: "Users", color: "--s1", values: m.statDays.map(d => perDay(d).users.size) }, { label: "Devices", color: "--s2", values: m.statDays.map(d => perDay(d).devices.size) }] }),
       dayTable(p => ({ users: p.users.size, devices: p.devices.size })), [{ label: "Day", value: r => r.day, render: r => shortDay(r.day) }, { label: "Users", num: true, value: r => r.users }, { label: "Devices", num: true, value: r => r.devices }]),
-    chartCard("Data transferred per day", "Downloaded and uploaded",
+    chartCard("Data transferred per day", `Downloaded and uploaded${arriving}`,
       el => timeChart(el, { days: m.statDays, provisional: m.provisional, type: "columns", format: bytes, kind: "bytes", series: [{ label: "Received", color: "--s1", values: m.statDays.map(d => perDay(d).rx) }, { label: "Sent", color: "--s2", values: m.statDays.map(d => perDay(d).tx) }] }),
       dayTable(p => ({ rx: p.rx, tx: p.tx })), [{ label: "Day", value: r => r.day, render: r => shortDay(r.day) }, { label: "Received", num: true, value: r => r.rx, render: r => bytes(r.rx) }, { label: "Sent", num: true, value: r => r.tx, render: r => bytes(r.tx) }]),
     chartCard("Waiting for Microsoft 365 per day", "Time requests waited: because Microsoft throttled, or for VFS365's own API budget",
       el => timeChart(el, { days: m.statDays, provisional: m.provisional, type: "lines", format: duration, kind: "seconds", series: waitSeries }),
       dayTable(p => ({ throttled: p.throttled, sec: p.throttledSec, user: p.budgetUser, background: p.budgetBackground, unsplit: p.budgetUnsplit })),
-      [{ label: "Day", value: r => r.day, render: r => shortDay(r.day) }, { label: "Throttled answers", num: true, value: r => r.throttled }, { label: "Throttled wait", num: true, value: r => r.sec, render: r => duration(r.sec) },
+      [{ label: "Day", value: r => r.day, render: r => shortDay(r.day) }, { label: "Throttled answers", num: true, value: r => r.throttled }, { label: "Throttled waits, added up", num: true, value: r => r.sec, render: r => duration(r.sec) },
         { label: "Budget: user actions", num: true, value: r => r.user, render: r => duration(r.user) }, { label: "Budget: background", num: true, value: r => r.background, render: r => duration(r.background) },
         ...(m.totals.budgetUnsplit ? [{ label: "Budget: not split", num: true, value: r => r.unsplit, render: r => duration(r.unsplit) }] : [])],
       h("dl", {},
@@ -956,18 +1100,23 @@ function render() {
         h("dt", {}, "Background"), h("dd", {}, "Discovery after sign-in, change checks, loading ahead. Background work may only use half of the budget, so it waits first; users don't notice it."),
         h("dt", {}, "Not split"), h("dd", {}, "Versions before 0.3.0 report one total, without the cause."),
         h("dt", {}, "Added up over requests"), h("dd", {}, "Four requests that wait 10 seconds at the same time count 40 seconds, so the time someone actually waited is shorter."))),
-    chartCard("Versions in use", m.latest ? `Devices per version; ${m.latest} is the newest seen` : "Devices per version",
+    chartCard("Versions in use", m.latest ? `Devices seen or installed in this period, per version; ${m.latest} is the newest` : "Devices seen or installed in this period, per version",
       el => barChart(el, m.versions.map(v => ({ label: v.version, value: v.devices, tip: "devices" })), { format: fmtInt, emphasis: item => item.label === m.latest }),
       () => m.versions, [{ label: "Version", value: r => r.version }, { label: "Devices", num: true, value: r => r.devices }]));
 
   const tabs = [["devices", `Devices (${fmtInt(m.devices.length)})`], ["users", `Users (${fmtInt(m.users.length)})`], ["errors", `Errors (${fmtInt(m.errors.length)})`], ["throttling", `Throttling (${fmtInt(m.episodes.length || m.throttledUserDays.length)})`], ["installs", `Installs (${fmtInt(m.installs.length)})`]];
   const tabBody = h("div");
-  const tabBar = h("div", { class: "tabs", role: "tablist" }, tabs.map(([key, label]) => h("button", { role: "tab", "aria-selected": String(ui.tab === key), onclick: () => { ui.tab = key; render(); } }, label)));
+  const tabBar = h("div", { class: "tabs", role: "tablist" }, tabs.map(([key, label]) => h("button", { role: "tab", "aria-selected": String(ui.tab === key), "data-key": `tab:${key}`, onclick: () => { ui.tab = key; render(); } }, label)));
   tabBody.append(tabContent(m));
   const tables = h("div", { class: "grid tables" }, h("section", { class: "card", id: "tables" }, h("div", { class: "card-head" }, h("div", {}, tabBar)), h("div", { class: "table-scroll" }, tabBody)));
 
-  const footer = h("p", { class: "footer" }, `Read ${dateTime(data.loadedAt)} from ${data.sample ? "sample data" : ui.conn.host}. Statistics are per day, device and user, sent the day after; errors arrive at once; installs come from the installer.`);
+  const footer = h("p", { class: "footer" }, `Read ${dateTime(data.loadedAt)} from ${data.sample ? "sample data" : ui.conn.host}. Statistics are per day, device and user, sent the day after; errors arrive at once; installs come from the installer. Rows are not signed: anyone with the agents' Add SAS can write them.`);
   $("main").replaceChildren(filterRow(m), insightCard, h("div", { style: "height:12px" }), kpis, charts, tables, footer);
+  if (current) showProgress(progressText);
+  const again = focusKey && [...$("main").querySelectorAll("[data-key]")].find(x => x.dataset.key === focusKey);
+  if (again) { again.focus({ preventScroll: true }); if (caret) again.setSelectionRange(...caret); }
+  // After the charts, which are drawn in this frame's earlier callbacks
+  requestAnimationFrame(() => scrollTo(0, scroll));
   statusLine(ui.conn);
 }
 
@@ -981,7 +1130,7 @@ function tabContent(m) {
     { label: "Resource units", value: r => r.ru, num: true, render: r => compact(r.ru), narrow: true },
     { label: "Throttled", value: r => r.throttled, num: true, narrow: true },
     { label: "Install", value: r => r.install?.at?.getTime() || 0, render: r => r.install ? `${r.install.Action} ${r.install.Version}, ${dateTime(r.install.at)}` : "", narrow: true },
-  ], m.devices, { onClick: openDevice, sort: { label: "Errors" } });
+  ], m.devices, { onClick: openDevice, sort: { label: "Errors" }, id: "devices" });
   if (ui.tab === "users") return dataTable([
     { label: "User", value: r => r.key.toLowerCase(), render: r => r.upn || r.windows || r.key },
     { label: "Windows user", value: r => r.windows, narrow: true },
@@ -992,22 +1141,22 @@ function tabContent(m) {
     { label: "Resource units", value: r => r.ru, num: true, render: r => compact(r.ru), narrow: true },
     { label: "Data", value: r => r.rx + r.tx, num: true, render: r => bytes(r.rx + r.tx), narrow: true },
     { label: "Budget wait", value: r => r.budgetUser, num: true, render: r => r.budgetUser ? duration(r.budgetUser) : "", narrow: true },
-  ], m.users, { onClick: openUser, sort: { label: "Errors" } });
+  ], m.users, { onClick: openUser, sort: { label: "Errors" }, id: "users" });
   if (ui.tab === "throttling") {
     return throttlingView(m.episodes, m.throttledUserDays, true);
   }
   if (ui.tab === "errors") {
-    const switcher = h("div", { class: "seg", style: "margin-bottom:8px" }, [["groups", "Grouped"], ["all", "Every error"]].map(([key, label]) => h("button", { "aria-pressed": String(ui.errorView === key), onclick: () => { ui.errorView = key; render(); } }, label)));
+    const switcher = h("div", { class: "seg", role: "group", "aria-label": "Errors", style: "margin-bottom:8px" }, [["groups", "Grouped"], ["all", "Every report"]].map(([key, label]) => h("button", { "aria-pressed": String(ui.errorView === key), "data-key": `errors:${key}`, onclick: () => { ui.errorView = key; render(); } }, label)));
     const table = ui.errorView === "groups"
       ? dataTable([
         { label: "Source", value: r => r.source, render: r => sourceDot(r.source) },
         { label: "Error", value: r => r.pattern, wrap: true, render: r => r.sample },
-        { label: "Count", value: r => r.rows.length, num: true },
+        { label: "Reports", value: r => r.rows.length, num: true },
         { label: "Devices", value: r => r.devices.size, num: true },
         { label: "Users", value: r => r.users.size, num: true, narrow: true },
         { label: "Last", value: r => r.last.getTime(), render: r => ago(r.last) },
-      ], m.groups, { onClick: openGroup })
-      : errorList(m.errors);
+      ], m.groups, { onClick: openGroup, id: "groups" })
+      : errorList(m.errors, "errors");
     return h("div", {}, switcher, table);
   }
   return dataTable([
@@ -1016,9 +1165,9 @@ function tabContent(m) {
     { label: "Action", value: r => r.Action },
     { label: "Version", value: r => r.Version || "" },
     { label: "Signed-in users", value: r => r.Users || "", wrap: true, narrow: true },
-  ], m.installs, { onClick: r => openDevice(m.devices.find(d => d.id === deviceOf(r))) });
+  ], m.installs, { onClick: r => openDevice(m.devices.find(d => d.id === deviceOf(r))), id: "installs" });
 }
-function errorList(rows) {
+function errorList(rows, id) {
   return dataTable([
     { label: "When", value: r => r.at.getTime(), render: r => dateTime(r.at) },
     { label: "Device", value: r => (r.DeviceName || "").toLowerCase(), render: r => r.DeviceName },
@@ -1026,16 +1175,17 @@ function errorList(rows) {
     { label: "Version", value: r => r.Version || "", narrow: true },
     { label: "Source", value: r => r.Source || "", render: r => sourceDot(r.Source || "other") },
     { label: "Message", value: r => r.Message || "", wrap: true },
-  ], rows, { onClick: r => openDevice(ui.model.devices.find(d => d.id === deviceOf(r))) });
+  ], rows, { onClick: r => openDevice(ui.model.devices.find(d => d.id === deviceOf(r))), id });
 }
 /* Who got throttled, when and how much: episodes with exact times (agents from 0.4.1) or the daily totals per user */
 function throttlingView(episodes, userDays, switchable) {
   if (!episodes.length && !userDays.length) return h("p", { class: "empty" }, "Microsoft didn't throttle VFS365 in this period.");
   const view = episodes.length ? (userDays.length ? ui.throttleView : "episodes") : "days";
   const switcher = switchable && episodes.length && userDays.length
-    ? h("div", { class: "seg", style: "margin-bottom:8px" }, [["episodes", "Episodes, exact times"], ["days", "Per user per day"]].map(([key, label]) =>
-      h("button", { "aria-pressed": String(view === key), onclick: () => { ui.throttleView = key; render(); } }, label)))
+    ? h("div", { class: "seg", role: "group", "aria-label": "Throttling", style: "margin-bottom:8px" }, [["episodes", "Episodes, exact times"], ["days", "Per user per day"]].map(([key, label]) =>
+      h("button", { "aria-pressed": String(view === key), "data-key": `throttling:${key}`, onclick: () => { ui.throttleView = key; render(); } }, label)))
     : null;
+  const id = switchable ? "throttling:" : null, openFor = r => openUser(ui.model.users.find(u => u.key === userOf(r)));
   const mix = r => [num(r.BackgroundResponses) >= num(r.Responses) / 2 ? "mostly background work" : "mostly user actions",
     num(r.SharePointResponses) >= num(r.GraphResponses) ? "SharePoint" : "Graph"].join(", ");
   const table = view === "episodes"
@@ -1048,31 +1198,54 @@ function throttlingView(episodes, userDays, switchable) {
       { label: "Held back", value: r => num(r.HeldSeconds), num: true, render: r => duration(num(r.HeldSeconds)) },
       { label: "Longest wait", value: r => num(r.LongestWaitSeconds), num: true, render: r => duration(num(r.LongestWaitSeconds)), narrow: true },
       { label: "What", value: r => mix(r), render: r => mix(r), narrow: true },
-    ], episodes, { onClick: r => openUser(ui.model.users.find(u => u.key === userOf(r))), sort: { label: "From" } })
+    ], episodes, { onClick: openFor, sort: { label: "From" }, id: id && id + "episodes" })
     : dataTable([
       { label: "Day", value: r => r.PartitionKey, render: r => shortDay(r.PartitionKey) },
       { label: "User", value: r => userOf(r).toLowerCase(), render: r => userOf(r) },
       { label: "Device", value: r => (r.DeviceName || "").toLowerCase(), render: r => r.DeviceName, narrow: true },
       { label: "Responses", value: r => num(r.Throttled), num: true },
-      { label: "Waited", value: r => num(r.ThrottledSeconds), num: true, render: r => duration(num(r.ThrottledSeconds)) },
+      { label: "Waits, added up", value: r => num(r.ThrottledSeconds), num: true, render: r => duration(num(r.ThrottledSeconds)) },
       { label: "Resource units that day", value: r => num(r.ResourceUnits), num: true, render: r => compact(num(r.ResourceUnits)), narrow: true },
       { label: "Version", value: r => r.Version || "", narrow: true },
-    ], userDays, { onClick: r => openUser(ui.model.users.find(u => u.key === userOf(r))), sort: { label: "Day" } });
+    ], userDays, { onClick: openFor, sort: { label: "Day" }, id: id && id + "days" });
   const note = !episodes.length ? h("p", { class: "sub" }, "Per user per day from the daily statistics; agents from 0.4.1 also report each episode with its exact times.") : null;
   return h("div", {}, switcher, table, note);
 }
-function showTab(tab) { ui.tab = tab; render(); $("tables")?.scrollIntoView({ behavior: "smooth" }); }
+function showTab(tab) { ui.tab = tab; render(); requestAnimationFrame(() => $("tables")?.scrollIntoView({ behavior: "smooth" })); }
 function openGroupBySource(source) { const g = ui.model.groups.find(x => x.source === source); g ? openGroup(g) : showTab("errors"); }
 
-/* ---------- Drilldowns ---------- */
+/* ---------- Drilldowns ----------
+   A modal dialog: the page behind is inert, Tab stays inside, Escape closes, focus goes back to what opened it */
+let drawerOpener = null;
+const drawerOpen = () => $("drawer").style.display === "block";
 function drawer(title, subtitle, ...content) {
-  $("drawerBody").replaceChildren(h("div", { class: "card-head" }, h("div", {}, h("h2", {}, title), subtitle ? h("div", { class: "sub" }, subtitle) : null), h("button", { class: "btn small", onclick: closeDrawer }, "Close")), ...content);
+  if (!drawerOpen()) drawerOpener = { node: document.activeElement, key: document.activeElement?.dataset?.key };
+  $("drawerBody").replaceChildren(h("div", { class: "card-head" }, h("div", {}, h("h2", { id: "drawerTitle" }, title), subtitle ? h("div", { class: "sub" }, subtitle) : null), h("button", { class: "btn small", onclick: closeDrawer }, "Close")), ...content);
   $("drawer").style.display = "block"; $("drawerBack").style.display = "block";
+  $("main").inert = $("top").inert = true;
   $("drawer").scrollTop = 0;
+  $("drawer").focus();
 }
-function closeDrawer() { $("drawer").style.display = "none"; $("drawerBack").style.display = "none"; hideTip(); }
+function closeDrawer() {
+  if (!drawerOpen()) return;
+  $("drawer").style.display = "none"; $("drawerBack").style.display = "none"; hideTip();
+  $("main").inert = $("top").inert = false;
+  drawerCharts.length = 0;
+  // The opener may have been replaced by a refresh meanwhile: then its successor with the same data-key
+  const back = drawerOpener?.node?.isConnected ? drawerOpener.node : drawerOpener?.key && [...$("main").querySelectorAll("[data-key]")].find(x => x.dataset.key === drawerOpener.key);
+  drawerOpener = null;
+  back?.focus();
+}
 $("drawerBack").addEventListener("click", closeDrawer);
 addEventListener("keydown", e => { if (e.key === "Escape") closeDrawer(); });
+$("drawer").addEventListener("keydown", e => {
+  if (e.key !== "Tab") return;
+  const items = [...$("drawer").querySelectorAll("button, a[href], input, select, textarea, [tabindex='0']")].filter(x => !x.disabled && x.getClientRects().length);
+  if (!items.length) return;
+  const first = items[0], last = items[items.length - 1];
+  if (e.shiftKey && (document.activeElement === first || document.activeElement === $("drawer"))) { e.preventDefault(); last.focus(); }
+  else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+});
 const facts = list => h("div", { class: "grid kpis", style: "margin:12px 0" }, list.map(([label, value]) => h("section", { class: "card kpi" }, h("div", { class: "label" }, label), h("div", { class: "value", style: "font-size:20px" }, value))));
 const budgetFacts = x => [["Budget wait, user actions", duration(x.budgetUser)], ["Budget wait, background", duration(x.budgetBackground)],
   ...(x.budgetUnsplit ? [["Budget wait, not split", duration(x.budgetUnsplit)]] : [])];
@@ -1086,7 +1259,7 @@ function usageCard(title, perDay) {
   const m = ui.model;
   const body = h("div");
   const card = h("section", { class: "card", style: "margin-top:12px" }, h("div", { class: "card-head" }, h("div", {}, h("h2", {}, title))), body);
-  requestAnimationFrame(() => timeChart(body, { days: m.statDays, provisional: m.provisional, type: "columns", format: compact, series: [
+  drawerChart(body, () => timeChart(body, { days: m.statDays, provisional: m.provisional, type: "columns", format: compact, series: [
     { label: "Graph", color: "--s1", values: perDay.map(rows => rows.reduce((t, r) => t + num(r.GraphRequests), 0)) },
     { label: "SharePoint", color: "--s2", values: perDay.map(rows => rows.reduce((t, r) => t + num(r.SharePointRequests), 0)) }] }));
   return card;
@@ -1096,40 +1269,43 @@ function openDevice(d) {
   const m = ui.model, { perDay } = rowsFor(r => deviceOf(r) === d.id);
   const errors = m.errors.filter(r => deviceOf(r) === d.id), installs = data.devices.filter(r => deviceOf(r) === d.id).map(r => ({ ...r, at: new Date(r.OccurredAt || r.Timestamp) })).sort((a, b) => b.at - a.at);
   drawer(d.name, `${d.entra ? `Entra device ID ${d.entra} · ` : ""}${d.machineIds.size > 1 ? `${d.machineIds.size} Windows installations (rebuilt from an image): ` : "Windows machine ID "}${[...d.machineIds].join(", ")}`,
-    facts([["Version", d.version || "unknown"], ["Users", fmtInt(d.users.size)], ["Last seen", ago(d.lastSeen)], ["Errors", fmtInt(d.errors)], ["Resource units", compact(d.ru)], ["Running", `${fmtInt(d.minutes / 60)} h`], ...budgetFacts(d)]),
+    facts([["Version", d.version || "unknown"], ["Users", fmtInt(d.users.size)], ["Last seen", ago(d.lastSeen)], ["Error reports", fmtInt(d.errors)], ["Resource units", compact(d.ru)], ["Running", `${fmtInt(d.minutes / 60)} h`], ...budgetFacts(d)]),
     usageCard("Requests per day", perDay),
     h("section", { class: "card", style: "margin-top:12px" }, h("h2", {}, "Users"), h("p", {}, [...d.users].join(", ") || "none")),
-    h("section", { class: "card", style: "margin-top:12px" }, h("h2", {}, `Errors (${errors.length})`), h("div", { class: "table-scroll" }, errorList(errors))),
+    h("section", { class: "card", style: "margin-top:12px" }, h("h2", {}, `Error reports (${errors.length})`), h("div", { class: "table-scroll" }, errorList(errors))),
     throttlingCard(r => deviceOf(r) === d.id),
     h("section", { class: "card", style: "margin-top:12px" }, h("h2", {}, "Install history"), installs.length
       ? h("div", { class: "table-scroll" }, dataTable([{ label: "When", value: r => r.at.getTime(), render: r => dateTime(r.at) }, { label: "Action", value: r => r.Action }, { label: "Version", value: r => r.Version }, { label: "Signed-in users", value: r => r.Users || "", wrap: true }], installs))
       : h("p", { class: "sub" }, "No install reports for this device.")));
 }
 function openUser(u) {
+  if (!u) return;
   const m = ui.model, { perDay } = rowsFor(r => userOf(r) === u.key);
   const errors = m.errors.filter(r => userOf(r) === u.key);
   drawer(u.upn || u.key, u.windows ? `Windows user ${u.windows}` : "",
-    facts([["Devices", fmtInt(u.devices.size)], ["Days active", fmtInt(u.days.size)], ["Last seen", ago(u.lastSeen)], ["Errors", fmtInt(u.errors)], ["Resource units", compact(u.ru)], ["Data", bytes(u.rx + u.tx)], ...budgetFacts(u)]),
+    facts([["Devices", fmtInt(u.devices.size)], ["Days active", fmtInt(u.days.size)], ["Last seen", ago(u.lastSeen)], ["Error reports", fmtInt(u.errors)], ["Resource units", compact(u.ru)], ["Data", bytes(u.rx + u.tx)], ...budgetFacts(u)]),
     usageCard("Requests per day", perDay),
     h("section", { class: "card", style: "margin-top:12px" }, h("h2", {}, "Devices"), h("p", {}, [...u.devices].map(id => m.devices.find(d => d.id === id)?.name || id).join(", ") || "none")),
-    h("section", { class: "card", style: "margin-top:12px" }, h("h2", {}, `Errors (${errors.length})`), h("div", { class: "table-scroll" }, errorList(errors))),
+    h("section", { class: "card", style: "margin-top:12px" }, h("h2", {}, `Error reports (${errors.length})`), h("div", { class: "table-scroll" }, errorList(errors))),
     throttlingCard(r => userOf(r) === u.key));
 }
 /* A device's or user's throttling, when there was any */
 function throttlingCard(match) {
   const m = ui.model, episodes = m.episodes.filter(match), days = m.throttledUserDays.filter(match);
   if (!episodes.length && !days.length) return null;
-  const responses = days.reduce((t, r) => t + num(r.Throttled), 0);
-  return h("section", { class: "card", style: "margin-top:12px" }, h("h2", {}, `Throttled (${fmtInt(responses || episodes.reduce((t, r) => t + num(r.Responses), 0))} responses)`),
+  // Statistics up to yesterday plus today's episodes; only episodes when no statistics row was throttled
+  const later = days.length ? episodes.filter(r => localDay(r.at) > m.statDays[m.statDays.length - 1]) : episodes;
+  const responses = days.reduce((t, r) => t + num(r.Throttled), 0) + later.reduce((t, r) => t + num(r.Responses), 0);
+  return h("section", { class: "card", style: "margin-top:12px" }, h("h2", {}, `Throttled (${fmtInt(responses)} responses)`),
     h("div", { class: "table-scroll" }, throttlingView(episodes, episodes.length ? [] : days, false)));
 }
 function openGroup(g) {
   const m = ui.model, body = h("div");
-  drawer(g.source, `Seen ${g.rows.length} time(s) on ${g.devices.size} device(s), ${g.users.size} user(s); first ${dateTime(g.first)}, last ${dateTime(g.last)}`,
+  drawer(g.source, `Reported ${g.rows.length} time(s) on ${g.devices.size} device(s), ${g.users.size} user(s); first ${dateTime(g.first)}, last ${dateTime(g.last)}`,
     h("section", { class: "card", style: "margin-top:12px" }, h("h2", {}, "Latest message"), h("p", { class: "msg" }, g.sample)),
     h("section", { class: "card", style: "margin-top:12px" }, h("h2", {}, "Per day"), body),
     h("section", { class: "card", style: "margin-top:12px" }, h("h2", {}, "Occurrences"), h("div", { class: "table-scroll" }, errorList(g.rows))));
-  requestAnimationFrame(() => timeChart(body, { days: m.days, type: "columns", format: fmtInt, series: [{ label: g.source, color: SOURCE_COLOR[g.source] || "--s1", values: m.days.map(d => g.rows.filter(r => localDay(r.at) === d).length) }] }));
+  drawerChart(body, () => timeChart(body, { days: m.days, type: "columns", format: fmtInt, series: [{ label: g.source, color: SOURCE_COLOR[g.source] || "--other", values: m.days.map(d => g.rows.filter(r => localDay(r.at) === d).length) }] }));
 }
 
 /* ---------- Sample data (for a look without a storage account) ---------- */
@@ -1137,18 +1313,21 @@ function makeSample() {
   let seed = 7; const rnd = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
   const pick = a => a[Math.floor(rnd() * a.length)];
   const today = new Date(), stats = new Map(), errors = new Map(), devices = [];
-  const tenant = "00000000-0000-0000-0000-000000000365";
+  // Two tenants: the last two laptops belong to the second
+  const tenantOf = k => k >= 12 ? "00000000-0000-0000-0000-00000000fab1" : "00000000-0000-0000-0000-000000000365";
   const hosts = Array.from({ length: 14 }, (_, i) => ({ id: crypto.randomUUID?.() || `device-${i}`, name: i < 6 ? `AVD-HOST-${pad(i + 1)}` : `LT-${1000 + i * 37}`, avd: i < 6 }));
   const people = Array.from({ length: 60 }, (_, i) => `user${pad(i + 1)}@contoso.example`);
-  const versionOn = (day, k) => day < localDay(addDays(today, -40 + (k % 5))) ? "0.1.9" : k % 5 === 4 || day < localDay(addDays(today, -12 + (k % 4))) ? "0.2.0" : "0.3.0";
+  const versionOn = (day, k) => day < localDay(addDays(today, -40 + (k % 5))) ? "0.1.9" : k % 5 === 4 || day < localDay(addDays(today, -12 + (k % 4))) ? "0.2.0" : "0.4.1";
   hosts.forEach((d, k) => {
     devices.push({ PartitionKey: d.id, RowKey: "a" + k, DeviceId: d.id, DeviceName: d.name, Action: "install", Version: "0.1.9", OccurredAt: addDays(today, -58).toISOString(), Users: "" });
     devices.push({ PartitionKey: d.id, RowKey: "b" + k, DeviceId: d.id, DeviceName: d.name, Action: "update", Version: "0.2.0", OccurredAt: addDays(today, -40 + (k % 5)).toISOString(), Users: "" });
-    if (k % 5 !== 4) devices.push({ PartitionKey: d.id, RowKey: "c" + k, DeviceId: d.id, DeviceName: d.name, Action: "update", Version: "0.3.0", OccurredAt: addDays(today, -12 + (k % 4)).toISOString(), Users: "" });
+    if (k % 5 !== 4) devices.push({ PartitionKey: d.id, RowKey: "c" + k, DeviceId: d.id, DeviceName: d.name, Action: "update", Version: "0.4.1", OccurredAt: addDays(today, -12 + (k % 4)).toISOString(), Users: "" });
   });
+  // A PC retired months ago without uninstalling: listed under devices, left out of versions
+  devices.push({ PartitionKey: "retired", RowKey: "a", DeviceId: "retired", DeviceName: "LT-0815", Action: "install", Version: "0.1.9", OccurredAt: addDays(today, -85).toISOString(), Users: "CONTOSO\\user60" });
   const sampleWaits = (version, back) => {
     const background = back % 7 === 1 ? Math.round(rnd() * 40) : 0, user = back === 9 && rnd() < 0.3 ? Math.round(rnd() * 20) : 0;
-    return version === "0.3.0"
+    return version === "0.4.1"
       ? { BudgetWaitSeconds: String(user + background), BudgetWaitForegroundSeconds: String(user), BudgetWaitBackgroundSeconds: String(background) }
       : { BudgetWaitSeconds: String(user + background) };
   };
@@ -1162,13 +1341,15 @@ function makeSample() {
         if (rnd() < (weekend ? 0.85 : 0.12)) continue;
         const busy = 0.4 + rnd() * 1.6, throttle = back === 23 || back === 9 ? Math.floor(rnd() * 6) : 0;
         const graph = Math.round(120 * busy), sp = Math.round(40 * busy + (back % 7 === 1 ? 300 : 0));
-        rows.push({ PartitionKey: day, RowKey: d.id + "_" + u, Day: day, DeviceId: d.id, DeviceName: d.name, User: u, WindowsUser: "CONTOSO\\" + u.split("@")[0], TenantId: tenant,
+        rows.push({ PartitionKey: day, RowKey: d.id + "_" + u, Day: day, DeviceId: d.id, DeviceName: d.name, User: u, WindowsUser: "CONTOSO\\" + u.split("@")[0], TenantId: tenantOf(k),
           Version: versionOn(day, k), GraphRequests: String(graph), SharePointRequests: String(sp), ResourceUnits: String(graph * 1.4 + sp * 2 | 0),
           BytesReceived: String(Math.round(busy * 9e7)), BytesSent: String(Math.round(busy * 2.2e7)), Throttled: String(throttle), ThrottledSeconds: String(throttle * 12),
-          Errors: 0, MinutesRunning: Math.round(300 + rnd() * 200), ...sampleWaits(versionOn(day, k), back) });
+          Errors: Math.floor(busy * 1.5), MinutesRunning: Math.round(300 + rnd() * 200), Timestamp: addDays(date, 1).toISOString(), ...sampleWaits(versionOn(day, k), back) });
       }
     });
-    stats.set(day, rows);
+    // One day sent twice (its answer lost): the dashboard keeps the newest
+    if (back === 15 && rows.length) rows.push({ ...rows[0], RowKey: rows[0].RowKey + "_again", Timestamp: addDays(date, 2).toISOString() });
+    stats.set(day, newestOnly(rows));
   }
   const messages = {
     upload: ["\\Sites\\Finance\\Documents\\Budget 2027.xlsx: The operation has timed out.", "\\OneDrive\\Exports\\report.csv: 503 Service Unavailable"],
@@ -1178,52 +1359,64 @@ function makeSample() {
     discovery: ["503 Service Unavailable from https://contoso.sharepoint.com/_api/search/query"],
     crash: ["The agent stopped unexpectedly (exit code 0xC0000005) and was started again"],
     "drive letter": ["T: is also remembered as a mapping to \\\\fs01\\data (HKCU\\Network\\T, from a drive mapping policy). Explorer can show that mapping as a disconnected network drive."],
+    delete: ["\\Sites\\HR\\Documents\\Policy 2025.docx could not be deleted: 423 Locked (the item is held by a retention policy)"],
+    agent: ["Object reference not set to an instance of an object."],
   };
   for (let back = 89; back >= 0; back--) {
     const n = Math.floor(rnd() * 4) + (back === 9 ? 14 : 0) + (back < 2 ? 3 : 0);
     for (let i = 0; i < n; i++) {
       const at = addDays(today, -back); at.setHours(8 + Math.floor(rnd() * 9), Math.floor(rnd() * 60));
       if (at > today) continue;
-      const source = back === 9 && i < 10 ? "upload" : pick(["upload", "upload", "conflict copy", "sign-in", "file system", "discovery", "crash", "drive letter"]);
-      const d = pick(hosts), u = d.avd ? pick(people.slice(0, 48)) : people[48 + hosts.indexOf(d) - 6];
+      const source = back === 9 && i < 10 ? "upload" : pick(["upload", "upload", "conflict copy", "sign-in", "file system", "discovery", "crash", "drive letter", "delete", "agent"]);
+      const d = pick(hosts), k = hosts.indexOf(d), u = d.avd ? pick(people.slice(0, 48)) : people[48 + k - 6];
       const key = utcDay(at);
       if (!errors.has(key)) errors.set(key, []);
-      errors.get(key).push({ PartitionKey: key, RowKey: String(i), DeviceId: d.id, DeviceName: d.name, User: u, WindowsUser: "CONTOSO\\" + u.split("@")[0], TenantId: tenant, Version: versionOn(localDay(at), hosts.indexOf(d)), Source: source, Message: pick(messages[source]), OccurredAt: at.toISOString() });
+      errors.get(key).push({ PartitionKey: key, RowKey: String(i), DeviceId: d.id, DeviceName: d.name, User: u, WindowsUser: "CONTOSO\\" + u.split("@")[0], TenantId: tenantOf(k), Version: versionOn(localDay(at), k), Source: source, Message: pick(messages[source]), OccurredAt: at.toISOString() });
     }
   }
-  // Throttling episodes on the throttled days, from the statistics rows that were throttled
-  for (const row of [...stats.values()].flat().filter(r => num(r.Throttled) > 0 && r.Version === "0.3.0")) {
-    const at = dayToDate(row.PartitionKey); at.setHours(8, Math.floor(rnd() * 50), 0, 0);
-    const held = num(row.ThrottledSeconds) + Math.round(rnd() * 120), responses = num(row.Throttled), key = utcDay(at);
+  // Throttling episodes on the throttled days, from the statistics rows that were throttled, and one this morning
+  const episode = (row, at, responses, held) => {
+    const key = utcDay(at);
     if (!errors.has(key)) errors.set(key, []);
     errors.get(key).push({ PartitionKey: key, RowKey: "t" + row.RowKey, DeviceId: row.DeviceId, DeviceName: row.DeviceName, User: row.User, WindowsUser: row.WindowsUser,
-      TenantId: tenant, Version: row.Version, Source: "throttled", OccurredAt: at.toISOString(), ThrottledUntil: new Date(at.getTime() + held * 1000).toISOString(),
+      TenantId: row.TenantId, Version: row.Version, Source: "throttled", OccurredAt: at.toISOString(), ThrottledUntil: new Date(at.getTime() + held * 1000).toISOString(),
       Responses: responses, HeldSeconds: held, LongestWaitSeconds: Math.min(held, 60 + Math.round(rnd() * 60)), Status429: responses, Status503: 0,
       GraphResponses: Math.floor(responses / 3), SharePointResponses: responses - Math.floor(responses / 3), BackgroundResponses: Math.ceil(responses * 0.7),
-      Message: `Microsoft throttled VFS365 for ${Math.round(held / 60)} min: ${responses} response(s) (429 x${responses}).` });
+      Message: `Microsoft throttled VFS365 for ${Math.max(1, Math.round(held / 60))} min: ${responses} response(s) (429 x${responses}).` });
+  };
+  const throttledRows = [...stats.values()].flat().filter(r => num(r.Throttled) > 0);
+  for (const row of throttledRows.filter(r => r.Version === "0.4.1")) {
+    const at = dayToDate(row.PartitionKey); at.setHours(8, Math.floor(rnd() * 50), 0, 0);
+    episode(row, at, num(row.Throttled), num(row.ThrottledSeconds) + Math.round(rnd() * 120));
   }
-  data.statistics = stats; data.errors = errors; data.devices = devices; data.missing = new Set(); data.loadedAt = new Date(); data.sample = true;
+  const morning = new Date(Math.min(Date.now() - 600000, new Date(today).setHours(9, 0, 0, 0)));
+  if (throttledRows.length) episode({ ...throttledRows[throttledRows.length - 1], RowKey: "today", Version: "0.4.1" }, morning, 7, 240);
+  data.statistics = stats; data.errors = errors; data.devices = devices; data.missing = new Set(); data.pagingHidden = false; data.loadedAt = new Date(); data.sample = true;
 }
 
 /* ---------- Start ---------- */
 $("refreshNow").addEventListener("click", () => refresh(true));
 $("refreshEvery").value = store.get("refreshEvery") ?? "5";
 $("refreshEvery").addEventListener("change", e => { store.set("refreshEvery", e.target.value); scheduleRefresh(); statusLine(ui.conn); });
-$("changeConnection").addEventListener("click", () => { data.sample = false; ui.conn = null; statusLine(null); connectionPanel(); });
+$("changeConnection").addEventListener("click", changeConnection);
+/* Colors are read when drawing: a theme change redraws the dashboard and the drawer's charts (other views have no drawn colors) */
+const repaint = () => { if (ui.conn && ui.view === "dashboard") render(); drawerCharts.forEach(f => f()); };
 $("themeToggle").addEventListener("click", () => {
   const dark = document.documentElement.dataset.theme ? document.documentElement.dataset.theme === "dark" : matchMedia("(prefers-color-scheme: dark)").matches;
-  document.documentElement.dataset.theme = dark ? "light" : "dark"; store.set("theme", document.documentElement.dataset.theme); if (ui.conn) render();
+  document.documentElement.dataset.theme = dark ? "light" : "dark"; store.set("theme", document.documentElement.dataset.theme); repaint();
 });
 if (store.get("theme")) document.documentElement.dataset.theme = store.get("theme");
-matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => { if (ui.conn) render(); });
-let resizeTimer; addEventListener("resize", () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(() => chartRenders.forEach(f => f()), 150); });
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change", repaint);
+let resizeTimer; addEventListener("resize", () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(() => { chartRenders.forEach(f => f()); drawerCharts.forEach(f => f()); }, 150); });
 
 (function start() {
   const hash = new URLSearchParams(location.hash.slice(1));
-  const initial = hash.get("connect") || store.get("connection");
-  // The SAS leaves the address bar (and this history entry) once read
+  // Opened from disk, a SAS that an earlier version kept in the shared localStorage is removed
+  if (fromDisk && store.get("connection")) { store.set("connection", null); ui.forgotSaved = true; }
+  const initial = hash.get("connect") || saved.get();
+  // The SAS leaves the address bar (and this history entry) once read; the browser's history list still has it
   if (hash.has("connect")) history.replaceState(null, "", location.pathname + location.search);
-  if (hash.has("sample")) { makeSample(); startWith({ base: "", sas: "", params: {}, account: "sample", host: "sample" }); return; }
+  if (hash.has("sample")) { makeSample(); startWith(sampleConnection()); return; }
   if (initial) { try { startWith(parseConnection(initial)); return; } catch { } }
   connectionPanel();
 })();

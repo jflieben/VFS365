@@ -7,9 +7,12 @@
     uploaded), and on a real uninstall (not an upgrade) per-user caches and Explorer entries are removed; unsaved changes are kept.
     An install or upgrade ends with vfs365.exe machine-start, which starts the agent in every signed-in session without one.
     With the MonitoringUrl device policy set, installs, updates and uninstalls are reported (vfs365.exe machine-report).
+    A repair runs none of these.
   -->
   <Package Name="VFS365" Manufacturer="JSolve B.V." Version="$(Version)" UpgradeCode="{9E0B7C21-3F64-4D3A-8B65-2D9A6F0C3651}" Scope="perMachine" Compressed="yes">
-    <MajorUpgrade DowngradeErrorMessage="A newer version of VFS365 is already installed." />
+    <!-- The older version goes inside this install's transaction, so a failed upgrade rolls back to it. A release cut again with the
+         same version replaces the first cut instead of installing next to it. -->
+    <MajorUpgrade Schedule="afterInstallInitialize" AllowSameVersionUpgrades="yes" DowngradeErrorMessage="A newer version of VFS365 is already installed." />
     <MediaTemplate EmbedCab="yes" />
 
     <Icon Id="vfs365.ico" SourceFile="$(AssetsDir)\vfs365.ico" />
@@ -73,25 +76,39 @@
       </Component>
     </StandardDirectory>
 
-    <CustomAction Id="AddNetworkProvider" Directory="INSTALLFOLDER" ExeCommand="&quot;[INSTALLFOLDER]vfs365.exe&quot; machine-setup" Execute="deferred" Impersonate="no" Return="ignore" />
+    <!-- Custom actions run vfs365.exe as SYSTEM through WiX's WixQuietExec: no console window, which on a user's desktop would let that
+         user run anything as SYSTEM, and the output goes to the MSI log. The command line is the action's CustomActionData, set
+         just before it. None fails setup. -->
+    <SetProperty Id="AddNetworkProvider" Value="&quot;[INSTALLFOLDER]vfs365.exe&quot; machine-setup" Before="AddNetworkProvider" Sequence="execute" />
+    <CustomAction Id="AddNetworkProvider" BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)" DllEntry="WixQuietExec" Execute="deferred" Impersonate="no" Return="ignore" />
 
     <!-- Before the files go: stop every user's agent (upgrade), and on uninstall also remove their caches and Explorer entries -->
-    <CustomAction Id="StopAgents" Directory="INSTALLFOLDER" ExeCommand="&quot;[INSTALLFOLDER]vfs365.exe&quot; machine-stop" Execute="deferred" Impersonate="no" Return="ignore" />
-    <CustomAction Id="StopAgentsAndCleanUp" Directory="INSTALLFOLDER" ExeCommand="&quot;[INSTALLFOLDER]vfs365.exe&quot; machine-stop --cleanup" Execute="deferred" Impersonate="no" Return="ignore" />
-    <!-- Monitoring (policy MonitoringUrl for the device): install, update and uninstall go to the devices table; best effort, never fails setup -->
-    <CustomAction Id="ReportInstall" Directory="INSTALLFOLDER" ExeCommand="&quot;[INSTALLFOLDER]vfs365.exe&quot; machine-report install" Execute="deferred" Impersonate="no" Return="ignore" />
-    <CustomAction Id="ReportUpdate" Directory="INSTALLFOLDER" ExeCommand="&quot;[INSTALLFOLDER]vfs365.exe&quot; machine-report update" Execute="deferred" Impersonate="no" Return="ignore" />
-    <CustomAction Id="ReportUninstall" Directory="INSTALLFOLDER" ExeCommand="&quot;[INSTALLFOLDER]vfs365.exe&quot; machine-report uninstall" Execute="deferred" Impersonate="no" Return="ignore" />
+    <SetProperty Id="StopAgents" Value="&quot;[INSTALLFOLDER]vfs365.exe&quot; machine-stop" Before="StopAgents" Sequence="execute" />
+    <CustomAction Id="StopAgents" BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)" DllEntry="WixQuietExec" Execute="deferred" Impersonate="no" Return="ignore" />
+    <SetProperty Id="StopAgentsAndCleanUp" Value="&quot;[INSTALLFOLDER]vfs365.exe&quot; machine-stop --cleanup" Before="StopAgentsAndCleanUp" Sequence="execute" />
+    <CustomAction Id="StopAgentsAndCleanUp" BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)" DllEntry="WixQuietExec" Execute="deferred" Impersonate="no" Return="ignore" />
+    <!-- Monitoring (policy MonitoringUrl for the device): install, update and uninstall go to the devices table; best effort -->
+    <SetProperty Id="ReportInstall" Value="&quot;[INSTALLFOLDER]vfs365.exe&quot; machine-report install" Before="ReportInstall" Sequence="execute" />
+    <CustomAction Id="ReportInstall" BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)" DllEntry="WixQuietExec" Execute="deferred" Impersonate="no" Return="ignore" />
+    <SetProperty Id="ReportUpdate" Value="&quot;[INSTALLFOLDER]vfs365.exe&quot; machine-report update" Before="ReportUpdate" Sequence="execute" />
+    <CustomAction Id="ReportUpdate" BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)" DllEntry="WixQuietExec" Execute="deferred" Impersonate="no" Return="ignore" />
+    <SetProperty Id="ReportUninstall" Value="&quot;[INSTALLFOLDER]vfs365.exe&quot; machine-report uninstall" Before="ReportUninstall" Sequence="execute" />
+    <CustomAction Id="ReportUninstall" BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)" DllEntry="WixQuietExec" Execute="deferred" Impersonate="no" Return="ignore" />
     <!-- Last: starts the agent as the user in every signed-in session without one (an upgrade stopped them) -->
-    <CustomAction Id="StartAgents" Directory="INSTALLFOLDER" ExeCommand="&quot;[INSTALLFOLDER]vfs365.exe&quot; machine-start" Execute="deferred" Impersonate="no" Return="ignore" />
+    <SetProperty Id="StartAgents" Value="&quot;[INSTALLFOLDER]vfs365.exe&quot; machine-start" Before="StartAgents" Sequence="execute" />
+    <CustomAction Id="StartAgents" BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)" DllEntry="WixQuietExec" Execute="deferred" Impersonate="no" Return="ignore" />
+    <!-- Rollback of a failed upgrade: the older version is back by then, and its agents, which its removal stopped, start again -->
+    <SetProperty Id="RestartAgentsOnRollback" Value="&quot;[INSTALLFOLDER]vfs365.exe&quot; machine-start" Before="RestartAgentsOnRollback" Sequence="execute" />
+    <CustomAction Id="RestartAgentsOnRollback" BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)" DllEntry="WixQuietExec" Execute="rollback" Impersonate="no" Return="ignore" />
     <InstallExecuteSequence>
+      <Custom Action="RestartAgentsOnRollback" Before="RemoveExistingProducts" Condition="NOT Installed AND WIX_UPGRADE_DETECTED" />
       <Custom Action="ReportUninstall" Before="StopAgentsAndCleanUp" Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
       <Custom Action="StopAgents" Before="RemoveFiles" Condition="REMOVE~=&quot;ALL&quot; AND UPGRADINGPRODUCTCODE" />
       <Custom Action="StopAgentsAndCleanUp" Before="RemoveFiles" Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
-      <Custom Action="AddNetworkProvider" After="WriteRegistryValues" Condition="NOT REMOVE~=&quot;ALL&quot;" />
+      <Custom Action="AddNetworkProvider" After="WriteRegistryValues" Condition="NOT Installed" />
       <Custom Action="ReportInstall" After="AddNetworkProvider" Condition="NOT Installed AND NOT WIX_UPGRADE_DETECTED" />
       <Custom Action="ReportUpdate" After="ReportInstall" Condition="NOT Installed AND WIX_UPGRADE_DETECTED" />
-      <Custom Action="StartAgents" Before="InstallFinalize" Condition="NOT REMOVE~=&quot;ALL&quot;" />
+      <Custom Action="StartAgents" Before="InstallFinalize" Condition="NOT Installed" />
     </InstallExecuteSequence>
 
     <Feature Id="Main">

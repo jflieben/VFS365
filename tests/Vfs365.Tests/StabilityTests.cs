@@ -11,10 +11,14 @@ public sealed class StabilityTests
     [InlineData(2, false)]                 // usage
     [InlineData(-1, false)]                // killed: Task Manager, the uninstaller
     [InlineData(unchecked((int)0xC000013A), false)] // Ctrl+C
+    [InlineData(0x40010004, false)]                 // ended by Windows at logoff (DBG_TERMINATE_PROCESS)
     [InlineData(unchecked((int)0xC0000005), true)]  // access violation
     [InlineData(unchecked((int)0xC000041D), true)]  // fatal exception in a user callback
     [InlineData(unchecked((int)0xC0000409), true)]  // fail-fast
     [InlineData(unchecked((int)0xE0434352), true)]  // unhandled .NET exception
+    [InlineData(unchecked((int)0x80131623), true)]  // CLR fail-fast (Environment.FailFast)
+    [InlineData(unchecked((int)0x80131506), true)]  // CLR execution engine error
+    [InlineData(3, true)]                           // nothing the agent returns itself
     public void Only_crashes_restart_the_agent(int exitCode, bool restart) => Assert.Equal(restart, AgentSupervisor.Crashed(exitCode));
 
     const string Unc = @"\\VFS365\JaneDoe";

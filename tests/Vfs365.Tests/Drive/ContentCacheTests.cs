@@ -264,6 +264,60 @@ public sealed class ContentCacheTests : IDisposable
         Assert.Equal(0, api.Downloads);
     }
 
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task The_length_of_cached_content_is_known_after_a_restart(bool encrypted)
+    {
+        var api = new FakeDriveApi();
+        var item = api.Add("a.bin", RandomNumberGenerator.GetBytes(200_000));
+        var options = new ContentCacheOptions { Cipher = encrypted ? KeyA : null };
+        await new ContentCache(Cache, api, options).FetchAsync("d", item.Id, item.CTag, item.Size, default);
+
+        var reopened = new ContentCache(Cache, api, options);
+
+        Assert.Equal(200_000, reopened.LengthOf("d", item.Id, item.CTag));
+        Assert.Null(reopened.LengthOf("d", item.Id, "c-another-version"));
+        Assert.Null(reopened.LengthOf("d", "id-other", item.CTag));
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(CacheCipher.ChunkSize - 1)]
+    [InlineData(CacheCipher.ChunkSize)]
+    [InlineData(CacheCipher.ChunkSize + 1)]
+    [InlineData(5 * CacheCipher.ChunkSize + 777)]
+    public void A_cache_file_size_gives_back_its_content_length(int length) =>
+        Assert.Equal(length, CacheCipher.ContentLength(CacheCipher.StoredLength(length)));
+
+    [Fact]
+    public void A_size_no_cache_file_can_have_holds_no_content()
+    {
+        Assert.Equal(-1, CacheCipher.ContentLength(10)); // shorter than the footer
+        Assert.Equal(-1, CacheCipher.ContentLength(CacheCipher.StoredLength(0) + 8)); // a chunk without room for its tag
+        Assert.Equal(-1, CacheCipher.ContentLength(CacheCipher.StoredLength(CacheCipher.ChunkSize) + 1));
+    }
+
+    [Fact]
+    public async Task An_item_deleted_while_it_downloads_is_not_kept()
+    {
+        var api = new FakeDriveApi();
+        var item = api.Add("a.txt", content: "old content");
+        var cache = new ContentCache(Cache, api, new ContentCacheOptions { Cipher = KeyA });
+        var hold = new TaskCompletionSource();
+        api.BeforeDownload = () => hold.Task;
+        var fetch = cache.FetchAsync("d", item.Id, item.CTag, item.Size, default);
+
+        cache.ForgetItem("d", item.Id);
+        hold.SetResult();
+        await fetch;
+
+        Assert.Equal((0L, 0), cache.Usage);
+        Assert.Null(cache.LengthOf("d", item.Id, item.CTag));
+        Assert.Empty(CacheFiles());
+    }
+
     public void Dispose()
     {
         try
