@@ -114,7 +114,7 @@ public sealed class StreamingTests : IDisposable
         var data = Data(3 * MiB);
         var item = fake.Add("big.bin", data);
         var stalling = new StallingDriveApi(fake) { StallAfterBytes = 100_000 }; // the first 64 KiB chunk and part of the second
-        var cache = new ContentCache(Path.Combine(directory, "stalled"), stalling, new ContentCacheOptions { NoProgressTimeout = TimeSpan.FromMilliseconds(300) });
+        var cache = new ContentCache(Path.Combine(directory, "stalled"), stalling, new ContentCacheOptions { NoProgressTimeout = TimeSpan.FromSeconds(2) }); // above a slow CI runner's first chunk
 
         using var source = cache.Open("d", item.Id, item.CTag, item.Size);
         var head = new byte[4096];

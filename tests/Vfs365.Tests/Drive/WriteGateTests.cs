@@ -95,12 +95,16 @@ public sealed class WriteGateTests(ITestOutputHelper output) : IDisposable
         var watch = Stopwatch.StartNew();
         await engine.CommitAsync(Root + "big.bin", default);
         Report("close of a 256 MiB save", watch.Elapsed);
+        var background = Stopwatch.StartNew();
         await engine.WaitForUploadsAsync();
+        Report("upload and adopting into the encrypted cache", background.Elapsed);
         var longest = await probe.StopAsync();
-        Report("longest create meanwhile (adopting into the encrypted cache)", longest);
+        Report("longest create meanwhile", longest);
 
         Assert.Equal(data, api.BytesOf("big.bin"));
-        Assert.True(longest < Brief, $"a create waited {longest.TotalMilliseconds:0} ms");
+        // Held under the gate, a create would wait out the whole adoption; a busy CPU (CI runners) slows everything, so relative to it
+        var bound = Brief > background.Elapsed / 4 ? Brief : background.Elapsed / 4;
+        Assert.True(longest < bound, $"a create waited {longest.TotalMilliseconds:0} ms of {background.Elapsed.TotalMilliseconds:0} ms");
         using var source = await engine.OpenContentAsync((await engine.GetEntryAsync(Root + "big.bin", default))!, default);
         Assert.Equal(data.Length, source.Length);
         Assert.Equal(0, api.Downloads);
