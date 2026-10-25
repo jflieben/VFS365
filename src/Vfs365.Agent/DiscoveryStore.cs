@@ -13,12 +13,13 @@ static class DiscoveryStore
 
     public static string FilePath { get; } = Path.Combine(DataDirectory, "discovery.json");
 
-    /// <summary>Null when missing or unreadable: discovery then starts fresh.</summary>
-    public static DiscoveryState? Load()
+    /// <summary>Null when missing or unreadable: discovery then starts fresh. <paramref name="path"/>: a file elsewhere (support bundles, tests).</summary>
+    public static DiscoveryState? Load(string? path = null)
     {
+        path ??= FilePath;
         try
         {
-            return File.Exists(FilePath) ? JsonSerializer.Deserialize<DiscoveryState>(File.ReadAllText(FilePath), Json) : null;
+            return File.Exists(path) ? JsonSerializer.Deserialize<DiscoveryState>(File.ReadAllText(path), Json) : null;
         }
         catch (JsonException)
         {

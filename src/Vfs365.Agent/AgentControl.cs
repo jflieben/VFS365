@@ -34,19 +34,28 @@ public static class AgentControl
     public static readonly Version FirstSessionEvent = new(0, 4, 0);
 
     /// <summary>Created by a mount; createdNew is false when one is already running in this session.</summary>
-    public static EventWaitHandle CreateStopEvent(out bool createdNew)
+    public static EventWaitHandle CreateStopEvent(out bool createdNew) =>
+        EventWaitHandleAcl.Create(false, EventResetMode.ManualReset, EventName(CurrentSession, CurrentSession), out createdNew, StopEventSecurity());
+
+    /// <summary>
+    /// Owned by the user, also in an elevated agent (whose objects Administrators would own otherwise, which machine-stop refuses); only
+    /// the user, SYSTEM and Administrators may use it.
+    /// </summary>
+    public static EventWaitHandleSecurity StopEventSecurity()
     {
+        var user = WindowsIdentity.GetCurrent().User!;
         var security = new EventWaitHandleSecurity();
+        security.SetOwner(user);
         foreach (var sid in new[]
         {
-            WindowsIdentity.GetCurrent().User!,
+            user,
             new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null),
             new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null),
         })
         {
             security.AddAccessRule(new EventWaitHandleAccessRule(sid, EventWaitHandleRights.FullControl, AccessControlType.Allow));
         }
-        return EventWaitHandleAcl.Create(false, EventResetMode.ManualReset, EventName(CurrentSession, CurrentSession), out createdNew, security);
+        return security;
     }
 
     /// <summary>True while a mount runs in this session.</summary>

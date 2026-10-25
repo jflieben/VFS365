@@ -1,8 +1,12 @@
 namespace Vfs365.Core.Drive;
 
-/// <summary>An item. ParentId is set where Graph returned it (single items and changes, not listings, where the folder is known).</summary>
+/// <summary>
+/// An item. ParentId is set where Graph returned it (single items and changes, not listings, where the folder is known). ModifiedBy:
+/// the display name of who saved it last, when Graph names one.
+/// </summary>
 public sealed record DriveItemInfo(string Id, string Name, bool IsFolder, long Size, DateTimeOffset Created, DateTimeOffset Modified, string? ETag, string? CTag,
-    [property: System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)] string? ParentId = null);
+    [property: System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)] string? ParentId = null,
+    [property: System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)] string? ModifiedBy = null);
 
 /// <summary>
 /// A download serves other content than the listing said: another length (the file changed in Microsoft 365 since it was listed, or
@@ -47,6 +51,9 @@ public sealed record UploadTarget(string? ItemId, string? IfMatch, string? Paren
     /// <summary>The cTag of the version the upload replaces: before the last fragment of a session, an item with other content fails it.</summary>
     public string? ContentTag { get; init; }
 
+    /// <summary>A new file's folder by item ID, when known: the upload lands in it even when the folder is renamed or moved meanwhile.</summary>
+    public string? ParentId { get; init; }
+
     public static UploadTarget Existing(DriveItemInfo item) => new(item.Id, item.ETag, null, null) { ContentTag = item.CTag };
 
     public static UploadTarget New(string parentPath, string name) => new(null, null, parentPath, name);
@@ -55,18 +62,43 @@ public sealed record UploadTarget(string? ItemId, string? IfMatch, string? Paren
 /// <summary>A resumable upload. Fragments go in order; each is a multiple of 320 KiB except the last.</summary>
 public sealed record UploadSession(Uri UploadUrl)
 {
+    /// <summary>The first fragment's size.</summary>
     public const int FragmentSize = 16 * 320 * 1024; // 5 MiB
+
+    /// <summary>Fragments grow up to this while the uplink is fast (Graph takes less than 60 MiB per request).</summary>
+    public const int MaxFragmentSize = 180 * 320 * 1024; // 56.25 MiB
 
     /// <summary>Fragments are multiples of this, except the last.</summary>
     public const int FragmentUnit = 320 * 1024;
 
-    /// <summary>Smaller files go up in one request.</summary>
-    public const long SimpleUploadLimit = 4 * 1024 * 1024;
+    /// <summary>
+    /// Files up to this size go up in one request. Graph's simple upload takes up to 250 MB, but advises sessions above 10 MiB: a
+    /// failed request then resumes instead of starting over.
+    /// </summary>
+    public const long SimpleUploadLimit = 10 * 1024 * 1024;
+
+    /// <summary>A file larger than this whose size is set before it is written uploads while it is written.</summary>
+    public const long StreamingThreshold = 4 * 1024 * 1024;
+
+    /// <summary>A fragment slower than this halves the next one (down to 320 KiB); one faster than a quarter of it doubles it.</summary>
+    public static readonly TimeSpan SlowFragment = TimeSpan.FromSeconds(30);
+
+    /// <summary>Fragments sent before they may grow: a file up to about 20 MiB stays in small pieces that resume cheaply.</summary>
+    public const int FragmentsBeforeGrowing = 4;
+
+    /// <summary>The size after the <paramref name="sent"/>th fragment, of <paramref name="size"/> bytes, took <paramref name="took"/>.</summary>
+    public static int NextFragmentSize(int size, TimeSpan took, int sent) =>
+        took > SlowFragment ? Math.Max(FragmentUnit, size / 2 / FragmentUnit * FragmentUnit)
+        : took < SlowFragment / 4 && sent >= FragmentsBeforeGrowing ? Math.Min(MaxFragmentSize, size * 2)
+        : size;
 
     /// <summary>Where the session uploads to, for the check before its last fragment.</summary>
     public string? DriveId { get; init; }
     public UploadTarget? Target { get; init; }
 }
+
+/// <summary>The item an upload target names, with its quickXorHash when Microsoft 365 has one (<see cref="Drive.QuickXorHash"/>).</summary>
+public sealed record UploadedItem(DriveItemInfo Item, string? QuickXorHash);
 
 /// <summary>Drive calls the engine needs. Paths are relative to the drive root, '/'-separated, "" for the root. Implemented in Vfs365.Graph.</summary>
 public interface IDriveApi
@@ -113,4 +145,19 @@ public interface IDriveApi
 
     /// <summary>To the recycle bin.</summary>
     Task DeleteAsync(string driveId, string itemId, CancellationToken ct);
+
+    /// <summary>
+    /// To the recycle bin while the item's eTag is <paramref name="ifMatch"/>, else Conflict (412). The default ignores the eTag: only
+    /// for wrappers in tests.
+    /// </summary>
+    Task DeleteAsync(string driveId, string itemId, string? ifMatch, CancellationToken ct) => DeleteAsync(driveId, itemId, ct);
+
+    /// <summary>
+    /// The item at an upload's target (its item ID, or its name in its folder) as it is now, null when nothing is there: whether an
+    /// upload whose answer got lost went through. The default knows no hash.
+    /// </summary>
+    async Task<UploadedItem?> GetUploadedAsync(string driveId, UploadTarget target, CancellationToken ct) =>
+        (target.ItemId is { } id ? await GetItemByIdAsync(driveId, id, ct)
+            : await GetItemAsync(driveId, target.ParentPath!.Length == 0 ? target.Name! : $"{target.ParentPath}/{target.Name}", ct)) is { } item
+            ? new UploadedItem(item, null) : null;
 }

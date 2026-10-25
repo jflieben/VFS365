@@ -8,17 +8,18 @@ namespace Vfs365.Graph;
 public sealed class RequestBudget
 {
     readonly Lock gate = new();
-    readonly Func<DateTimeOffset> clock;
+    readonly Func<TimeSpan> clock;
     readonly Func<TimeSpan, CancellationToken, Task> delay;
     double tokens;
-    DateTimeOffset last;
+    TimeSpan last;
     long foregroundTicks;
     long backgroundTicks;
 
-    public RequestBudget(int perMinute, Func<DateTimeOffset>? clock = null, Func<TimeSpan, CancellationToken, Task>? delay = null)
+    /// <param name="clock">Monotonic time (<see cref="MonotonicClock"/>), so a wall clock set back doesn't drain the bucket.</param>
+    public RequestBudget(int perMinute, Func<TimeSpan>? clock = null, Func<TimeSpan, CancellationToken, Task>? delay = null)
     {
         PerMinute = Math.Max(0, perMinute);
-        this.clock = clock ?? (() => DateTimeOffset.UtcNow);
+        this.clock = clock ?? MonotonicClock.Now;
         this.delay = delay ?? Task.Delay;
         tokens = PerMinute;
         last = this.clock();
@@ -91,10 +92,14 @@ public sealed class RequestBudget
         }
     }
 
+    /// <summary>A clock that went back refills nothing and counts on from where it is now.</summary>
     void Refill()
     {
         var now = clock();
-        tokens = Math.Min(PerMinute, tokens + (now - last).TotalMinutes * PerMinute);
+        if (now > last)
+        {
+            tokens = Math.Min(PerMinute, tokens + (now - last).TotalMinutes * PerMinute);
+        }
         last = now;
     }
 }

@@ -23,6 +23,9 @@ public sealed class FsEntry
     /// <summary>Local file holding this file's current content while it is being changed.</summary>
     public string? StagingPath { get; init; }
 
+    /// <summary>For staged content created here: what its creator passed to <see cref="DriveEngine.CreateAsync"/>, else null.</summary>
+    public object? Creator { get; internal init; }
+
     /// <summary>Graph drive of a drive item; null for virtual folders.</summary>
     public string? DriveId { get; internal init; }
 

@@ -60,7 +60,7 @@ public static class MachineStart
         }
     }
 
-    static List<(int Id, int State)> Sessions()
+    internal static List<(int Id, int State)> Sessions()
     {
         var sessions = new List<(int, int)>();
         if (!WTSEnumerateSessionsW(IntPtr.Zero, 0, 1, out var list, out var count))

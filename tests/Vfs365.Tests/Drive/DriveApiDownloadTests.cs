@@ -23,6 +23,9 @@ public sealed class DriveApiDownloadTests
         public string ETag { get; set; } = "\"{AB12},3\"";
         public string CTag { get; set; } = "\"c:{AB12},2\"";
         public bool SelectDropsUrl { get; set; }
+
+        /// <summary>No download URL with or without $select (an item being scanned, say).</summary>
+        public bool NoUrl { get; set; }
         public byte[] Content { get; set; } = Encoding.UTF8.GetBytes("hello");
 
         /// <summary>The ETag header downloads answer with; none when null.</summary>
@@ -43,7 +46,7 @@ public sealed class DriveApiDownloadTests
             }
             var query = Uri.UnescapeDataString(request.RequestUri.Query);
             ItemRequests.Add(query);
-            var url = SelectDropsUrl && query.Contains("$select") ? "" : "\"@microsoft.graph.downloadUrl\":\"https://dl.test/file?tempauth=secret\",";
+            var url = NoUrl || (SelectDropsUrl && query.Contains("$select")) ? "" : "\"@microsoft.graph.downloadUrl\":\"https://dl.test/file?tempauth=secret\",";
             var json = $$"""{{{url}}"id":"item1","name":"a.txt","size":{{Content.Length}},"file":{},"eTag":{{Json(ETag)}},"cTag":{{Json(CTag)}}}""";
             return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent(json, Encoding.UTF8, "application/json") });
         }
@@ -83,12 +86,15 @@ public sealed class DriveApiDownloadTests
         Assert.True((await Assert.ThrowsAsync<ContentChangedException>(() => ReadAsync(api, server.CTag))).OtherVersion);
     }
 
-    [Fact]
-    public async Task A_download_url_is_reused_only_briefly_so_a_same_size_save_by_a_colleague_is_seen()
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-10)] // the wall clock set back 10 minutes meanwhile: the reuse window is monotonic
+    public async Task A_download_url_is_reused_only_briefly_so_a_same_size_save_by_a_colleague_is_seen(int wallStepMinutes)
     {
         var server = new Server();
-        var now = new DateTimeOffset(2026, 10, 24, 12, 0, 0, TimeSpan.Zero);
-        var api = new DriveApi(new M365Client(new HttpClient(server), new Tokens()) { Clock = () => now });
+        var wall = new DateTimeOffset(2026, 10, 24, 12, 0, 0, TimeSpan.Zero);
+        var elapsed = TimeSpan.FromHours(1);
+        var api = new DriveApi(new M365Client(new HttpClient(server), new Tokens()) { Clock = () => wall, Monotonic = () => elapsed });
         var listed = server.CTag;
         Assert.Equal("hello", await ReadAsync(api, listed));
 
@@ -96,7 +102,8 @@ public sealed class DriveApiDownloadTests
         server.CTag = "\"c:{AB12},3\"";
         server.ETag = "\"{AB12},4\"";
         server.Content = Encoding.UTF8.GetBytes("HELLO");
-        now += TimeSpan.FromSeconds(30);
+        elapsed += TimeSpan.FromSeconds(30);
+        wall += TimeSpan.FromSeconds(30) + TimeSpan.FromMinutes(wallStepMinutes);
 
         var changed = await Assert.ThrowsAsync<ContentChangedException>(() => ReadAsync(api, listed));
         Assert.True(changed.OtherVersion);
@@ -105,14 +112,35 @@ public sealed class DriveApiDownloadTests
     }
 
     [Fact]
-    public async Task Without_the_url_under_select_the_whole_item_is_read()
+    public async Task Without_the_url_under_select_the_whole_item_is_read_and_later_downloads_skip_select()
     {
         var server = new Server { SelectDropsUrl = true };
-        var api = new DriveApi(new M365Client(new HttpClient(server), new Tokens()));
+        var elapsed = TimeSpan.FromHours(1);
+        var api = new DriveApi(new M365Client(new HttpClient(server), new Tokens()) { Monotonic = () => elapsed });
 
         Assert.Equal("hello", await ReadAsync(api, server.CTag));
         Assert.Equal(2, server.ItemRequests.Count);
         Assert.DoesNotContain("$select", server.ItemRequests[1]);
+
+        elapsed += TimeSpan.FromMinutes(1);
+        Assert.Equal("hello", await ReadAsync(api, server.CTag));
+        Assert.Equal(3, server.ItemRequests.Count);
+        Assert.DoesNotContain("$select", server.ItemRequests[2]);
+    }
+
+    [Fact]
+    public async Task An_item_without_a_download_url_either_way_leaves_select_on()
+    {
+        var server = new Server { NoUrl = true };
+        var api = new DriveApi(new M365Client(new HttpClient(server), new Tokens()));
+
+        await Assert.ThrowsAsync<IOException>(() => ReadAsync(api, server.CTag));
+        Assert.Equal(2, server.ItemRequests.Count);
+
+        server.NoUrl = false;
+        Assert.Equal("hello", await ReadAsync(api, server.CTag));
+        Assert.Equal(3, server.ItemRequests.Count);
+        Assert.Contains("$select", server.ItemRequests[2]);
     }
 
     [Fact]

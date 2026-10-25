@@ -108,26 +108,38 @@ public sealed class MachineCleanupTests : IDisposable
     }
 
     [Fact]
-    public void Reads_the_user_and_program_version_of_an_agent_process()
+    public void Reads_the_user_and_program_version_of_an_agent_process_in_the_install_folder_only()
     {
-        var describe = typeof(MachineCleanup).GetMethod("Describe", BindingFlags.NonPublic | BindingFlags.Static)!;
         using var self = Process.GetCurrentProcess();
 
-        var found = ((SecurityIdentifier User, Version Version)?)describe.Invoke(null, [self]);
+        var found = MachineCleanup.Describe(self, Path.GetDirectoryName(Environment.ProcessPath!)!);
 
         var file = FileVersionInfo.GetVersionInfo(Environment.ProcessPath!);
         Assert.Equal(WindowsIdentity.GetCurrent().User, found!.Value.User);
         Assert.Equal(new Version(file.FileMajorPart, file.FileMinorPart, file.FileBuildPart), found.Value.Version);
+        // A program by the same name elsewhere (a user's copy) is left alone, and nothing of it is read
+        Assert.Null(MachineCleanup.Describe(self, root));
     }
+
+    [Theory]
+    [InlineData(@"C:\Program Files\VFS365\vfs365-agent.exe", @"C:\Program Files\VFS365\", true)]
+    [InlineData(@"c:\program files\vfs365\VFS365.exe", @"C:\Program Files\VFS365", true)]
+    [InlineData(@"C:\Program Files\VFS365\tools\vfs365.exe", @"C:\Program Files\VFS365\", false)]
+    [InlineData(@"C:\Users\ann\Downloads\vfs365-agent.exe", @"C:\Program Files\VFS365\", false)]
+    [InlineData(@"C:\Program Files\VFS365 old\vfs365.exe", @"C:\Program Files\VFS365\", false)]
+    public void Only_programs_right_in_the_install_folder_count(string program, string folder, bool inside) =>
+        Assert.Equal(inside, MachineCleanup.InFolder(program, folder));
 
     [Fact]
     public void Logon_cleanup_uses_built_in_tools_only()
     {
-        var command = MachineCleanup.LogonCleanupCommand();
+        var command = MachineCleanup.LogonCleanupCommand(["M:"]);
 
-        Assert.StartsWith(@"%SystemRoot%\System32\cmd.exe ", command, StringComparison.Ordinal);
+        Assert.StartsWith($@"""{Environment.SystemDirectory}\cmd.exe"" ", command, StringComparison.Ordinal);
         Assert.DoesNotContain("vfs365.exe", command, StringComparison.OrdinalIgnoreCase);
         Assert.Contains(@"Desktop\NameSpace\{3CB016A6-FE2C-45AC-ADBD-05A92CDE26CC}"" /f", command, StringComparison.Ordinal);
+        Assert.Contains(@"/c:""_SZ    M:\\\\""", command, StringComparison.Ordinal);
+        Assert.InRange(command.Length, 1, 8000); // cmd.exe's limit is 8191
         Assert.Equal("2026,1012,931,5", MachineCleanup.ActiveSetupVersion(new DateTime(2026, 10, 12, 9, 31, 5, DateTimeKind.Utc)));
     }
 

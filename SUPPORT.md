@@ -18,4 +18,4 @@ JSolve B.V. offers help with deploying and running VFS365, troubleshooting in yo
 
 ## When you report a bug
 
-Include the VFS365 version (`vfs365.exe about`), the Windows version and architecture, the WinFsp version, how you deployed (setup, MSI, Intune) and the relevant lines from `%LOCALAPPDATA%\VFS365\agent.log`. Remove user names, tenant names and file paths you don't want to publish first.
+Include the VFS365 version (`vfs365.exe about`), the Windows version and architecture, the WinFsp version, how you deployed (setup, MSI, Intune) and the relevant lines from `%LOCALAPPDATA%\VFS365\agent.log`. Remove user names, tenant names and file paths you don't want to publish first. A support bundle (Collect diagnostics in the tray, or `vfs365.exe support-bundle`) has all of this with tokens removed, but it keeps user, tenant and file names: quote from it, don't attach it to a public issue.

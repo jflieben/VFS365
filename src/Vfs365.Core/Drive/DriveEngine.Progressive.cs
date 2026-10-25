@@ -1,10 +1,12 @@
+using System.Diagnostics;
+
 namespace Vfs365.Core.Drive;
 
 /// <summary>
 /// Large files written front to back, whose final size was set first (Windows' copy engine does both), upload while they are written:
 /// each write waits while the previous fragment is still uploading, so the writer's progress follows the network and the close
-/// only sends the last fragment. Anything else, and any failure (a timeout included), falls back to a whole-file upload on close;
-/// a write never fails because of it.
+/// only sends the last fragment. Fragments grow while they go quickly. Anything else, and any failure (a timeout included), falls back
+/// to a whole-file upload on close; a write never fails because of it.
 /// </summary>
 public sealed partial class DriveEngine
 {
@@ -23,7 +25,7 @@ public sealed partial class DriveEngine
             }
             return;
         }
-        if (!pending.HasWrites && size > UploadSession.SimpleUploadLimit)
+        if (!pending.HasWrites && size > UploadSession.StreamingThreshold)
         {
             pending.Progress = new ProgressiveUpload(size, pending.DrivePath);
         }
@@ -56,18 +58,19 @@ public sealed partial class DriveEngine
             }
 
             // The fragment that ends the file completes the item, so it waits for the close (write-through)
-            const int fragment = UploadSession.FragmentSize;
-            while (progress.Contiguous - progress.Sent >= fragment && progress.Sent + fragment < progress.Size)
+            while (progress.Contiguous - progress.Sent >= progress.Fragment && progress.Sent + progress.Fragment < progress.Size)
             {
                 if (progress.InFlight is { } previous)
                 {
                     await previous;
                     progress.InFlight = null;
+                    continue; // its speed sets the next one's size
                 }
                 progress.Session ??= await api.CreateUploadSessionAsync(pending.DriveId, TargetOf(pending), ct);
                 var start = progress.Sent;
-                progress.Sent += fragment;
-                progress.InFlight = api.UploadFragmentAsync(progress.Session, pending.StagingPath, start, fragment, progress.Size, CancellationToken.None);
+                var size = progress.Fragment;
+                progress.Sent += size;
+                progress.InFlight = SendFragmentAsync(progress, pending.StagingPath, start, size, CancellationToken.None);
             }
         }
         catch (Exception e) when (!ct.IsCancellationRequested)
@@ -82,9 +85,19 @@ public sealed partial class DriveEngine
         }
     }
 
+    /// <summary>One fragment of a progressive upload; how long it took sets the next one's size.</summary>
+    async Task<DriveItemInfo?> SendFragmentAsync(ProgressiveUpload progress, string staging, long start, int size, CancellationToken ct)
+    {
+        var started = Stopwatch.GetTimestamp();
+        var item = await api.UploadFragmentAsync(progress.Session!, staging, start, size, progress.Size, ct);
+        progress.Fragment = UploadSession.NextFragmentSize(size, Stopwatch.GetElapsedTime(started), ++progress.Fragments);
+        return item;
+    }
+
     /// <summary>
     /// Sends the rest of a progressive upload. Null when there is none to finish, or it failed on the way (the session is abandoned and
-    /// the caller uploads the whole file). The item deleted, changed or locked meanwhile throws, as a whole upload would.
+    /// the caller uploads the whole file). The item deleted, changed or locked meanwhile throws, as a whole upload would. A last fragment
+    /// without an answer is looked up first: it may have completed the item, and sending the file again would end in a conflict copy.
     /// </summary>
     async Task<DriveItemInfo?> FinishProgressiveAsync(PendingFile pending, CancellationToken ct)
     {
@@ -93,6 +106,7 @@ public sealed partial class DriveEngine
             return null;
         }
         await progress.Gate.WaitAsync(ct);
+        var final = false;
         try
         {
             var usable = !progress.Broken && progress.Session is not null && progress.Contiguous == progress.Size
@@ -110,9 +124,12 @@ public sealed partial class DriveEngine
             }
 
             DriveItemInfo? item = null;
-            for (var start = progress.Sent; start < progress.Size; start += UploadSession.FragmentSize)
+            for (var start = progress.Sent; start < progress.Size;)
             {
-                item = await api.UploadFragmentAsync(progress.Session!, pending.StagingPath, start, Math.Min(UploadSession.FragmentSize, progress.Size - start), progress.Size, ct);
+                var size = (int)Math.Min(progress.Fragment, progress.Size - start);
+                final = start + size >= progress.Size;
+                item = await SendFragmentAsync(progress, pending.StagingPath, start, size, ct);
+                start += size;
             }
             pending.Progress = null;
             return item ?? throw new IOException($"Upload session for {pending.DrivePath} ended without an item");
@@ -121,6 +138,17 @@ public sealed partial class DriveEngine
         {
             await AbandonAsync(pending, progress);
             throw;
+        }
+        catch (Exception e) when (final && !ct.IsCancellationRequested && MayHaveLanded(e))
+        {
+            await AbandonAsync(pending, progress);
+            if (await LandedAsync(pending, TargetOf(pending), ct) is { } landed)
+            {
+                Log($"{pending.DrivePath}: the last fragment got no answer, but it went through");
+                return landed;
+            }
+            Log($"streaming upload of {pending.DrivePath} failed at its end, uploading it whole: {e.Message}");
+            return null;
         }
         catch (Exception e) when (!ct.IsCancellationRequested)
         {
@@ -139,7 +167,7 @@ public sealed partial class DriveEngine
         }
     }
 
-    /// <summary>Stops a progressive upload; the file then uploads whole on close.</summary>
+    /// <summary>Stops a progressive upload; the file then uploads whole on close. Its own fields change at once, before it waits.</summary>
     async Task AbandonAsync(PendingFile pending, ProgressiveUpload progress)
     {
         progress.Broken = true;

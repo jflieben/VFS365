@@ -35,6 +35,103 @@ public sealed class AgentLog : TextWriter
     /// <summary>The agent's log; <paramref name="newSession"/> (a sign-in, not a restart from the tray) starts a new file.</summary>
     public static TextWriter Open(bool newSession) => TextWriter.Synchronized(Open(DiscoveryStore.DataDirectory, newSession, MaxBytes, () => DateTime.Now));
 
+    /// <summary>How often a log that fell back to another folder tries agent.log again.</summary>
+    public static readonly TimeSpan RetryInterval = TimeSpan.FromMinutes(1);
+
+    /// <summary>
+    /// The agent's log, also when %LOCALAPPDATA% can't be written at the sign-in (a profile disk still attaching, antivirus): tried three
+    /// times, then the log goes to %TEMP%\VFS365 and moves on to agent.log once that opens. Never throws.
+    /// </summary>
+    public static TextWriter OpenGuarded(bool newSession) => TextWriter.Synchronized(OpenGuarded(DiscoveryStore.DataDirectory,
+        Path.Combine(Path.GetTempPath(), "VFS365"), newSession, MaxBytes, () => DateTime.Now, Thread.Sleep));
+
+    public static TextWriter OpenGuarded(string folder, string fallbackFolder, bool newSession, long maxBytes, Func<DateTime> clock, Action<TimeSpan> pause)
+    {
+        for (var attempt = 1; ; attempt++)
+        {
+            try
+            {
+                return Open(folder, newSession, maxBytes, clock);
+            }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+            {
+                if (attempt == 3)
+                {
+                    return new Fallback(folder, fallbackFolder, newSession, maxBytes, clock, e.Message);
+                }
+                pause(TimeSpan.FromSeconds(1));
+            }
+        }
+    }
+
+    /// <summary>A log in the fallback folder (or none, when that fails too) that moves on to agent.log once it opens.</summary>
+    sealed class Fallback : TextWriter
+    {
+        readonly string folder, fallbackFolder;
+        readonly bool newSession;
+        readonly long maxBytes;
+        readonly Func<DateTime> clock;
+        TextWriter current;
+        DateTime retryAt;
+        bool moved;
+
+        public Fallback(string folder, string fallbackFolder, bool newSession, long maxBytes, Func<DateTime> clock, string why)
+        {
+            (this.folder, this.fallbackFolder, this.newSession, this.maxBytes, this.clock) = (folder, fallbackFolder, newSession, maxBytes, clock);
+            try
+            {
+                current = Open(fallbackFolder, newSession, maxBytes, clock);
+            }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+            {
+                current = Null;
+            }
+            current.WriteLine($"{clock():yyyy-MM-dd HH:mm:ss} Log: {Path.Combine(folder, FileName)} can't be opened ({why}); this log is used until it can");
+            retryAt = clock() + RetryInterval;
+        }
+
+        public override Encoding Encoding => Encoding.UTF8;
+
+        public override void Write(char value) => Write(value.ToString());
+
+        public override void Write(char[] buffer, int index, int count) => Write(new string(buffer, index, count));
+
+        public override void Write(string? value)
+        {
+            if (!moved && clock() >= retryAt)
+            {
+                TryMove();
+            }
+            current.Write(value);
+        }
+
+        public override void WriteLine(string? value) => Write(value + NewLine);
+
+        void TryMove()
+        {
+            retryAt = clock() + RetryInterval;
+            try
+            {
+                var log = Open(folder, newSession, maxBytes, clock);
+                log.WriteLine($"{clock():yyyy-MM-dd HH:mm:ss} Log: the lines before this are in {Path.Combine(fallbackFolder, FileName)} (this log couldn't be opened then)");
+                current.Dispose();
+                (current, moved) = (log, true);
+            }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+            {
+            }
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                current.Dispose();
+            }
+            base.Dispose(disposing);
+        }
+    }
+
     public static AgentLog Open(string folder, bool newSession, long maxBytes, Func<DateTime> clock)
     {
         Directory.CreateDirectory(folder);

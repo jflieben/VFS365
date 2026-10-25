@@ -50,9 +50,17 @@ public class DiscoveryServiceTests
 
         static Exception Timeout() => new TaskCanceledException("no answer within 100 s (timed out)", new TimeoutException());
 
-        public Task<SiteMetadata> GetSiteAsync(string webUrl, CancellationToken ct) =>
-            TimingOut.Contains($"{webUrl}|site") ? throw Timeout()
-            : FailingSites.Contains(webUrl) ? throw new HttpRequestException("site down") : Task.FromResult(Sites.GetValueOrDefault(webUrl, new SiteMetadata(false, false)));
+        public List<string> SiteCalls = [];
+
+        public Task<SiteMetadata> GetSiteAsync(string webUrl, CancellationToken ct)
+        {
+            lock (SiteCalls)
+            {
+                SiteCalls.Add(webUrl);
+            }
+            return TimingOut.Contains($"{webUrl}|site") ? throw Timeout()
+                : FailingSites.Contains(webUrl) ? throw new HttpRequestException("site down") : Task.FromResult(Sites.GetValueOrDefault(webUrl, new SiteMetadata(false, false)));
+        }
 
         public Task<IReadOnlyList<PinnedLibrary>?> GetWebLibrariesAsync(string webUrl, CancellationToken ct)
         {
@@ -762,5 +770,45 @@ public class DiscoveryServiceTests
         Assert.Equal("https://fabrikam.sharepoint.com", second.TenantRoot);
         Assert.Empty(second.Libraries);
         Assert.Null(second.HidingSkippedReason);
+    }
+
+    /// <summary>A site collection with its root web and two subsites, a library each.</summary>
+    static (FakeApi Api, string[] Webs) SubsiteCollection()
+    {
+        var api = new FakeApi();
+        var site = $"{Root}/sites/Projects";
+        string[] webs = [site, $"{site}/Alpha", $"{site}/Beta"];
+        for (var i = 0; i < webs.Length; i++)
+        {
+            api.Hits.Add(new DiscoveredLibrary(Id(10), Id(20 + i), Id(30 + i), webs[i], site, $"Web{i}", "Documents"));
+            api.Lists[$"{webs[i]}|{Id(30 + i)}"] = new ListMetadata("Documents", false, 101, false, false, null, false, false, 1);
+        }
+        return (api, webs);
+    }
+
+    [Fact]
+    public async Task The_webs_of_one_site_collection_read_its_site_once()
+    {
+        var (api, webs) = SubsiteCollection();
+        api.Sites[webs[0]] = api.Sites[webs[1]] = api.Sites[webs[2]] = new SiteMetadata(false, true); // locked: the whole collection
+
+        var result = await Run(api);
+
+        Assert.Single(api.SiteCalls);
+        Assert.Equal(3, result.Libraries.Count);
+        Assert.All(result.Libraries, l => Assert.True(l.ReadOnly));
+    }
+
+    [Fact]
+    public async Task A_failed_site_read_is_not_kept_for_the_collections_other_webs()
+    {
+        var (api, webs) = SubsiteCollection();
+        api.FailingSites.Add(webs[0]);
+
+        var result = await new DiscoveryService(api, new DiscoveryOptions { Clock = () => Start, FirstReadJitter = TimeSpan.Zero, MaxParallelSites = 1 }).RunAsync(null);
+
+        Assert.Equal(2, api.SiteCalls.Count);
+        Assert.Equal(2, result.Libraries.Count);
+        Assert.Single(result.Errors);
     }
 }

@@ -1,11 +1,12 @@
 # Publishes a GitHub release when VERSION on main names a version that has no release yet. Release notes come from that version's
-# CHANGELOG.md entry; the build fails without one. Builds, signing and publishing run for main only.
+# CHANGELOG.md entry; the first job fails without one. Builds, signing and publishing run for main only.
 #
 # Each job has only the rights it needs: tests and the builds read the repository; only publish creates the release and the build
 # provenance attestation. Verify a file with:
 #   gh attestation verify <file> --repo <owner>/<repo> --signer-workflow <owner>/<repo>/.github/workflows/release.yml --source-ref refs/heads/main
 # The WinFsp MSI is upstream's (pinned by hash in build.ps1), so it gets no attestation from here. Actions are pinned by commit
-# (Dependabot keeps them current); NuGet restores in locked mode against the packages.lock.json files (CI=true).
+# (Dependabot keeps them current); NuGet restores in locked mode against the packages.lock.json files (CI=true). Tests and build use
+# the NuGet cache (keyed by those files), build also the Zig cache; package, which signs, uses neither.
 #
 # Code signing with Azure Artifact Signing (formerly Trusted Signing): with the repository variable SIGNING_PROFILE set to the
 # certificate profile name (Settings, Secrets and variables, Actions, Variables), package signs vfs365np.dll, VFS365's exes and DLLs,
@@ -59,8 +60,9 @@ jobs:
           "version=$version" >> $env:GITHUB_OUTPUT
           gh release view "v$version" --repo $env:GITHUB_REPOSITORY *> $null
           $exists = if ($LASTEXITCODE -eq 0) { 'true' } else { 'false' }
-          "exists=$exists" >> $env:GITHUB_OUTPUT
           if ($exists -eq 'true') { "v$version is already released; nothing to do." }
+          elseif (-not (Select-String -LiteralPath CHANGELOG.md -Pattern "^## $([Regex]::Escape($version))(\s|$)" -Quiet)) { Throw "CHANGELOG.md has no '## $version' entry" }
+          "exists=$exists" >> $env:GITHUB_OUTPUT
           exit 0
 
   test:
@@ -77,14 +79,17 @@ jobs:
       - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
         with:
           dotnet-version: 10.0.x
+          cache: true
+          cache-dependency-path: '**/packages.lock.json'
 
       - name: Test
         shell: pwsh
         run: ./build.ps1 test -Release
 
+  # Runs next to the tests; package waits for both
   build:
-    needs: [version, test]
-    if: github.ref == 'refs/heads/main'
+    needs: version
+    if: github.ref == 'refs/heads/main' && needs.version.outputs.exists == 'false'
     runs-on: windows-latest
     permissions:
       contents: read
@@ -96,6 +101,22 @@ jobs:
       - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
         with:
           dotnet-version: 10.0.x
+          cache: true
+          cache-dependency-path: '**/packages.lock.json'
+
+      - name: Zig version
+        id: zig
+        shell: pwsh
+        run: |
+          $match = Select-String -LiteralPath build.ps1 -Pattern "^\s+Version = '([0-9.]+)'" | Select-Object -First 1
+          if(-not $match){ Throw 'No Zig version found in build.ps1' }
+          "version=$($match.Matches[0].Groups[1].Value)" >> $env:GITHUB_OUTPUT
+
+      - name: Cache Zig
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~\AppData\Local\zig-portable
+          key: zig-${{ runner.os }}-${{ runner.arch }}-${{ steps.zig.outputs.version }}
 
       - name: Build
         shell: pwsh
@@ -112,7 +133,7 @@ jobs:
           retention-days: 1
 
   package:
-    needs: [version, build]
+    needs: [version, test, build]
     if: github.ref == 'refs/heads/main'
     runs-on: windows-latest
     environment: release

@@ -8,21 +8,36 @@ namespace Vfs365.Core.Drive;
 /// of a save. Deletes and renames to temp names wait out the settle window, so a save pattern can put its new content into the
 /// original item (same ID, versions and sharing). Office's temp and lock files never reach SharePoint; other new files under
 /// temp-like names only when they are still there minutes after their close.
-/// The write gate orders changes to local state; transfers (uploads, downloads for a write, file renames, due deletes) let it go, and
-/// only operations on the same file wait.
+/// The write gate orders changes to local state and is held only for that: transfers (uploads, downloads for a write, renames and
+/// deletes on the server, due deletes, caching an uploaded file) and disk flushes run without it, and only operations on the same
+/// file, or below the same folder, wait for them.
 /// </summary>
 public sealed partial class DriveEngine
 {
     readonly SemaphoreSlim writeGate = new(1, 1);
     readonly SemaphoreSlim uploadSlots = new(Math.Max(1, options.UploadConcurrency));
+
+    /// <summary>Due deletes sent at the same time, whichever round of due work started them.</summary>
+    readonly SemaphoreSlim deleteSlots = new(DeleteConcurrency);
     readonly Dictionary<PendingFile, Task> backgroundUploads = [];
-    readonly List<Task> backgroundDeletes = [];
+
+    /// <summary>Due deletes and uploaded files being cached, until they end.</summary>
+    readonly HashSet<Task> backgroundWork = [];
 
     /// <summary>When each item was last uploaded by a close, for <see cref="DriveEngineOptions.RepeatSaveWindow"/>.</summary>
     readonly ConcurrentDictionary<string, DateTimeOffset> recentUploads = new(StringComparer.Ordinal);
 
-    /// <summary>Keys with a transfer running without the write gate, until it ends. Guarded by the write gate.</summary>
-    readonly Dictionary<string, Task> transfers = new(StringComparer.OrdinalIgnoreCase);
+    /// <summary>Work running without the write gate, by the keys it changes, until it ends. Guarded by the write gate.</summary>
+    readonly Dictionary<string, Transfer> transfers = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>Transfers on a folder (a delete or move on the server): keys below their prefixes wait too. Guarded by the write gate.</summary>
+    readonly List<Transfer> folderTransfers = [];
+
+    /// <summary>Pending files whose journal changed with the write gate held, written when it is let go. Guarded by the write gate.</summary>
+    readonly HashSet<PendingFile> unjournaled = [];
+
+    /// <summary>Uploaded content being cached from its staging file, by drive, item and version: reads use the staging file until then.</summary>
+    readonly ConcurrentDictionary<string, string> adopting = new(StringComparer.Ordinal);
 
     /// <summary>
     /// Items saved lately, with the content tags of the versions before the save: a handle opened on one of those reads the save. A
@@ -41,6 +56,9 @@ public sealed partial class DriveEngine
     /// <summary>A new file under a temp-like name uploads when it is still there this long after its close (or the rename to it).</summary>
     static readonly TimeSpan TempUploadDelay = TimeSpan.FromMinutes(5);
 
+    /// <summary>A file closed while other handles still write it uploads at the last close, or this long after the first at the latest.</summary>
+    static readonly TimeSpan OtherWritersGrace = TimeSpan.FromMinutes(10);
+
     /// <summary>Deletes sent at the same time once their settle window passed.</summary>
     const int DeleteConcurrency = 4;
 
@@ -49,39 +67,79 @@ public sealed partial class DriveEngine
         public string DrivePath => Resolved.DrivePath;
     }
 
-    public async Task<FsEntry> CreateAsync(string path, bool isDirectory, CancellationToken ct)
+    /// <summary>
+    /// Work at some keys without the write gate. Operations on those keys (and, for a folder, below its prefixes) wait for it to end.
+    /// Its keys change when its file or a folder above moves meanwhile.
+    /// </summary>
+    sealed class Transfer
+    {
+        readonly TaskCompletionSource done = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public Task Done => done.Task;
+        public List<string> Keys { get; } = [];
+        public List<string> Prefixes { get; } = [];
+
+        /// <summary>The upload of this pending file (or the name sent after it): a rename of a new file or of a folder above goes on meanwhile.</summary>
+        public PendingFile? Upload { get; init; }
+
+        /// <summary>Work by item ID or on local files (an upload, a due delete, caching an upload): a move of a folder above doesn't wait for it.</summary>
+        public bool MovesAlong { get => Upload is not null || field; init; }
+
+        /// <summary>Called when an operation waits for it.</summary>
+        public Action? Waited { get; init; }
+
+        public void End() => done.TrySetResult();
+    }
+
+    /// <param name="creator">Kept with a new file until it is uploaded, for the front end: entries for it carry it (<see cref="FsEntry.Creator"/>).</param>
+    public async Task<FsEntry> CreateAsync(string path, bool isDirectory, CancellationToken ct, object? creator = null)
     {
         var target = await WritableAsync(path, ct);
         var key = Key(target.DriveId, target.DrivePath);
         await LookAheadAsync(target.DriveId, target.DrivePath, ct);
-        await writeGate.WaitAsync(ct);
+        // Made before the gate is taken: disk work other files needn't wait for
+        var staging = isDirectory ? null : NewStagingFile();
+        PendingFile? created = null;
         try
         {
-            await SettleAsync(key);
-            var local = overlay.GetValueOrDefault(key);
-            if (local is PendingFile or AliasItem || (local is null && await LookupAsync(target.DriveId, target.DrivePath, ct) is not null))
+            await writeGate.WaitAsync(ct);
+            try
             {
-                throw new FsException(FsError.NameCollision, path);
-            }
+                if (overlay.GetValueOrDefault(key) is PendingFile or AliasItem)
+                {
+                    throw new FsException(FsError.NameCollision, path); // taken here, whatever its upload does meanwhile
+                }
+                await SettleAsync(key);
+                var local = overlay.GetValueOrDefault(key);
+                if (local is PendingFile or AliasItem || (local is null && await LookupAsync(target.DriveId, target.DrivePath, ct) is not null))
+                {
+                    throw new FsException(FsError.NameCollision, path);
+                }
 
-            if (isDirectory)
+                if (isDirectory)
+                {
+                    var folder = await TransferAsync(() => api.CreateFolderAsync(target.DriveId, ParentOf(target.DrivePath), NameOf(target.DrivePath), ct), key);
+                    Upsert(target.DriveId, target.DrivePath, folder);
+                    // Empty, as it was just made: files created in it need no lookups
+                    listings[key] = Listing.Loaded([], Now, Now, folder.Id);
+                    return ItemEntry(target.Resolved.Path, target.Drive, target.DriveId, target.DrivePath, folder);
+                }
+
+                // A file created where one was just deleted takes over that item. Its journal isn't forced to disk: nothing is acknowledged yet.
+                created = new PendingFile(target.DriveId, target.DrivePath, staging!, (local as GoneItem)?.Item, Now) { Dirty = true, Writers = 1, Creator = creator };
+                overlay[key] = created;
+                JournalLater(created);
+                return PendingEntry(target.Resolved.Path, target.Drive, created);
+            }
+            finally
             {
-                var folder = await TransferAsync(() => api.CreateFolderAsync(target.DriveId, ParentOf(target.DrivePath), NameOf(target.DrivePath), ct), key);
-                Upsert(target.DriveId, target.DrivePath, folder);
-                // Empty, as it was just made: files created in it need no lookups
-                listings[key] = Listing.Loaded([], Now, Now, folder.Id);
-                return ItemEntry(target.Resolved.Path, target.Drive, target.DriveId, target.DrivePath, folder);
+                ReleaseGate();
             }
-
-            // A file created where one was just deleted takes over that item
-            var pending = new PendingFile(target.DriveId, target.DrivePath, NewStagingFile(), (local as GoneItem)?.Item, Now) { Dirty = true };
-            overlay[key] = pending;
-            Journal(pending);
-            return PendingEntry(target.Resolved.Path, target.Drive, pending);
         }
-        finally
+        catch when (staging is not null && created is null)
         {
-            writeGate.Release();
+            TryDelete(staging);
+            throw;
         }
     }
 
@@ -90,8 +148,9 @@ public sealed partial class DriveEngine
 
     /// <summary>
     /// Stages the file for changes: content is copied in unless <paramref name="truncate"/>. Returns the staged entry; a handle that
-    /// keeps it follows this content (<see cref="Follow"/>). The download runs without the write gate. An entry handed out for another
-    /// version than the item holds now stages that version, and its save names it (If-Match): what the handle read is what it changes.
+    /// keeps it follows this content (<see cref="Follow"/>) and counts as one of its writers until its close commits. The download runs
+    /// without the write gate. An entry handed out for another version than the item holds now stages that version, and its save names
+    /// it (If-Match): what the handle read is what it changes.
     /// </summary>
     public async Task<FsEntry> StageAsync(FsEntry file, bool truncate, CancellationToken ct)
     {
@@ -115,15 +174,16 @@ public sealed partial class DriveEngine
                     {
                         if (pending.Progress is { } progress)
                         {
-                            await AbandonAsync(pending, progress);
+                            _ = AbandonAsync(pending, progress); // its fragment in flight ends on its own; the file uploads whole
                         }
-                        Unflush(pending);
+                        Unflush(pending); // on disk before the truncation can be (rare: an overwrite of a file not uploaded yet)
                         pending.HasWrites = false;
                         using var stream = new FileStream(pending.StagingPath, FileMode.Open, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete);
                         stream.SetLength(0);
                         pending.Dirty = true;
                         pending.Modified = Now;
                     }
+                    pending.Writers++;
                     return PendingEntry(target.Resolved.Path, target.Drive, pending);
                 case GoneItem:
                     throw new FsException(FsError.NotFound, file.Path);
@@ -158,17 +218,17 @@ public sealed partial class DriveEngine
                     throw;
                 }
             }
-            var staged = new PendingFile(target.DriveId, target.DrivePath, staging, item, Now) { Dirty = truncate, Alias = alias };
+            var staged = new PendingFile(target.DriveId, target.DrivePath, staging, item, Now) { Dirty = truncate, Alias = alias, Writers = 1 };
             overlay[key] = staged;
             if (truncate)
             {
-                Journal(staged);
+                JournalLater(staged);
             }
             return PendingEntry(target.Resolved.Path, target.Drive, staged);
         }
         finally
         {
-            writeGate.Release();
+            ReleaseGate();
         }
     }
 
@@ -190,8 +250,8 @@ public sealed partial class DriveEngine
     /// <summary>
     /// What an entry handed out earlier refers to now, for a handle that keeps it. A staged entry follows its content through renames
     /// and into the item it was uploaded as (a conflict copy included); an item entry picks up staged content of the same item, and
-    /// this engine's save of it when the entry is for a version before that save. Throws <see cref="FsError.Invalid"/> when the staged
-    /// content was deleted or replaced.
+    /// this engine's save of it when the entry is for a version before that save. A version still being cached from its staging file
+    /// reads from that file. Throws <see cref="FsError.Invalid"/> when the staged content was deleted or replaced.
     /// </summary>
     public FsEntry Follow(FsEntry entry)
     {
@@ -221,10 +281,36 @@ public sealed partial class DriveEngine
         if (entry.ItemId is { } id && saved.TryGetValue(id, out var known) && entry.ContentTag is { } tag
             && tag != (known.Item.CTag ?? known.Item.ETag) && known.Replaced.Contains(tag))
         {
-            return ItemEntry(entry.Path, drive, driveId, entry.DrivePath, known.Item);
+            entry = ItemEntry(entry.Path, drive, driveId, entry.DrivePath, known.Item);
         }
-        return entry;
+        return Adopting(entry);
     }
+
+    /// <summary>An item entry, reading from the staging file while that version is being cached from it (<see cref="AdoptLater"/>).</summary>
+    FsEntry Adopting(FsEntry entry)
+    {
+        var staging = entry.ItemId is { } id && adopting.TryGetValue(AdoptKey(entry.DriveId!, id, entry.ContentTag), out var file) ? file : null;
+        return staging == entry.StagingPath ? entry : new FsEntry
+        {
+            Path = entry.Path,
+            Name = entry.Name,
+            IsDirectory = entry.IsDirectory,
+            Size = entry.Size,
+            Created = entry.Created,
+            Modified = entry.Modified,
+            ReadOnly = entry.ReadOnly,
+            Blocked = entry.Blocked,
+            ItemId = entry.ItemId,
+            ContentTag = entry.ContentTag,
+            StagingPath = staging,
+            DriveId = entry.DriveId,
+            DrivePath = entry.DrivePath,
+            Folder = entry.Folder,
+            Drive = entry.Drive,
+        };
+    }
+
+    static string AdoptKey(string driveId, string itemId, string? contentTag) => $"{driveId}|{itemId}|{contentTag}";
 
     /// <summary>Remembers that a save of this engine made <paramref name="item"/>, replacing <paramref name="replaced"/> when it was the same item.</summary>
     void Saved(DriveItemInfo item, DriveItemInfo? replaced)
@@ -300,7 +386,7 @@ public sealed partial class DriveEngine
             {
                 Unflush(pending);
             }
-            else if (!pending.Journaled)
+            else if (!pending.Journaled && !StaysLocal(pending))
             {
                 Journal(pending);
             }
@@ -326,89 +412,226 @@ public sealed partial class DriveEngine
     }
 
     /// <summary>
-    /// Uploads a changed file when its writer closes it. Close can't fail, so a lock or conflict ends in a conflict copy.
-    /// New files go to the background uploads when that is on; a file saved again within RepeatSaveWindow uploads at its end; a new
-    /// file under a temp-like name uploads only when it is still there minutes later.
+    /// Uploads a changed file when its writer closes it. Close can't fail, so a lock or conflict ends in a conflict copy. A close while
+    /// other handles still write the file only makes what was written durable: the last one commits. New files go to the background
+    /// uploads when that is on; a file saved again within RepeatSaveWindow uploads at its end; a new file under a temp-like name uploads
+    /// only when it is still there minutes later. What was written is on disk when this returns, flushed without the write gate.
     /// </summary>
-    public async Task CommitAsync(string path, CancellationToken ct)
+    public Task CommitAsync(string path, CancellationToken ct) => CommitAsync(path, null, ct);
+
+    /// <summary>
+    /// <see cref="CommitAsync(string, CancellationToken)"/> for the content a writing handle's entry (<paramref name="handle"/>, as staged
+    /// or followed) wrote, wherever it went since, and never another file's that took its name or item meanwhile. Nothing to do when
+    /// that content was uploaded or discarded already.
+    /// </summary>
+    public Task CommitAsync(FsEntry handle, CancellationToken ct) =>
+        !bindings.TryGetValue(handle, out var bound) ? CommitAsync(handle.Path, null, ct)
+        : bound.IsLive ? CommitAsync(null, bound, ct)
+        : Task.CompletedTask;
+
+    async Task CommitAsync(string? path, PendingFile? only, CancellationToken ct)
     {
-        if (ns.Resolve(path) is not { Drive: { } drive } resolved || resolved.DrivePath.Length == 0)
+        string? key = null;
+        if (only is null)
         {
-            return;
+            if (ns.Resolve(path!) is not { Drive: { } drive } resolved || resolved.DrivePath.Length == 0)
+            {
+                return;
+            }
+            key = Key(await drive.GetDriveIdAsync(ct), resolved.DrivePath);
         }
-        var driveId = await drive.GetDriveIdAsync(ct);
+        PendingFile? flush = null;
+        var queue = false;
         await writeGate.WaitAsync(ct);
         try
         {
-            var key = Key(driveId, resolved.DrivePath);
-            await SettleAsync(key);
-            if (overlay.GetValueOrDefault(key) is not PendingFile { Dirty: true } pending || StaysLocal(pending))
+            if (only is not null)
+            {
+                await SettleOnAsync(only);
+            }
+            else
+            {
+                await SettleAsync(key!);
+            }
+            if (overlay.GetValueOrDefault(key ?? only!.Key) is not PendingFile pending || (only is not null && !ReferenceEquals(pending, only)))
+            {
+                return;
+            }
+            if (pending.Writers > 1)
+            {
+                // Other handles still write it: the last close commits
+                pending.Writers--;
+                if (pending.Dirty && !StaysLocal(pending))
+                {
+                    flush = pending;
+                    pending.CommitAt ??= Now + OtherWritersGrace;
+                }
+                return;
+            }
+            pending.Writers = 0;
+            if (!pending.Dirty || StaysLocal(pending))
             {
                 return;
             }
             pending.Rejected = false;
+            flush = pending;
             if (TempLike(pending))
             {
                 // A save pattern renames or deletes it within seconds; still there by then, it is a real file
                 pending.TempSince = Now;
                 pending.CommitAt = Now + TempUploadDelay;
                 pending.RetryAt = null;
-                MarkFlushed(pending);
                 return;
             }
             pending.Queued = true;
+            if (pending.Alias is { } aside && aside.Deadline > Now)
+            {
+                // A renamed-away original: a save may claim its item any moment, so it uploads when that settled
+                CommitBy(pending, aside.Deadline);
+                return;
+            }
             if (pending.Base is null && pending.Progress is null && options.UploadNewFilesInBackground)
             {
-                MarkFlushed(pending); // journaled since it was created
-                QueueUpload(pending);
+                queue = true; // journaled since it was created
                 return;
             }
             if (pending.Base is { } baseItem && options.RepeatSaveWindow > TimeSpan.Zero && recentUploads.TryGetValue(baseItem.Id, out var last)
                 && Now - last < options.RepeatSaveWindow)
             {
-                MarkFlushed(pending);
-                pending.CommitAt ??= last + options.RepeatSaveWindow;
+                CommitBy(pending, last + options.RepeatSaveWindow);
                 return;
             }
             await UploadPendingAsync(pending, ct);
         }
         finally
         {
-            writeGate.Release();
+            ReleaseGate();
+            if (flush is not null)
+            {
+                MarkFlushed(flush); // nothing to do when it uploaded meanwhile
+                if (queue)
+                {
+                    QueueUpload(flush);
+                }
+            }
         }
     }
 
+    /// <summary>Uploads the file by <paramref name="at"/> without a close asking for it; an earlier time set already stays.</summary>
+    static void CommitBy(PendingFile pending, DateTimeOffset at) => pending.CommitAt = pending.CommitAt is { } earlier && earlier < at ? earlier : at;
+
     /// <summary>
-    /// Called with the write gate held. While a transfer runs at one of the keys, lets the gate go until it ended, so the caller sees
-    /// its outcome.
+    /// Called with the write gate held. While work runs at one of the keys (or on a folder above one), lets the gate go until it ended,
+    /// so the caller sees its outcome. A due delete waited for goes ahead at once.
     /// </summary>
-    async Task SettleAsync(params string[] keys)
+    Task SettleAsync(params string[] keys) => SettleExceptAsync(null, keys);
+
+    /// <summary>Like <see cref="SettleAsync"/>, but not for the work <paramref name="skip"/> names.</summary>
+    async Task SettleExceptAsync(Func<Transfer, bool>? skip, params string[] keys)
     {
-        while (keys.Select(transfers.GetValueOrDefault).FirstOrDefault(t => t is not null) is { } transfer)
+        while (Blocking(keys, skip) is { } transfer)
+        {
+            await AwaitWithoutGateAsync(transfer);
+        }
+    }
+
+    /// <summary>Like <see cref="SettleAsync"/> for a pending file, at its path then, which may change while it waits.</summary>
+    async Task SettleOnAsync(PendingFile pending)
+    {
+        while (Blocking([pending.Key], null) is { } transfer)
         {
             await AwaitWithoutGateAsync(transfer);
         }
     }
 
     /// <summary>Like <see cref="SettleAsync"/>, for every key below a folder's (<paramref name="prefix"/> ends with '/').</summary>
-    async Task SettleBelowAsync(string prefix)
+    async Task SettleBelowAsync(string prefix, Func<Transfer, bool>? skip = null)
     {
-        while (transfers.FirstOrDefault(t => t.Key.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)).Value is { } transfer)
+        while (BlockingBelow(prefix, skip) is { } transfer)
         {
             await AwaitWithoutGateAsync(transfer);
         }
     }
 
-    async Task AwaitWithoutGateAsync(Task transfer)
+    Transfer? Blocking(string[] keys, Func<Transfer, bool>? skip)
     {
-        writeGate.Release();
+        foreach (var key in keys)
+        {
+            if (transfers.TryGetValue(key, out var transfer) && (skip is null || !skip(transfer)))
+            {
+                return transfer;
+            }
+        }
+        foreach (var transfer in folderTransfers)
+        {
+            if ((skip is null || !skip(transfer)) && transfer.Prefixes.Any(prefix => keys.Any(key => key.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))))
+            {
+                return transfer;
+            }
+        }
+        return null;
+    }
+
+    Transfer? BlockingBelow(string prefix, Func<Transfer, bool>? skip) =>
+        transfers.FirstOrDefault(t => t.Key.StartsWith(prefix, StringComparison.OrdinalIgnoreCase) && (skip is null || !skip(t.Value))).Value
+        ?? folderTransfers.FirstOrDefault(t => (skip is null || !skip(t))
+            && t.Prefixes.Any(p => p.StartsWith(prefix, StringComparison.OrdinalIgnoreCase) || prefix.StartsWith(p, StringComparison.OrdinalIgnoreCase)));
+
+    async Task AwaitWithoutGateAsync(Transfer transfer)
+    {
+        transfer.Waited?.Invoke();
+        ReleaseGate();
         try
         {
-            await transfer;
+            await transfer.Done;
         }
         finally
         {
             await writeGate.WaitAsync(CancellationToken.None);
+        }
+    }
+
+    /// <summary>Records work at its keys and folder prefixes. A key that has work already keeps it. Called with the write gate held.</summary>
+    void Register(Transfer transfer, string[] keys, string[] prefixes)
+    {
+        foreach (var key in keys)
+        {
+            if (transfers.TryAdd(key, transfer))
+            {
+                transfer.Keys.Add(key);
+            }
+        }
+        if (prefixes.Length > 0)
+        {
+            transfer.Prefixes.AddRange(prefixes);
+            folderTransfers.Add(transfer);
+        }
+    }
+
+    void Unregister(Transfer transfer)
+    {
+        foreach (var key in transfer.Keys)
+        {
+            if (transfers.TryGetValue(key, out var current) && current == transfer)
+            {
+                transfers.Remove(key);
+            }
+        }
+        transfer.Keys.Clear();
+        folderTransfers.Remove(transfer);
+    }
+
+    /// <summary>Its file moved: the work now holds up operations at the new key. Called with the write gate held.</summary>
+    void Rekey(Transfer transfer, string from, string to)
+    {
+        if (transfers.TryGetValue(from, out var current) && current == transfer)
+        {
+            transfers.Remove(from);
+            transfer.Keys.Remove(from);
+        }
+        if (transfers.TryAdd(to, transfer))
+        {
+            transfer.Keys.Add(to);
         }
     }
 
@@ -416,26 +639,21 @@ public sealed partial class DriveEngine
     /// Runs a transfer without the write gate: called with it held, returns with it held. Operations on the keys wait for it
     /// (<see cref="SettleAsync"/>) and due work skips them, so their local state is as before when it returns.
     /// </summary>
-    async Task<T> TransferAsync<T>(Func<Task<T>> transfer, params string[] keys)
+    Task<T> TransferAsync<T>(Func<Task<T>> work, params string[] keys) => TransferAsync(work, new Transfer(), keys);
+
+    async Task<T> TransferAsync<T>(Func<Task<T>> work, Transfer transfer, string[] keys, params string[] prefixes)
     {
-        var done = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        foreach (var key in keys)
-        {
-            transfers[key] = done.Task;
-        }
-        writeGate.Release();
+        Register(transfer, keys, prefixes);
+        ReleaseGate();
         try
         {
-            return await transfer();
+            return await work();
         }
         finally
         {
             await writeGate.WaitAsync(CancellationToken.None);
-            foreach (var key in keys)
-            {
-                transfers.Remove(key);
-            }
-            done.SetResult();
+            Unregister(transfer);
+            transfer.End();
         }
     }
 
@@ -456,11 +674,39 @@ public sealed partial class DriveEngine
     {
         lock (backgroundUploads)
         {
-            if (!backgroundUploads.TryGetValue(pending, out var running) || running.IsCompleted)
+            if (backgroundUploads.TryGetValue(pending, out var running) && !running.IsCompleted)
             {
-                backgroundUploads[pending] = Task.Run(() => BackgroundUploadAsync(pending));
+                return;
             }
+            var upload = Task.Run(() => BackgroundUploadAsync(pending));
+            backgroundUploads[pending] = upload;
+            _ = upload.ContinueWith(done =>
+            {
+                lock (backgroundUploads)
+                {
+                    if (backgroundUploads.TryGetValue(pending, out var current) && current == done)
+                    {
+                        backgroundUploads.Remove(pending);
+                    }
+                }
+            }, TaskScheduler.Default);
         }
+    }
+
+    /// <summary>Background work kept until it ends, for <see cref="WaitForUploadsAsync"/>.</summary>
+    void Track(Task work)
+    {
+        lock (backgroundWork)
+        {
+            backgroundWork.Add(work);
+        }
+        _ = work.ContinueWith(done =>
+        {
+            lock (backgroundWork)
+            {
+                backgroundWork.Remove(done);
+            }
+        }, TaskScheduler.Default);
     }
 
     /// <remarks>Not background priority for the request budget: this is the user's data, not work done ahead.</remarks>
@@ -472,7 +718,7 @@ public sealed partial class DriveEngine
             await writeGate.WaitAsync();
             try
             {
-                await SettleAsync(pending.Key);
+                await SettleOnAsync(pending);
                 if (ReferenceEquals(overlay.GetValueOrDefault(pending.Key), pending) && pending.Dirty)
                 {
                     await UploadPendingAsync(pending, CancellationToken.None);
@@ -490,7 +736,11 @@ public sealed partial class DriveEngine
             }
             finally
             {
-                writeGate.Release();
+                ReleaseGate();
+            }
+            if (pending.IsLive)
+            {
+                MarkFlushed(pending); // before it is retried: changes nobody closed included
             }
         }
         finally
@@ -499,22 +749,17 @@ public sealed partial class DriveEngine
         }
     }
 
-    /// <summary>Background uploads and deletes queued or running.</summary>
+    /// <summary>Background uploads, due deletes and caching of uploads queued or running.</summary>
     Task[] RunningUploads()
     {
-        Task[] deletes;
-        lock (backgroundDeletes)
+        Task[] work;
+        lock (backgroundWork)
         {
-            backgroundDeletes.RemoveAll(d => d.IsCompleted);
-            deletes = [.. backgroundDeletes];
+            work = [.. backgroundWork];
         }
         lock (backgroundUploads)
         {
-            foreach (var done in backgroundUploads.Where(u => u.Value.IsCompleted).Select(u => u.Key).ToList())
-            {
-                backgroundUploads.Remove(done);
-            }
-            return [.. backgroundUploads.Values, .. deletes];
+            return [.. backgroundUploads.Values, .. work];
         }
     }
 
@@ -528,7 +773,10 @@ public sealed partial class DriveEngine
         }
     }
 
-    /// <summary>Folders go at once; files are hidden now and deleted after the settle window unless a save claims them.</summary>
+    /// <summary>
+    /// Folders go at once (without the write gate; operations below them wait); files are hidden now and deleted after the settle window
+    /// unless a save claims them.
+    /// </summary>
     public async Task DeleteAsync(string path, CancellationToken ct)
     {
         var target = await WritableAsync(path, ct);
@@ -563,9 +811,13 @@ public sealed partial class DriveEngine
             var item = await LookupAsync(target.DriveId, target.DrivePath, ct) ?? throw new FsException(FsError.NotFound, path);
             if (item.IsFolder)
             {
-                // With the gate held: it changes everything below it
-                await api.DeleteAsync(target.DriveId, item.Id, ct);
+                // It changes everything below it: operations there wait for it
                 var below = Key(target.DriveId, target.DrivePath + "/");
+                await TransferAsync(async () =>
+                {
+                    await api.DeleteAsync(target.DriveId, item.Id, ct);
+                    return true;
+                }, new Transfer(), [key], below);
                 foreach (var deleted in overlay.Values.Where(l => l is GoneItem or AliasItem && l.Key.StartsWith(below, StringComparison.OrdinalIgnoreCase)).ToList())
                 {
                     DropLocal(deleted); // went to the recycle bin with the folder
@@ -579,7 +831,7 @@ public sealed partial class DriveEngine
         }
         finally
         {
-            writeGate.Release();
+            ReleaseGate();
         }
     }
 
@@ -601,30 +853,63 @@ public sealed partial class DriveEngine
         }
 
         var driveId = from.DriveId;
+        var fromKey = Key(driveId, from.DrivePath);
+        var toKey = Key(driveId, to.DrivePath);
         var sameName = from.DrivePath.Equals(to.DrivePath, StringComparison.OrdinalIgnoreCase);
+        var toTemp = LocalOnlyNames.IsTempLike(NameOf(to.DrivePath));
         await LookAheadAsync(driveId, from.DrivePath, ct);
         if (!sameName)
         {
             await LookAheadAsync(driveId, to.DrivePath, ct);
         }
+        if (!ParentOf(to.DrivePath).Equals(ParentOf(from.DrivePath), StringComparison.OrdinalIgnoreCase))
+        {
+            await LookAheadAsync(driveId, ParentOf(to.DrivePath), ct); // the folder a file not uploaded yet moves into
+        }
+        (PendingFile? Moved, bool Queue) after = (null, false);
         await writeGate.WaitAsync(ct);
         try
         {
-            await SettleAsync(Key(driveId, from.DrivePath), Key(driveId, to.DrivePath));
-            var fromLocal = overlay.GetValueOrDefault(Key(driveId, from.DrivePath));
-            var toLocal = sameName ? null : overlay.GetValueOrDefault(Key(driveId, to.DrivePath));
-            var toRemote = sameName || toLocal is not null ? null : await LookupAsync(driveId, to.DrivePath, ct);
+            // A new file going to a free real name moves along with its upload (RenamePendingAsync), so that isn't waited for
+            bool OwnUpload(Transfer t) => !sameName && !toTemp && options.UploadNewFilesInBackground
+                && t.Upload is { Base: null, Alias: null } upload && ReferenceEquals(overlay.GetValueOrDefault(fromKey), upload);
+            if (!replace && !sameName && overlay.GetValueOrDefault(toKey) is PendingFile or AliasItem)
+            {
+                throw new FsException(FsError.NameCollision, destination); // taken here, whatever its upload does meanwhile
+            }
+            LocalState? fromLocal, toLocal;
+            DriveItemInfo? toRemote, toItem;
+            while (true)
+            {
+                await SettleExceptAsync(OwnUpload, fromKey, toKey);
+                fromLocal = overlay.GetValueOrDefault(fromKey);
+                toLocal = sameName ? null : overlay.GetValueOrDefault(toKey);
+                toRemote = sameName || toLocal is not null ? null : await LookupAsync(driveId, to.DrivePath, ct);
+                toItem = toLocal switch
+                {
+                    GoneItem gone => gone.Item,
+                    PendingFile pending => pending.Base,
+                    AliasItem alias => alias.Item,
+                    _ => toRemote,
+                };
+                if (toItem is not null && Blocking([fromKey], null) is not null)
+                {
+                    // Its upload runs and the name is taken: this rename can't go along with it, so it waits after all
+                    await SettleAsync(fromKey, toKey);
+                    continue;
+                }
+                if (fromLocal is AliasItem { OriginalPath: var original } && Blocking([Key(driveId, original)], null) is not null)
+                {
+                    // Work at the renamed-away original's own name (its item is there on the server), which this rename changes too
+                    await SettleAsync(Key(driveId, original));
+                    continue;
+                }
+                break;
+            }
             if (!replace && (toLocal is PendingFile or AliasItem || toRemote is not null))
             {
                 throw new FsException(FsError.NameCollision, destination);
             }
-            var toItem = toLocal switch
-            {
-                GoneItem gone => gone.Item,
-                PendingFile pending => pending.Base,
-                AliasItem alias => alias.Item,
-                _ => toRemote,
-            };
             // An item is at the destination on the server (listed, hidden or changed here), not just a local name
             var onServer = toLocal switch
             {
@@ -637,7 +922,7 @@ public sealed partial class DriveEngine
             switch (fromLocal)
             {
                 case PendingFile pending:
-                    await RenamePendingAsync(pending, to.DrivePath, toItem, toLocal, onServer, ct);
+                    after = await RenamePendingAsync(pending, to.DrivePath, toItem, toLocal, onServer, ct);
                     return;
                 case AliasItem alias:
                     await RenameAliasAsync(alias, to.DrivePath, toItem, toLocal, onServer, ct);
@@ -647,12 +932,12 @@ public sealed partial class DriveEngine
             }
 
             var item = await LookupAsync(driveId, from.DrivePath, ct) ?? throw new FsException(FsError.NotFound, source);
-            if (!item.IsFolder && !sameName && LocalOnlyNames.IsTempLike(NameOf(to.DrivePath)) && !onServer)
+            if (!item.IsFolder && !sameName && toTemp && !onServer)
             {
                 // Saving: the original steps aside under a temp name. Kept local; restored unless new content claims it.
                 DropLocal(toLocal);
-                overlay[Key(driveId, from.DrivePath)] = new GoneItem(driveId, from.DrivePath, item, Now + options.SettleWindow, deleteOnExpiry: false);
-                overlay[Key(driveId, to.DrivePath)] = new AliasItem(driveId, to.DrivePath, item, from.DrivePath, Now + options.SettleWindow);
+                overlay[fromKey] = new GoneItem(driveId, from.DrivePath, item, Now + options.SettleWindow, deleteOnExpiry: false);
+                overlay[toKey] = new AliasItem(driveId, to.DrivePath, item, from.DrivePath, Now + options.SettleWindow);
                 return;
             }
             if (!item.IsFolder && toItem is not null && toItem.Id != item.Id)
@@ -666,19 +951,19 @@ public sealed partial class DriveEngine
                     {
                         await content.CopyToAsync(driveId, item.Id, item.CTag ?? item.ETag, ServedSize(driveId, item), file, ct, current => ContentChanged(driveId, current));
                         return await UploadIntoAsync(driveId, toItem, file, ct);
-                    }, Key(driveId, from.DrivePath), Key(driveId, to.DrivePath));
+                    }, fromKey, toKey);
                 }
                 catch
                 {
                     TryDelete(file);
                     throw;
                 }
-                content.Adopt(driveId, updated, file);
                 DropLocal(toLocal);
                 Claimed(driveId, updated);
                 Saved(updated, toItem);
                 Upsert(driveId, to.DrivePath, updated);
-                overlay[Key(driveId, from.DrivePath)] = new GoneItem(driveId, from.DrivePath, item, Now + options.SettleWindow, deleteOnExpiry: true);
+                overlay[fromKey] = new GoneItem(driveId, from.DrivePath, item, Now + options.SettleWindow, deleteOnExpiry: true);
+                AdoptLater(driveId, updated, file, toKey);
                 Log($"replaced {to.DrivePath} with {from.DrivePath}");
                 return;
             }
@@ -693,54 +978,77 @@ public sealed partial class DriveEngine
             }
 
             var moved = await TransferAsync(async () => await api.MoveAsync(driveId, item.Id, await FolderIdAsync(driveId, ParentOf(to.DrivePath), ct), NameOf(to.DrivePath), ct),
-                Key(driveId, from.DrivePath), Key(driveId, to.DrivePath));
+                fromKey, toKey);
             Forget(driveId, from.DrivePath);
             Upsert(driveId, to.DrivePath, moved);
             Log($"renamed {from.DrivePath} to {to.DrivePath} ({moved.Id})");
         }
         finally
         {
-            writeGate.Release();
+            ReleaseGate();
+            if (after.Moved is { } file)
+            {
+                // Acknowledged before its upload: on disk first (a file closed under a local-only name never was)
+                MarkFlushed(file);
+                if (after.Queue)
+                {
+                    QueueUpload(file);
+                }
+            }
         }
     }
 
     /// <summary>
-    /// Moves or renames a folder, with the write gate held: it changes everything below it. Files below it that aren't uploaded yet
-    /// go along: their transfers end first, streaming uploads start over, and their local state moves to the new path.
+    /// Moves or renames a folder: it changes everything below it, so operations there wait for the move, without the write gate.
+    /// Uploads below go on (into items by ID, new files into their folder by its ID) and their local state and work move to the new
+    /// path; streaming uploads below start over, since they were aimed at the old one.
     /// </summary>
     async Task MoveFolderAsync(string driveId, DriveItemInfo folder, string from, string to, CancellationToken ct)
     {
         var below = Key(driveId, from + "/");
-        await SettleBelowAsync(below);
+        var targetBelow = Key(driveId, to + "/");
+        await SettleBelowAsync(below, t => t.MovesAlong);
+        await SettleBelowAsync(targetBelow);
         foreach (var pending in overlay.Values.OfType<PendingFile>().Where(p => p.Key.StartsWith(below, StringComparison.OrdinalIgnoreCase)).ToList())
         {
             if (pending.Progress is { } progress)
             {
-                await AbandonAsync(pending, progress);
+                _ = AbandonAsync(pending, progress);
             }
         }
 
-        var moved = await api.MoveAsync(driveId, folder.Id, await FolderIdAsync(driveId, ParentOf(to), ct), NameOf(to), ct);
+        var moved = await TransferAsync(async () => await api.MoveAsync(driveId, folder.Id, await FolderIdAsync(driveId, ParentOf(to), ct), NameOf(to), ct),
+            new Transfer(), [Key(driveId, from), Key(driveId, to)], below, targetBelow);
         Invalidate(driveId, from);
         Forget(driveId, from);
         Upsert(driveId, to, moved);
+        string Moved(string path) => to + path[from.Length..];
+        bool Below(string path) => path.StartsWith(from + "/", StringComparison.OrdinalIgnoreCase);
         foreach (var alias in overlay.Values.OfType<AliasItem>().Concat(overlay.Values.OfType<PendingFile>().Select(p => p.Alias).OfType<AliasItem>()).ToList())
         {
-            if (alias.DriveId == driveId && alias.OriginalPath.StartsWith(from + "/", StringComparison.OrdinalIgnoreCase))
+            if (alias.DriveId == driveId && Below(alias.OriginalPath))
             {
-                alias.OriginalPath = to + alias.OriginalPath[from.Length..];
+                alias.OriginalPath = Moved(alias.OriginalPath);
             }
+        }
+        foreach (var uploading in overlay.Values.OfType<PendingFile>().Where(p => p.DriveId == driveId && p.ServerPath is { } at && Below(at)).ToList())
+        {
+            uploading.ServerPath = Moved(uploading.ServerPath!);
         }
         var count = 0;
         foreach (var local in overlay.Values.Where(l => l.Key.StartsWith(below, StringComparison.OrdinalIgnoreCase)).ToList())
         {
-            Move(local, to + local.DrivePath[from.Length..]);
+            Move(local, Moved(local.DrivePath));
             count++;
+        }
+        foreach (var (key, running) in transfers.Where(t => t.Key.StartsWith(below, StringComparison.OrdinalIgnoreCase)).ToList())
+        {
+            Rekey(running, key, targetBelow + key[below.Length..]);
         }
         Log($"renamed {from} to {to} ({moved.Id}){(count > 0 ? $", with {count} file(s) not uploaded yet" : "")}");
     }
 
-    /// <summary>Puts local state under another path. Called with the write gate held; nothing may be at that path.</summary>
+    /// <summary>Puts local state under another path; its journal follows when the write gate is let go. Nothing may be at that path.</summary>
     void Move(LocalState local, string drivePath)
     {
         overlay.TryRemove(new KeyValuePair<string, LocalState>(local.Key, local));
@@ -748,7 +1056,7 @@ public sealed partial class DriveEngine
         overlay[local.Key] = local;
         if (local is PendingFile pending)
         {
-            Journal(pending);
+            JournalLater(pending);
         }
     }
 
@@ -774,7 +1082,6 @@ public sealed partial class DriveEngine
                     saved.TryRemove(old, out _);
                 }
             }
-            var deletes = new List<GoneItem>();
             foreach (var local in overlay.Values.ToList())
             {
                 if (!all)
@@ -787,7 +1094,7 @@ public sealed partial class DriveEngine
                 }
                 if (local is GoneItem { DeleteOnExpiry: true } gone && (all || gone.Deadline <= Now))
                 {
-                    deletes.Add(gone);
+                    StartDelete(gone, all);
                     continue;
                 }
                 try
@@ -799,14 +1106,10 @@ public sealed partial class DriveEngine
                     Log($"error: {local.DrivePath}: {e.Message}");
                 }
             }
-            if (deletes.Count > 0)
-            {
-                StartDeletes(deletes, all);
-            }
         }
         finally
         {
-            writeGate.Release();
+            ReleaseGate();
         }
         if (all)
         {
@@ -897,65 +1200,110 @@ public sealed partial class DriveEngine
         Move(pending, JoinDrivePath(ParentOf(aside.OriginalPath), ConflictName(NameOf(aside.OriginalPath), 1)));
         pending.Base = null;
         pending.CommitAt ??= Now;
-        Journal(pending);
+        JournalLater(pending);
         Log($"{aside.OriginalPath} was saved meanwhile; the changes made to it under {aside.Name} are kept as {pending.Name}");
     }
 
     /// <summary>
-    /// Deletes items whose settle window passed without the write gate, a few at a time and at background priority (at unmount in the
-    /// foreground), so saves don't wait for a bulk delete. Operations on their paths wait for them, as for transfers.
+    /// Deletes an item whose settle window passed, without the write gate, at background priority (at unmount in the foreground) and
+    /// DeleteConcurrency at a time across rounds, so saves don't wait for a bulk delete. Operations on its path wait only for this
+    /// delete, which then goes ahead at once in the foreground. Called with the write gate held.
     /// </summary>
-    void StartDeletes(List<GoneItem> due, bool all)
+    void StartDelete(GoneItem gone, bool all)
     {
-        var done = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        foreach (var gone in due)
+        var priority = new PriorityHolder(background: !all);
+        var waited = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var transfer = new Transfer
         {
-            transfers[gone.Key] = done.Task;
-        }
-        var run = Task.Run(async () =>
+            MovesAlong = true,
+            Waited = () =>
+            {
+                priority.Promote();
+                waited.TrySetResult();
+            },
+        };
+        Register(transfer, [gone.Key], []);
+        Track(Task.Run(async () =>
         {
-            if (!all)
-            {
-                RequestPriority.MarkBackground();
-            }
-            var failures = new ConcurrentDictionary<GoneItem, Exception>();
-            await Parallel.ForEachAsync(due, new ParallelOptions { MaxDegreeOfParallelism = DeleteConcurrency }, async (gone, _) =>
-            {
-                try
-                {
-                    await api.DeleteAsync(gone.DriveId, gone.Item.Id, CancellationToken.None);
-                }
-                catch (RemoteException e) when (e.Error == RemoteError.NotFound)
-                {
-                }
-                catch (Exception e)
-                {
-                    failures[gone] = e;
-                }
-            });
-            await writeGate.WaitAsync();
+            RequestPriority.Use(priority);
+            var slot = await TakeDeleteSlotAsync(waited.Task);
+            (Exception? Failure, DriveItemInfo? Kept) outcome;
             try
             {
-                foreach (var gone in due)
-                {
-                    transfers.Remove(gone.Key);
-                    Deleted(gone, failures.GetValueOrDefault(gone));
-                }
+                outcome = await DeleteDueAsync(gone);
             }
             finally
             {
-                writeGate.Release();
-                done.SetResult();
+                if (slot)
+                {
+                    deleteSlots.Release();
+                }
             }
-        });
-        lock (backgroundDeletes)
+            await writeGate.WaitAsync();
+            try
+            {
+                Unregister(transfer);
+                Deleted(gone, outcome.Failure, outcome.Kept);
+            }
+            finally
+            {
+                ReleaseGate();
+                transfer.End();
+            }
+        }));
+    }
+
+    /// <summary>Waits for a delete slot, unless an operation waits for this delete first: then it goes at once. True when it took one.</summary>
+    async Task<bool> TakeDeleteSlotAsync(Task waited)
+    {
+        var slot = deleteSlots.WaitAsync();
+        if (await Task.WhenAny(slot, waited) == slot)
         {
-            backgroundDeletes.Add(run);
+            return true;
+        }
+        _ = slot.ContinueWith(_ => deleteSlots.Release(), TaskScheduler.Default); // taken later after all: given back
+        return false;
+    }
+
+    /// <summary>
+    /// A due delete, with If-Match: the version the user deleted. Changed since in its metadata only (412, same cTag), the item is
+    /// deleted as it is now; with new content it is kept (Kept: the item now), so a colleague's newer version never goes by accident.
+    /// </summary>
+    async Task<(Exception? Failure, DriveItemInfo? Kept)> DeleteDueAsync(GoneItem gone)
+    {
+        try
+        {
+            try
+            {
+                await api.DeleteAsync(gone.DriveId, gone.Item.Id, gone.Item.ETag, CancellationToken.None);
+            }
+            catch (RemoteException e) when (e.Error == RemoteError.Conflict)
+            {
+                if (await api.GetItemByIdAsync(gone.DriveId, gone.Item.Id, CancellationToken.None) is not { } current)
+                {
+                    return (null, null);
+                }
+                if (current.CTag is null || current.CTag != gone.Item.CTag)
+                {
+                    return (new RemoteException(RemoteError.Conflict, $"412 {gone.Name} changed in Microsoft 365 after it was deleted here, so it is kept"), current);
+                }
+                Log($"{gone.DrivePath} changed in Microsoft 365 in its metadata only, deleting it");
+                await api.DeleteAsync(gone.DriveId, current.Id, current.ETag, CancellationToken.None);
+            }
+            return (null, null);
+        }
+        catch (RemoteException e) when (e.Error == RemoteError.NotFound)
+        {
+            return (null, null);
+        }
+        catch (Exception e)
+        {
+            return (e, null);
         }
     }
 
     /// <summary>The outcome of a due delete. Called with the write gate held.</summary>
-    void Deleted(GoneItem gone, Exception? failure)
+    void Deleted(GoneItem gone, Exception? failure, DriveItemInfo? kept)
     {
         if (failure is null)
         {
@@ -970,8 +1318,12 @@ public sealed partial class DriveEngine
         }
         else
         {
-            // Refused (locked, no permission to delete): the file shows again
+            // Refused (locked, no permission to delete) or changed meanwhile: the file shows again
             DropLocal(gone);
+            if (kept is not null && kept.Name.Equals(gone.Name, StringComparison.OrdinalIgnoreCase))
+            {
+                Upsert(gone.DriveId, gone.DrivePath, kept);
+            }
             Report(gone.DriveId, gone.DrivePath, ChangeKind.Added, false);
             Log($"error: delete of {gone.DrivePath} refused, it is back: {Short(failure)}");
             Notify(NoticeKind.NotDeleted, gone.DriveId, gone.DrivePath, Short(failure));
@@ -995,13 +1347,17 @@ public sealed partial class DriveEngine
     /// <summary>A new file under a temp-like name (those included): uploads, if at all, only <see cref="TempUploadDelay"/> after its close.</summary>
     static bool TempLike(PendingFile pending) => pending.Base is null && LocalOnlyNames.IsTempLike(pending.Name);
 
-    async Task RenamePendingAsync(PendingFile pending, string to, DriveItemInfo? toItem, LocalState? toLocal, bool onServer, CancellationToken ct)
+    /// <summary>
+    /// Renames staged content. To a temp name it stays local; a new file to a free name moves here at once (its upload goes on, see
+    /// below); else this is the commit point of a save. Returns the file to flush, and whether to queue its upload, once the gate is let go.
+    /// </summary>
+    async Task<(PendingFile? Moved, bool Queue)> RenamePendingAsync(PendingFile pending, string to, DriveItemInfo? toItem, LocalState? toLocal, bool onServer, CancellationToken ct)
     {
         var driveId = pending.DriveId;
         var from = pending.DrivePath;
         if (pending.Progress is { } progress)
         {
-            await AbandonAsync(pending, progress);
+            _ = AbandonAsync(pending, progress); // aimed at the old name; its fragment in flight ends on its own
         }
         pending.Rejected = false;
         if (LocalOnlyNames.IsTempLike(NameOf(to)) && !onServer)
@@ -1029,7 +1385,36 @@ public sealed partial class DriveEngine
                     pending.Queued = false;
                 }
             }
-            return;
+            return (null, false);
+        }
+
+        if (pending.Base is null && pending.Alias is null && toItem is null && options.UploadNewFilesInBackground)
+        {
+            // A new file to a free name (a browser's download at its end, a first save): moves here at once. An upload running goes on
+            // and its item takes the name once it is up (FollowNameAsync); closed under a temp-like name, it uploads now.
+            if (ParentOf(to) is { Length: > 0 } folder && !folder.Equals(ParentOf(from), StringComparison.OrdinalIgnoreCase)
+                && await LookupAsync(driveId, folder, ct) is not { IsFolder: true })
+            {
+                throw new FsException(FsError.NotFound, $"{folder} isn't there");
+            }
+            DropLocal(toLocal);
+            var uploading = transfers.GetValueOrDefault(pending.Key) is { } running && running.Upload == pending ? running : null;
+            Move(pending, to);
+            if (uploading is not null)
+            {
+                // Operations at the new name wait for it too; the old one stays held, the item is there until it moves
+                Register(uploading, [pending.Key], []);
+            }
+            pending.TempSince = null;
+            var queue = false;
+            if (pending.Writers == 0 && uploading is null && pending.RetryAt is null && pending.Dirty)
+            {
+                pending.CommitAt = null;
+                pending.Queued = true;
+                queue = true;
+            }
+            Log($"renamed {from} to {to}, {(uploading is not null ? "its upload goes on" : "not uploaded yet")}");
+            return (pending, queue);
         }
 
         // Commit point of a save: content goes into the item that owns the destination, else the file's own item, else a new file.
@@ -1038,27 +1423,47 @@ public sealed partial class DriveEngine
         var originalBase = pending.Base;
         var aside = pending.Alias;
         var into = toItem ?? originalBase;
+        var earlier = pending.Unconfirmed is { } unconfirmed && (into is null
+            ? unconfirmed.Target.ItemId is null && unconfirmed.Target.Name == NameOf(to) && unconfirmed.Target.ParentPath == ParentOf(to)
+            : unconfirmed.Target.ItemId == into.Id) ? unconfirmed : null;
+        pending.Unconfirmed = null;
+        UploadTarget? sent = null;
         DriveItemInfo? uploaded = null;
         DriveItemInfo item;
         try
         {
             item = await TransferAsync(async () =>
             {
-                if (into is null)
+                if (earlier is not null && await LandedEarlierAsync(pending, earlier, ct) is { } landed)
                 {
-                    return await api.UploadAsync(driveId, UploadTarget.New(ParentOf(to), NameOf(to)), pending.StagingPath, ct);
+                    Log($"{to}: the last save got no answer, but it went through");
+                    if (into is null)
+                    {
+                        return landed;
+                    }
+                    uploaded = landed;
                 }
-                try
+                else if (into is null)
                 {
-                    uploaded = await UploadIntoAsync(driveId, into, pending.StagingPath, ct);
+                    sent = await NewTargetAsync(driveId, ParentOf(to), NameOf(to), ct);
+                    return await api.UploadAsync(driveId, sent, pending.StagingPath, ct);
                 }
-                catch (RemoteException e) when (e.Error is RemoteError.NotFound or RemoteError.Gone)
+                else
                 {
-                    // Deleted in Microsoft 365 meanwhile: the content becomes a new file under the name
-                    into = null;
-                    return await api.UploadAsync(driveId, UploadTarget.New(ParentOf(to), NameOf(to)), pending.StagingPath, ct);
+                    try
+                    {
+                        sent = UploadTarget.Existing(into);
+                        uploaded = await UploadIntoAsync(driveId, into, pending.StagingPath, ct);
+                    }
+                    catch (RemoteException e) when (e.Error is RemoteError.NotFound or RemoteError.Gone)
+                    {
+                        // Deleted in Microsoft 365 meanwhile: the content becomes a new file under the name
+                        into = null;
+                        sent = await NewTargetAsync(driveId, ParentOf(to), NameOf(to), ct);
+                        return await api.UploadAsync(driveId, sent, pending.StagingPath, ct);
+                    }
                 }
-                return toItem is null ? await api.MoveAsync(driveId, uploaded.Id, await FolderIdAsync(driveId, ParentOf(to), ct), NameOf(to), ct) : uploaded;
+                return toItem is null ? await api.MoveAsync(driveId, uploaded!.Id, await FolderIdAsync(driveId, ParentOf(to), ct), NameOf(to), ct) : uploaded!;
             }, pending.Key, Key(driveId, to));
         }
         catch when (uploaded is not null)
@@ -1066,7 +1471,13 @@ public sealed partial class DriveEngine
             // The content is in the file's own item, the move failed: later uploads go into the item as it is now
             pending.Base = uploaded;
             Upsert(driveId, from, uploaded);
-            Journal(pending);
+            JournalLater(pending);
+            throw;
+        }
+        catch (Exception e) when (sent is not null && !ct.IsCancellationRequested && MayHaveLanded(e) && pending.Writes == writes)
+        {
+            // No answer: it may have gone through, which the next attempt looks up before it sends the file again
+            pending.Unconfirmed = new UnconfirmedUpload(sent, writes);
             throw;
         }
         if (toItem is null && originalBase is not null)
@@ -1093,7 +1504,7 @@ public sealed partial class DriveEngine
                 Claimed(driveId, item);
                 Saved(item, into);
                 Upsert(driveId, to, item);
-                Journal(pending);
+                JournalLater(pending);
                 pending.CommitAt ??= Now + options.PagingCommitDelay;
             }
             else
@@ -1117,6 +1528,7 @@ public sealed partial class DriveEngine
             }
         }
         Log($"saved {to} into {item.Id} (from {NameOf(from)})");
+        return (null, false);
     }
 
     async Task RenameAliasAsync(AliasItem alias, string to, DriveItemInfo? toItem, LocalState? toLocal, bool onServer, CancellationToken ct)
@@ -1135,16 +1547,51 @@ public sealed partial class DriveEngine
             Move(alias, to);
             return;
         }
-        if (alias.Claimed)
+        // A save claimed the item, or new content staged into it will (a file made where the original was takes over its item)
+        if (alias.Claimed || overlay.Values.Any(l => l is PendingFile { Base: { } staged } && l.DriveId == driveId && staged.Id == alias.Item.Id))
         {
             await BackupAsync(alias, to, onServer ? toItem : null, toLocal, ct);
             return;
         }
+        var originalKey = Key(driveId, alias.OriginalPath);
+        if (onServer && toItem is not null && toItem.Id != alias.Item.Id)
+        {
+            // Replacing a file, as in RenameAsync: the alias's content goes into the destination item, which keeps its identity
+            var file = NewStagingFile();
+            DriveItemInfo updated;
+            try
+            {
+                updated = await TransferAsync(async () =>
+                {
+                    await content.CopyToAsync(driveId, alias.Item.Id, alias.Item.CTag ?? alias.Item.ETag, ServedSize(driveId, alias.Item), file, ct,
+                        current => ContentChanged(driveId, current));
+                    return await UploadIntoAsync(driveId, toItem, file, ct);
+                }, alias.Key, Key(driveId, to), originalKey);
+            }
+            catch
+            {
+                TryDelete(file);
+                throw;
+            }
+            DropLocal(alias);
+            DropLocal(toLocal);
+            Claimed(driveId, updated);
+            Saved(updated, toItem);
+            Upsert(driveId, to, updated);
+            // Its own item goes, unless a save went into it meanwhile
+            if (!alias.Claimed && (overlay.GetValueOrDefault(originalKey) is not { } atOriginal || atOriginal is GoneItem gone && gone.Item.Id == alias.Item.Id))
+            {
+                overlay[originalKey] = new GoneItem(driveId, alias.OriginalPath, alias.Item, Now + options.SettleWindow, deleteOnExpiry: true);
+            }
+            AdoptLater(driveId, updated, file, Key(driveId, to));
+            Log($"replaced {to} with {alias.DrivePath}");
+            return;
+        }
 
         var moved = await TransferAsync(async () => await api.MoveAsync(driveId, alias.Item.Id, await FolderIdAsync(driveId, ParentOf(to), ct), NameOf(to), ct),
-            alias.Key, Key(driveId, to), Key(driveId, alias.OriginalPath));
+            alias.Key, Key(driveId, to), originalKey);
         DropLocal(alias);
-        if (overlay.GetValueOrDefault(Key(driveId, alias.OriginalPath)) is GoneItem original && original.Item.Id == alias.Item.Id)
+        if (overlay.GetValueOrDefault(originalKey) is GoneItem original && original.Item.Id == alias.Item.Id)
         {
             DropLocal(original);
         }
@@ -1162,9 +1609,10 @@ public sealed partial class DriveEngine
     {
         var driveId = alias.DriveId;
         var tag = alias.Item.CTag ?? alias.Item.ETag;
+        var notCached = $"{to}: the version of {NameOf(alias.OriginalPath)} before the save isn't cached here, so it can't be kept as a copy";
         if (!content.Has(driveId, alias.Item.Id, tag))
         {
-            throw new FsException(FsError.AccessDenied, $"{to}: the version of {NameOf(alias.OriginalPath)} before the save isn't cached here, so it can't be kept as a copy");
+            throw new FsException(FsError.AccessDenied, notCached);
         }
         var file = NewStagingFile();
         DriveItemInfo backup;
@@ -1174,31 +1622,41 @@ public sealed partial class DriveEngine
             {
                 await content.CopyToAsync(driveId, alias.Item.Id, tag, ServedSize(driveId, alias.Item), file, ct);
                 return into is null
-                    ? await api.UploadAsync(driveId, UploadTarget.New(ParentOf(to), NameOf(to)), file, ct)
+                    ? await api.UploadAsync(driveId, await NewTargetAsync(driveId, ParentOf(to), NameOf(to), ct), file, ct)
                     : await UploadIntoAsync(driveId, into, file, ct);
             }, alias.Key, Key(driveId, to));
+        }
+        catch (ContentChangedException)
+        {
+            // Only partly here (a read was downloading it), and the item holds the save by now
+            TryDelete(file);
+            throw new FsException(FsError.AccessDenied, notCached);
         }
         catch
         {
             TryDelete(file);
             throw;
         }
-        content.Adopt(driveId, backup, file);
         DropLocal(alias);
         DropLocal(toLocal);
         Upsert(driveId, to, backup);
+        AdoptLater(driveId, backup, file, Key(driveId, to));
         Log($"kept the version of {alias.OriginalPath} before the save as {to} ({backup.Id})");
     }
 
-    /// <summary>What became of an upload: the item the content went into, at which path and how, or the failure.</summary>
-    sealed record UploadOutcome(DriveItemInfo? Item, string DrivePath, UploadKind Kind, Exception? Cause);
+    /// <summary>
+    /// What became of an upload: the item the content went into, at which path and how, or the failure. Unconfirmed: the target of an
+    /// upload that failed without an answer and couldn't be looked up, checked before the next attempt.
+    /// </summary>
+    sealed record UploadOutcome(DriveItemInfo? Item, string DrivePath, UploadKind Kind, Exception? Cause, UploadTarget? Unconfirmed = null);
 
     enum UploadKind { Saved, AsNew, ConflictCopy, Recovered, Failed }
 
     /// <summary>
     /// Uploads a pending file. Called with the write gate held; lets it go during the transfer, so other files go on meanwhile, and
-    /// holds it again before applying the outcome. Operations on this file wait for it (<see cref="SettleAsync"/>). A failed upload
-    /// doesn't throw: the file stays staged and is retried with back-off, unless SharePoint refuses it.
+    /// holds it again before applying the outcome. Operations on this file wait for it (<see cref="SettleAsync"/>), except a rename of
+    /// a new file, which it follows. A failed upload doesn't throw: the file stays staged and is retried with back-off, unless
+    /// SharePoint refuses it. The caller flushes the file once the gate is let go.
     /// </summary>
     async Task UploadPendingAsync(PendingFile pending, CancellationToken ct)
     {
@@ -1232,14 +1690,50 @@ public sealed partial class DriveEngine
                 return;
             }
         }
-        var target = TargetOf(pending);
         var replaced = pending.Base;
         var writes = pending.Writes;
-        var outcome = await TransferAsync(() => SendAsync(pending, target, ct), pending.Key);
+        var isNew = pending.Base is null;
+        UploadOutcome? outcome = null;
+        if (pending.Unconfirmed is { } earlier)
+        {
+            // The last attempt got no answer: it may have gone through, and sending it again would end in a conflict copy
+            pending.Unconfirmed = null;
+            try
+            {
+                string[] held = pending.ServerPath is { } at && !at.Equals(pending.DrivePath, StringComparison.Ordinal)
+                    ? [pending.Key, Key(pending.DriveId, at)] : [pending.Key];
+                if (await TransferAsync(() => LandedEarlierAsync(pending, earlier, ct), new Transfer { Upload = pending }, held) is { } landed)
+                {
+                    Log($"{pending.DrivePath}: the last upload got no answer, but it went through");
+                    outcome = new(landed, pending.DrivePath, UploadKind.Saved, null);
+                }
+            }
+            catch (Exception e)
+            {
+                outcome = new(null, pending.DrivePath, UploadKind.Failed, e, earlier.Target);
+            }
+        }
+        if (outcome is null)
+        {
+            if (isNew)
+            {
+                pending.ServerPath = pending.DrivePath;
+            }
+            var target = TargetOf(pending);
+            outcome = await TransferAsync(() => SendAsync(pending, target, writes, ct), new Transfer { Upload = pending }, [pending.Key]);
+        }
+        if (outcome.Kind is UploadKind.Saved or UploadKind.AsNew && ReferenceEquals(overlay.GetValueOrDefault(pending.Key), pending))
+        {
+            outcome = await FollowNameAsync(pending, outcome, ct);
+        }
 
         if (outcome.Kind == UploadKind.Failed)
         {
             var cause = outcome.Cause!;
+            if (outcome.Unconfirmed is { } sent && pending.Writes == writes)
+            {
+                pending.Unconfirmed = new UnconfirmedUpload(sent, writes);
+            }
             if (cause is RemoteException { Error: RemoteError.Rejected })
             {
                 // Retrying can't help: stays here, and in "Not saved", until it is saved or renamed again
@@ -1257,7 +1751,6 @@ public sealed partial class DriveEngine
                 pending.Waiting = true;
                 Notify(NoticeKind.UploadWaiting, pending.DriveId, pending.DrivePath, Short(cause));
             }
-            MarkFlushed(pending);
             return;
         }
 
@@ -1281,17 +1774,18 @@ public sealed partial class DriveEngine
                     overlay[pending.Key] = pending;
                 }
                 pending.Base = item;
+                pending.ServerPath = null;
                 pending.RecoverAsCopy = false;
                 Saved(item, replaced);
                 Upsert(pending.DriveId, outcome.DrivePath, item);
-                Journal(pending);
+                JournalLater(pending);
                 pending.CommitAt ??= Now + options.PagingCommitDelay;
                 Log($"saved {outcome.DrivePath} into {item.Id}; it changed meanwhile, uploading again");
             }
             else
             {
                 Uploaded(pending, item, outcome.DrivePath, outcome.Kind == UploadKind.Saved ? replaced : null);
-                Log($"saved {outcome.DrivePath} into {item.Id}{(target.ItemId is null || outcome.Kind != UploadKind.Saved ? " (new)" : "")}");
+                Log($"saved {outcome.DrivePath} into {item.Id}{(isNew || outcome.Kind != UploadKind.Saved ? " (new)" : "")}");
             }
         }
         finally
@@ -1308,8 +1802,10 @@ public sealed partial class DriveEngine
                     RemoteException { Error: RemoteError.NotFound or RemoteError.Gone } => "deleted",
                     _ => "changed",
                 };
-                Log($"{original} is {why} on the server: saved as {item.Name}");
-                Notify(NoticeKind.ConflictCopy, pending.DriveId, original, item.Name);
+                var other = why == "changed" ? (outcome.Cause as RemoteException)?.Current : null;
+                Log($"{original} is {why} on the server: saved as {item.Name}"); // who saved it shows only in the notification
+                ConflictCopyMade(pending.DriveId, item, other);
+                Notify(NoticeKind.ConflictCopy, pending.DriveId, original, item.Name, other);
                 break;
             case UploadKind.Recovered:
                 Log($"{original} was still being written when the PC or the agent stopped: saved next to it as {item.Name}, the file itself is unchanged");
@@ -1328,12 +1824,63 @@ public sealed partial class DriveEngine
     }
 
     /// <summary>
+    /// The upload of a new file went through while the file was renamed or moved here (RenamePendingAsync): its item follows on the
+    /// server. A name taken there meanwhile gets a conflict copy's name; another failure keeps the file staged into the item, to try
+    /// again. Called with the write gate held; the outcome is then at the file's path.
+    /// </summary>
+    async Task<UploadOutcome> FollowNameAsync(PendingFile pending, UploadOutcome outcome, CancellationToken ct)
+    {
+        var item = outcome.Item!;
+        for (var attempt = 1; pending.ServerPath is { } at && !at.Equals(pending.DrivePath, StringComparison.Ordinal);)
+        {
+            if (Blocking([pending.Key], t => t.Upload == pending) is not null)
+            {
+                await SettleExceptAsync(t => t.Upload == pending, pending.Key); // a move of a folder above it ends first
+                continue;
+            }
+            var to = pending.DrivePath;
+            try
+            {
+                // The name it has on the server stays held until it moves: a new file there would collide with it
+                item = await TransferAsync(async () => await api.MoveAsync(pending.DriveId, item.Id, await FolderIdAsync(pending.DriveId, ParentOf(to), ct), NameOf(to), ct),
+                    new Transfer { Upload = pending }, [pending.Key, Key(pending.DriveId, at)]);
+                pending.ServerPath = to;
+                Forget(pending.DriveId, at);
+            }
+            catch (RemoteException e) when (e.Error == RemoteError.Conflict && attempt < 10)
+            {
+                // The name was taken on the server meanwhile: the file keeps a conflict copy's name next to it
+                var copy = JoinDrivePath(ParentOf(to), ConflictName(NameOf(to), attempt++));
+                if (pending.DrivePath == to && !overlay.ContainsKey(Key(pending.DriveId, copy)))
+                {
+                    Move(pending, copy);
+                    Log($"{to} was taken on the server meanwhile: saved as {NameOf(copy)}");
+                    Notify(NoticeKind.ConflictCopy, pending.DriveId, to, NameOf(copy));
+                }
+            }
+            catch (Exception e)
+            {
+                // The content is up under the earlier name: the file stays staged into that item, and the retry finds the content there
+                // (unless written meanwhile) and sends only the name
+                pending.Base = item;
+                pending.Unconfirmed = new UnconfirmedUpload(UploadTarget.Existing(item), pending.Writes);
+                Upsert(pending.DriveId, at, item);
+                JournalLater(pending);
+                return new(null, pending.DrivePath, UploadKind.Failed, e);
+            }
+        }
+        pending.ServerPath = null;
+        return outcome with { Item = item, DrivePath = pending.DrivePath };
+    }
+
+    /// <summary>
     /// The transfer of <see cref="UploadPendingAsync"/>, without the write gate: into the item, else as a new file under its name when
     /// the item was deleted on the server, else as a conflict copy next to it. Content recovered without a flush goes only into a
-    /// "(recovered)" copy.
+    /// "(recovered)" copy. A failure without an answer is looked up at once: it may have gone through.
     /// </summary>
-    async Task<UploadOutcome> SendAsync(PendingFile pending, UploadTarget target, CancellationToken ct)
+    async Task<UploadOutcome> SendAsync(PendingFile pending, UploadTarget target, int writes, CancellationToken ct)
     {
+        UploadTarget? sent = null;
         try
         {
             if (pending.Recovered)
@@ -1352,32 +1899,98 @@ public sealed partial class DriveEngine
             }
             try
             {
-                var item = await FinishProgressiveAsync(pending, ct)
-                    ?? (pending.Base is { } baseItem ? await UploadIntoAsync(pending.DriveId, baseItem, pending.StagingPath, ct)
-                        : await api.UploadAsync(pending.DriveId, target, pending.StagingPath, ct));
-                return new(item, pending.DrivePath, UploadKind.Saved, null);
+                sent = pending.Progress is not null ? target : null;
+                if (await FinishProgressiveAsync(pending, ct) is { } streamed)
+                {
+                    return new(streamed, pending.DrivePath, UploadKind.Saved, null);
+                }
+                if (pending.Base is { } baseItem)
+                {
+                    sent = target;
+                    return new(await UploadIntoAsync(pending.DriveId, baseItem, pending.StagingPath, ct), pending.DrivePath, UploadKind.Saved, null);
+                }
+                sent = await NewTargetAsync(pending.DriveId, target.ParentPath!, target.Name!, ct);
+                return new(await api.UploadAsync(pending.DriveId, sent, pending.StagingPath, ct), pending.DrivePath, UploadKind.Saved, null);
             }
             catch (RemoteException e) when (target.ItemId is not null && e.Error is RemoteError.NotFound or RemoteError.Gone)
             {
                 try
                 {
-                    var created = await api.UploadAsync(pending.DriveId, UploadTarget.New(ParentOf(pending.DrivePath), pending.Name), pending.StagingPath, ct);
+                    sent = await NewTargetAsync(pending.DriveId, ParentOf(pending.DrivePath), pending.Name, ct);
+                    var created = await api.UploadAsync(pending.DriveId, sent, pending.StagingPath, ct);
                     return new(created, pending.DrivePath, UploadKind.AsNew, e);
                 }
                 catch (RemoteException again) when (again.Error == RemoteError.Conflict)
                 {
+                    sent = null;
                     return await CopyAsync(pending, ConflictName, UploadKind.ConflictCopy, e, ct);
                 }
             }
             catch (RemoteException e) when (e.Error is RemoteError.Conflict or RemoteError.Locked)
             {
+                sent = null;
                 return await CopyAsync(pending, ConflictName, UploadKind.ConflictCopy, e, ct);
+            }
+        }
+        catch (Exception e) when (sent is not null && !ct.IsCancellationRequested && MayHaveLanded(e) && pending.Writes == writes)
+        {
+            try
+            {
+                if (await LandedAsync(pending, sent, ct) is { } landed)
+                {
+                    Log($"{pending.DrivePath}: the upload got no answer, but it went through");
+                    return new(landed, pending.DrivePath, UploadKind.Saved, null);
+                }
+                return new(null, pending.DrivePath, UploadKind.Failed, e);
+            }
+            catch (Exception)
+            {
+                return new(null, pending.DrivePath, UploadKind.Failed, e, sent);
             }
         }
         catch (Exception e)
         {
             return new(null, pending.DrivePath, UploadKind.Failed, e);
         }
+    }
+
+    /// <summary>A failure that doesn't tell whether a write reached Microsoft 365: no answer (network, timeout) or a server error.</summary>
+    static bool MayHaveLanded(Exception e) =>
+        e is HttpRequestException or IOException or TimeoutException or OperationCanceledException || e is RemoteException { Error: RemoteError.Unavailable };
+
+    /// <summary>
+    /// An earlier upload of this content got no answer: the item it reached when it went through after all, null when it didn't or the
+    /// content changed since (then it can't be told). Throws when Microsoft 365 can't be asked.
+    /// </summary>
+    async Task<DriveItemInfo?> LandedEarlierAsync(PendingFile pending, UnconfirmedUpload earlier, CancellationToken ct) =>
+        earlier.Writes == pending.Writes ? await LandedAsync(pending, earlier.Target, ct) : null;
+
+    /// <summary>
+    /// After an upload of the staged content that ended without an answer: the item at its target when it holds this content (same size
+    /// and quickXorHash), null when it doesn't or there is no hash to tell by. Throws when Microsoft 365 can't be asked.
+    /// </summary>
+    async Task<DriveItemInfo?> LandedAsync(PendingFile pending, UploadTarget target, CancellationToken ct)
+    {
+        if (await api.GetUploadedAsync(pending.DriveId, target, ct) is not { QuickXorHash: { } hash, Item: { IsFolder: false } item }
+            || item.Size != new FileInfo(pending.StagingPath).Length)
+        {
+            return null;
+        }
+        return hash == QuickXorHash.OfFile(pending.StagingPath) ? item : null;
+    }
+
+    /// <summary>A new file's target, with its folder by item ID (but the library's top): it lands there even when the folder moves meanwhile.</summary>
+    async Task<UploadTarget> NewTargetAsync(string driveId, string parentPath, string name, CancellationToken ct)
+    {
+        var target = UploadTarget.New(parentPath, name);
+        if (parentPath.Length == 0)
+        {
+            return target;
+        }
+        return target with
+        {
+            ParentId = listings.TryGetValue(Key(driveId, parentPath), out var listing) && listing.FolderId is { } id ? id : await FolderIdAsync(driveId, parentPath, ct),
+        };
     }
 
     /// <summary>
@@ -1390,7 +2003,7 @@ public sealed partial class DriveEngine
         {
             // A version read whose eTag isn't known (AsRead): the item must still hold that content
             var current = await api.GetItemByIdAsync(driveId, into.Id, ct) ?? throw new RemoteException(RemoteError.NotFound, $"{into.Name} was deleted in Microsoft 365");
-            into = current.CTag == into.CTag ? current : throw new RemoteException(RemoteError.Conflict, $"412 {into.Name} changed in Microsoft 365 since it was read");
+            into = current.CTag == into.CTag ? current : throw new RemoteException(RemoteError.Conflict, $"412 {into.Name} changed in Microsoft 365 since it was read") { Current = current };
         }
         try
         {
@@ -1398,9 +2011,13 @@ public sealed partial class DriveEngine
         }
         catch (RemoteException e) when (e.Error == RemoteError.Conflict && into.CTag is not null)
         {
-            if (await api.GetItemByIdAsync(driveId, into.Id, ct) is not { } current || current.CTag != into.CTag || current.ETag == into.ETag)
+            if (await api.GetItemByIdAsync(driveId, into.Id, ct) is not { } current || current.ETag == into.ETag)
             {
                 throw;
+            }
+            if (current.CTag != into.CTag)
+            {
+                throw new RemoteException(e.Error, e.Message) { Current = current }; // who saved it, for the conflict copy's notice
             }
             Log($"{into.Name} changed in Microsoft 365 in its metadata only, saving into it");
             return await api.UploadAsync(driveId, UploadTarget.Existing(current), file, ct);
@@ -1415,7 +2032,7 @@ public sealed partial class DriveEngine
         {
             try
             {
-                var copy = await api.UploadAsync(pending.DriveId, UploadTarget.New(parent, name(pending.Name, attempt)), pending.StagingPath, ct);
+                var copy = await api.UploadAsync(pending.DriveId, await NewTargetAsync(pending.DriveId, parent, name(pending.Name, attempt), ct), pending.StagingPath, ct);
                 return new(copy, JoinDrivePath(parent, copy.Name), kind, cause);
             }
             catch (RemoteException e) when (e.Error == RemoteError.Conflict && attempt < 10)
@@ -1426,15 +2043,19 @@ public sealed partial class DriveEngine
 
     /// <summary>
     /// For a file recovered after a crash: the item at its path when it has the staged content already (the upload went through before
-    /// the journal was removed), else null.
+    /// the journal was removed), else null. Told by quickXorHash; downloaded and compared only when Microsoft 365 has no hash for it.
     /// </summary>
     async Task<DriveItemInfo?> AlreadyUploadedAsync(PendingFile pending, CancellationToken ct)
     {
-        var current = await api.GetItemAsync(pending.DriveId, pending.DrivePath, ct);
-        if (current is null || current.IsFolder || current.Size != new FileInfo(pending.StagingPath).Length
+        if (await api.GetUploadedAsync(pending.DriveId, UploadTarget.New(ParentOf(pending.DrivePath), pending.Name), ct) is not { Item: var current } found
+            || current.IsFolder || current.Size != new FileInfo(pending.StagingPath).Length
             || (pending.Base is { } baseItem && (current.Id != baseItem.Id || current.ETag == baseItem.ETag)))
         {
             return null;
+        }
+        if (found.QuickXorHash is { } hash)
+        {
+            return hash == QuickXorHash.OfFile(pending.StagingPath) ? current : null;
         }
         var copy = NewStagingFile();
         try
@@ -1476,7 +2097,7 @@ public sealed partial class DriveEngine
         }
     }
 
-    /// <summary>Waits for the background uploads and deletes queued or running now.</summary>
+    /// <summary>Waits for the background uploads, deletes and caching of uploads queued or running now.</summary>
     public async Task WaitForUploadsAsync()
     {
         while (RunningUploads() is { Length: > 0 } running)
@@ -1487,28 +2108,95 @@ public sealed partial class DriveEngine
 
     /// <summary>
     /// The pending content is now <paramref name="item"/> at <paramref name="drivePath"/>, replacing <paramref name="replaced"/> when that
-    /// is the same item. Called with its write lock held.
+    /// is the same item. Called with its write lock and the write gate held; the staging file becomes cached content after the gate.
     /// </summary>
     void Uploaded(PendingFile pending, DriveItemInfo item, string drivePath, DriveItemInfo? replaced)
     {
         recentUploads[item.Id] = Now;
         Saved(item, replaced);
         pending.Retire(item, drivePath);
+        Upsert(pending.DriveId, drivePath, item); // before the pending file goes, so the new file is never briefly not found
         overlay.TryRemove(new KeyValuePair<string, LocalState>(pending.Key, pending));
         if (overlay.GetValueOrDefault(Key(pending.DriveId, drivePath)) is GoneItem gone)
         {
             DropLocal(gone);
         }
         Claimed(pending.DriveId, item);
-        Upsert(pending.DriveId, drivePath, item);
         if (!item.Name.Equals(NameOf(drivePath), StringComparison.OrdinalIgnoreCase))
         {
             // Content under a temp name went into its item, which keeps its own name: nothing is at the temp name, so deleting it can't reach the item
             Forget(pending.DriveId, drivePath);
         }
-        content.Adopt(pending.DriveId, item, pending.StagingPath);
-        TryDelete(JournalOf(pending.StagingPath));
+        Unjournal(pending);
+        AdoptLater(pending.DriveId, item, pending.StagingPath, Key(pending.DriveId, drivePath));
     }
+
+    /// <summary>
+    /// The staging file of uploaded content becomes the item's cached content without the write gate (encrypting a large file takes
+    /// seconds). Reads of that version use the staging file until then (<see cref="Follow"/>); staging the file again waits for it, as
+    /// for a transfer. Content SharePoint changed on upload (Office files) isn't kept: reads go to Microsoft 365 at once. Called with the
+    /// write gate held.
+    /// </summary>
+    void AdoptLater(string driveId, DriveItemInfo item, string staging, string key)
+    {
+        var version = AdoptKey(driveId, item.Id, item.CTag ?? item.ETag);
+        long length;
+        try
+        {
+            length = new FileInfo(staging).Length;
+        }
+        catch (IOException)
+        {
+            length = -1;
+        }
+        // The cache takes a second name of the file, so a read handed the staging path (Follow) just before it is done still opens it
+        var source = staging;
+        if (length == item.Size)
+        {
+            adopting[version] = staging;
+            if (TryLink(staging, staging + ".adopt"))
+            {
+                source = staging + ".adopt";
+            }
+        }
+        var transfer = new Transfer { MovesAlong = true };
+        Register(transfer, [key], []);
+        Track(Task.Run(async () =>
+        {
+            try
+            {
+                content.Adopt(driveId, item, source);
+            }
+            finally
+            {
+                adopting.TryRemove(new KeyValuePair<string, string>(version, staging));
+                await writeGate.WaitAsync();
+                try
+                {
+                    Unregister(transfer);
+                }
+                finally
+                {
+                    ReleaseGate();
+                    transfer.End();
+                }
+            }
+            if (source != staging)
+            {
+                await Task.Delay(StagingReadGrace);
+                TryDelete(staging);
+            }
+        }));
+    }
+
+    /// <summary>How long a staging file stays after its content was cached, for reads that were handed its path just before.</summary>
+    static readonly TimeSpan StagingReadGrace = TimeSpan.FromMilliseconds(250);
+
+    /// <summary>A second name for a file (a hard link); false where the file system has none, and the file is then cached under its own.</summary>
+    static bool TryLink(string existing, string link) => OperatingSystem.IsWindows() && CreateHardLink(link, existing, IntPtr.Zero);
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll", EntryPoint = "CreateHardLinkW", CharSet = System.Runtime.InteropServices.CharSet.Unicode, SetLastError = true)]
+    static extern bool CreateHardLink(string fileName, string existingFileName, IntPtr securityAttributes);
 
     /// <summary>New content went into the item: it is no longer hidden or waiting to be restored anywhere.</summary>
     void Claimed(string driveId, DriveItemInfo item)
@@ -1563,7 +2251,7 @@ public sealed partial class DriveEngine
                 _ = AbandonAsync(pending, progress);
             }
             TryDelete(pending.StagingPath);
-            TryDelete(JournalOf(pending.StagingPath));
+            Unjournal(pending);
         }
     }
 
@@ -1589,7 +2277,7 @@ public sealed partial class DriveEngine
     {
         if (folderPath.Length > 0)
         {
-            return (await LookupAsync(driveId, folderPath, ct))?.Id ?? throw new FsException(FsError.NotFound, folderPath);
+            return (await LookupAsync(driveId, folderPath, ct, refreshParent: false))?.Id ?? throw new FsException(FsError.NotFound, folderPath);
         }
         var key = Key(driveId, "");
         if (lookups.TryGetValue(key, out var known) && known.Item is { } root)
@@ -1672,8 +2360,8 @@ public sealed partial class DriveEngine
 
     void Log(string message) => options.Log?.Invoke(message);
 
-    void Notify(NoticeKind kind, string driveId, string drivePath, string? detail) =>
-        options.Notice?.Invoke(new EngineNotice(kind, NameOf(drivePath), VolumePath(driveId, drivePath), detail));
+    void Notify(NoticeKind kind, string driveId, string drivePath, string? detail, DriveItemInfo? other = null) =>
+        options.Notice?.Invoke(new EngineNotice(kind, NameOf(drivePath), VolumePath(driveId, drivePath), detail, other?.ModifiedBy, other?.Modified));
 
     /// <summary>Where a drive path shows on the volume; null when its library isn't mounted.</summary>
     string? VolumePath(string driveId, string drivePath) =>

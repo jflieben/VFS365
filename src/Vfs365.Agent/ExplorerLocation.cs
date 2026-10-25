@@ -58,9 +58,16 @@ static class ExplorerLocation
 
     public static void Unregister() => Unregister(Registry.CurrentUser, includeDriveLabels: false);
 
-    /// <summary>Removes the navigation pane entry from a user's hive, and with <paramref name="includeDriveLabels"/> the drive names too (uninstall).</summary>
+    /// <summary>
+    /// Removes the navigation pane entry from a user's hive, and with <paramref name="includeDriveLabels"/> the drive names and the
+    /// VFS365 menu (<see cref="ExplorerVerbs"/>) too (uninstall).
+    /// </summary>
     public static void Unregister(RegistryKey hive, bool includeDriveLabels)
     {
+        if (includeDriveLabels)
+        {
+            ExplorerVerbs.Remove(hive);
+        }
         hive.DeleteSubKeyTree($@"{Classes}\CLSID\{Clsid}", false);
         hive.DeleteSubKeyTree($@"{Classes}\WOW6432Node\CLSID\{Clsid}", false);
         hive.DeleteSubKeyTree(NameSpace, false);
@@ -83,7 +90,7 @@ static class ExplorerLocation
     {
         using var nameSpace = hive.OpenSubKey(NameSpace);
         using var mountPoints = hive.OpenSubKey($@"{Explorer}\MountPoints2");
-        return nameSpace is not null || DriveLabelKeys(mountPoints).Any();
+        return nameSpace is not null || DriveLabelKeys(mountPoints).Any() || ExplorerVerbs.IsRegistered(hive);
     }
 
     static IEnumerable<string> DriveLabelKeys(RegistryKey? mountPoints) =>
@@ -91,41 +98,67 @@ static class ExplorerLocation
 
     /// <summary>
     /// The name Explorer shows for the network drive (instead of "share (\\server)"), for the UNC prefix \server\share.
-    /// Drops names left for other prefixes, such as \VFS365\&lt;tenant&gt; from 0.1.3 and earlier.
+    /// Drops names left for other prefixes, such as \VFS365\&lt;tenant&gt; from 0.1.3 and earlier. Explorer is told only when something changed.
     /// </summary>
     public static void SetDriveLabel(string uncPrefix, string label)
     {
         var keyName = LabelKey(uncPrefix);
         using var mountPoints = Registry.CurrentUser.CreateSubKey($@"{Explorer}\MountPoints2");
+        var changed = false;
         foreach (var stale in DriveLabelKeys(mountPoints).Where(name => !name.Equals(keyName, StringComparison.OrdinalIgnoreCase)
-            && !name.StartsWith(keyName + "#", StringComparison.OrdinalIgnoreCase)))
+            && !name.StartsWith(keyName + "#", StringComparison.OrdinalIgnoreCase)).ToList())
         {
             mountPoints.DeleteSubKeyTree(stale, false);
+            changed = true;
+        }
+        if (WriteLabel(mountPoints, keyName, label) || changed)
+        {
+            Refresh();
+        }
+    }
+
+    /// <summary>
+    /// The name Explorer shows for a drive letter given a folder inside the volume (policy DriveMappings), by its UNC path. Written only
+    /// when it differs: true then, and the caller tells Explorer once (<see cref="Refresh"/>) after all its letters.
+    /// </summary>
+    public static bool SetFolderLabel(string unc, string label)
+    {
+        using var mountPoints = Registry.CurrentUser.CreateSubKey($@"{Explorer}\MountPoints2");
+        return WriteLabel(mountPoints, LabelKey(unc), label);
+    }
+
+    static bool WriteLabel(RegistryKey mountPoints, string keyName, string label)
+    {
+        using (var existing = mountPoints.OpenSubKey(keyName))
+        {
+            if (existing?.GetValue("_LabelFromReg") is string current && current == label)
+            {
+                return false;
+            }
         }
         using var mountPoint = mountPoints.CreateSubKey(keyName);
         mountPoint.SetValue("_LabelFromReg", label);
-        Refresh();
+        return true;
     }
 
-    /// <summary>The name Explorer shows for a drive letter given a folder inside the volume (policy DriveMappings), by its UNC path.</summary>
-    public static void SetFolderLabel(string unc, string label)
-    {
-        using var mountPoint = Registry.CurrentUser.CreateSubKey($@"{Explorer}\MountPoints2\{LabelKey(unc)}");
-        mountPoint.SetValue("_LabelFromReg", label);
-        Refresh();
-    }
-
+    /// <summary>Removes a folder's drive name (at unmount); a registry that refuses it never stops the unmount.</summary>
     public static void RemoveFolderLabel(string unc)
     {
-        using var mountPoints = Registry.CurrentUser.OpenSubKey($@"{Explorer}\MountPoints2", writable: true);
-        mountPoints?.DeleteSubKeyTree(LabelKey(unc), false);
+        try
+        {
+            using var mountPoints = Registry.CurrentUser.OpenSubKey($@"{Explorer}\MountPoints2", writable: true);
+            mountPoints?.DeleteSubKeyTree(LabelKey(unc), false);
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException or System.Security.SecurityException)
+        {
+        }
     }
 
     /// <summary>MountPoints2's key for \\server\share\path (or \server\share): ##server#share#path.</summary>
     static string LabelKey(string unc) => "##" + unc.TrimStart('\\').Replace('\\', '#');
 
     /// <summary>Tells Explorer to read its folders and names again (SHCNE_ASSOCCHANGED).</summary>
-    internal static void Refresh() => SHChangeNotify(0x08000000, 0, null, IntPtr.Zero);
+    public static void Refresh() => SHChangeNotify(0x08000000, 0, null, IntPtr.Zero);
 
     /// <summary>Tells Explorer a drive letter ("Z:") came (SHCNE_DRIVEADD) or went (SHCNE_DRIVEREMOVED), by its path (SHCNF_PATHW).</summary>
     internal static void DriveAdded(string letter) => SHChangeNotify(0x100, 5, letter + @"\", IntPtr.Zero);

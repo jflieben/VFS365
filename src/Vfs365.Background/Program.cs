@@ -6,6 +6,10 @@ using Vfs365.Agent;
 // on logoff, shutdown and the installer (Restart Manager): only once Windows really ends it (SessionEnded, not a shutdown that is still
 // asked about and can be cancelled), redirected folders go back, the drive letters for folders and the navigation pane entry go, then
 // the mount uploads pending changes and stops.
+if (args is ["verb", ..])
+{
+    return VerbPipe.RunClient(args); // Explorer's VFS365 menu: hands the request to the running agent and ends
+}
 if (!args.Contains(AgentSupervisor.ChildFlag, StringComparer.OrdinalIgnoreCase))
 {
     var ending = false;
@@ -20,5 +24,5 @@ SystemEvents.PowerModeChanged += (_, e) =>
         AgentCommands.PowerChanged(resumed: e.Mode == PowerModes.Resume);
     }
 };
-using var log = AgentLog.Open(newSession: false);
+using var log = AgentLog.OpenGuarded(newSession: false); // a profile that isn't writable yet at logon never ends the agent
 return await AgentCommands.RunAsync(["mount", .. args.Where(a => !a.Equals(AgentSupervisor.ChildFlag, StringComparison.OrdinalIgnoreCase))], log, log, timestamps: true, tray: true);

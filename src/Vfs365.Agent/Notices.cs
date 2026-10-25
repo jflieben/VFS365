@@ -73,6 +73,7 @@ public static class SignInText
         (["AADSTS50057"], "Aad.Disabled"),
         (["AADSTS50020", SignInException.Guest], "Aad.Guest"),
         ([SignInException.Cancelled], "Aad.Cancelled"),
+        ([SignInException.Unavailable], "Aad.Unavailable"),
     ];
 
     public static string Of(Exception e, CultureInfo? culture = null) => UiText.Get(culture, Key(Message(e)));
@@ -154,9 +155,14 @@ public sealed class NoticeBatcher(bool notifyUploads = true)
     /// </summary>
     public IReadOnlyList<(string Title, string Text)> Due(DateTimeOffset now, CultureInfo? culture = null)
     {
-        var batches = new List<(NoticeKind Kind, List<(EngineNotice Notice, Cause Cause)> Items)>();
+        List<(NoticeKind Kind, List<(EngineNotice Notice, Cause Cause)> Items)> batches;
         lock (gate)
         {
+            if (pending.Count == 0)
+            {
+                return []; // the agent asks every second
+            }
+            batches = [];
             // A file that uploaded after it was waiting needs no "waiting" toast
             var done = pending.Where(n => n.Notice.Kind == NoticeKind.UploadDone).GroupBy(n => NameOf(n.Notice), StringComparer.OrdinalIgnoreCase)
                 .ToDictionary(g => g.Key, g => g.Max(n => n.At), StringComparer.OrdinalIgnoreCase);
@@ -182,7 +188,9 @@ public sealed class NoticeBatcher(bool notifyUploads = true)
             toasts.Add(kind switch
             {
                 NoticeKind.ConflictCopy => (UiText.Get(culture, "Copy.Title"),
-                    items.Count == 1 ? UiText.Get(culture, "Copy.One", first.Name, first.Detail) : UiText.Get(culture, "Copy.Many", items.Count)),
+                    items.Count > 1 ? UiText.Get(culture, "Copy.Many", items.Count)
+                    : first is { By: { } by, At: { } at } ? UiText.Get(culture, "Copy.By", first.Name, first.Detail, by, at.ToLocalTime().ToString("g", culture ?? CultureInfo.CurrentUICulture))
+                    : UiText.Get(culture, "Copy.One", first.Name, first.Detail)),
                 NoticeKind.NotDeleted => (UiText.Get(culture, "NotDeleted.Title"),
                     items.Count == 1 ? UiText.Get(culture, "NotDeleted.One", first.Name, cause) : UiText.Get(culture, "NotDeleted.Many", items.Count)),
                 NoticeKind.UploadWaiting => (UiText.Get(culture, "Waiting.Title"),

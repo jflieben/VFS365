@@ -84,6 +84,17 @@ sealed class WamAccount(IntPtr account, string userName) : IDisposable
 
     public IntPtr Pointer => pointer;
 
+    /// <summary>A reference of the caller's own for one request (Marshal.Release it after), so disposing this meanwhile is safe; zero when disposed.</summary>
+    public IntPtr AddRef()
+    {
+        var owned = pointer;
+        if (owned != IntPtr.Zero)
+        {
+            Marshal.AddRef(owned);
+        }
+        return owned;
+    }
+
     public void Dispose()
     {
         if (Interlocked.Exchange(ref pointer, IntPtr.Zero) is var owned && owned != IntPtr.Zero)
@@ -96,9 +107,22 @@ sealed class WamAccount(IntPtr account, string userName) : IDisposable
 /// <summary>What a token request returned. Account is set on success (dispose it when not kept).</summary>
 sealed record WamResult(WamStatus Status, string? Token, WamAccount? Account, IReadOnlyDictionary<string, string> Properties, uint ErrorCode, string? ErrorMessage);
 
-/// <summary>Token requests to the Microsoft work or school account provider. WAM's objects are agile: calls work from any thread.</summary>
-sealed class WamClient
+/// <summary>WAM's token requests as WamTokenSource uses them: <see cref="WamClient"/>, or a fake in tests.</summary>
+interface IWamBroker
 {
+    /// <summary>A token; silent when <paramref name="window"/> is zero. <paramref name="account"/>: a WebAccount pointer, or zero for the Windows account.</summary>
+    Task<WamResult> RequestAsync(string scope, string clientId, IReadOnlyDictionary<string, string> properties, IntPtr account, IntPtr window,
+        CancellationToken ct, bool forcePrompt = false);
+
+    Task SignOutAsync(IntPtr account, string clientId, CancellationToken ct);
+}
+
+/// <summary>Token requests to the Microsoft work or school account provider. WAM's objects are agile: calls work from any thread.</summary>
+sealed class WamClient : IWamBroker
+{
+    /// <summary>After a request is cancelled (a timeout), how long WAM gets to confirm before the wait ends anyway.</summary>
+    static readonly TimeSpan CancelGrace = TimeSpan.FromSeconds(2);
+
     const string ManagerClass = "Windows.Security.Authentication.Web.Core.WebAuthenticationCoreManager";
     const string RequestClass = "Windows.Security.Authentication.Web.Core.WebTokenRequest";
 
@@ -119,26 +143,38 @@ sealed class WamClient
     WamClient(IntPtr statics, IntPtr interop, IntPtr requests, IntPtr provider) =>
         (this.statics, this.interop, this.requests, this.provider) = (statics, interop, requests, provider);
 
-    /// <summary>The client for the Microsoft work or school account provider; lives as long as the process.</summary>
+    /// <summary>The client for the Microsoft work or school account provider; lives as long as the process. A failure releases what it got.</summary>
     public static async Task<WamClient> CreateAsync(CancellationToken ct)
     {
         WinRt.JoinMta();
-        var statics = WinRt.Factory(ManagerClass, IWebAuthenticationCoreManagerStatics);
-        var interop = WinRt.Factory(ManagerClass, IWebAuthenticationCoreManagerInterop);
-        var requests = WinRt.Factory(RequestClass, IWebTokenRequestFactory);
-        // FindAccountProviderAsync(id, authority)
-        var operation = WinRt.WithStrings([Wam.MicrosoftProvider, "organizations"], s => WinRt.Out(statics, 12, s[0], s[1]));
-        var provider = await ResultAsync(operation, ct);
-        return provider == IntPtr.Zero
-            ? throw new InvalidOperationException("Windows has no provider for work or school accounts")
-            : new WamClient(statics, interop, requests, provider);
+        var (statics, interop, requests) = (IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
+        try
+        {
+            statics = WinRt.Factory(ManagerClass, IWebAuthenticationCoreManagerStatics);
+            interop = WinRt.Factory(ManagerClass, IWebAuthenticationCoreManagerInterop);
+            requests = WinRt.Factory(RequestClass, IWebTokenRequestFactory);
+            // FindAccountProviderAsync(id, authority)
+            var operation = WinRt.WithStrings([Wam.MicrosoftProvider, "organizations"], s => WinRt.Out(statics, 12, s[0], s[1]));
+            var provider = await ResultAsync(operation, ct);
+            return provider == IntPtr.Zero
+                ? throw new InvalidOperationException("Windows has no provider for work or school accounts")
+                : new WamClient(statics, interop, requests, provider);
+        }
+        catch
+        {
+            foreach (var factory in new[] { statics, interop, requests }.Where(f => f != IntPtr.Zero))
+            {
+                Marshal.Release(factory);
+            }
+            throw;
+        }
     }
 
     /// <summary>
     /// A token for <paramref name="scope"/>: silently when <paramref name="window"/> is zero, else with a sign-in window owned by it.
     /// Without <paramref name="account"/>, the Windows account (silent) or the user's choice (window).
     /// </summary>
-    public async Task<WamResult> RequestAsync(string scope, string clientId, IReadOnlyDictionary<string, string> properties, WamAccount? account,
+    public async Task<WamResult> RequestAsync(string scope, string clientId, IReadOnlyDictionary<string, string> properties, IntPtr account,
         IntPtr window, CancellationToken ct, bool forcePrompt = false)
     {
         var request = WinRt.WithStrings([scope, clientId], s => forcePrompt
@@ -159,10 +195,9 @@ sealed class WamClient
             {
                 Marshal.Release(map);
             }
-            var accountPointer = account?.Pointer ?? IntPtr.Zero;
-            operation = window != IntPtr.Zero ? WinRt.RequestForWindow(interop, window, request, accountPointer, IAsyncOperationOfResult)
-                : accountPointer == IntPtr.Zero ? WinRt.Out(statics, 6, request) // GetTokenSilentlyAsync(request)
-                : WinRt.Out(statics, 7, request, accountPointer); // GetTokenSilentlyAsync(request, account)
+            operation = window != IntPtr.Zero ? WinRt.RequestForWindow(interop, window, request, account, IAsyncOperationOfResult)
+                : account == IntPtr.Zero ? WinRt.Out(statics, 6, request) // GetTokenSilentlyAsync(request)
+                : WinRt.Out(statics, 7, request, account); // GetTokenSilentlyAsync(request, account)
         }
         finally
         {
@@ -180,9 +215,9 @@ sealed class WamClient
     }
 
     /// <summary>Signs <paramref name="account"/> out of this app (WebAccount.SignOutAsync(clientId)); the Windows account stays signed in.</summary>
-    public static async Task SignOutAsync(WamAccount account, string clientId, CancellationToken ct)
+    public async Task SignOutAsync(IntPtr account, string clientId, CancellationToken ct)
     {
-        Marshal.ThrowExceptionForHR(Marshal.QueryInterface(account.Pointer, in IWebAccount2, out var account2));
+        WinRt.Check(Marshal.QueryInterface(account, in IWebAccount2, out var account2));
         IntPtr action;
         try
         {
@@ -262,38 +297,56 @@ sealed class WamClient
     /// <summary>
     /// Waits for an IAsyncOperation (or IAsyncAction) and returns its result (an owned pointer; zero for an action). Polls its status:
     /// a completion handler would need a COM object of our own, and requests take milliseconds (cached) to minutes (a sign-in window).
+    /// Cancelling <paramref name="ct"/> cancels the operation; when WAM doesn't confirm within CancelGrace the wait ends anyway. A failure
+    /// is a COMException with WAM's HRESULT.
     /// </summary>
     static async Task<IntPtr> ResultAsync(IntPtr operation, CancellationToken ct, bool hasResult = true)
     {
         var info = IntPtr.Zero;
+        var started = true;
         try
         {
             info = WinRt.AsyncInfo(operation);
             var delay = 1;
-            var cancelled = false;
+            long? cancelledAt = null;
             int status;
             while ((status = WinRt.OutInt(info, 7)) == 0) // get_Status: Started
             {
-                if (ct.IsCancellationRequested && !cancelled)
+                if (ct.IsCancellationRequested)
                 {
-                    WinRt.Call(info, 9); // Cancel
-                    cancelled = true;
+                    if (cancelledAt is null)
+                    {
+                        WinRt.Call(info, 9); // Cancel
+                        cancelledAt = Environment.TickCount64;
+                    }
+                    else if (Environment.TickCount64 - cancelledAt >= CancelGrace.TotalMilliseconds)
+                    {
+                        throw new OperationCanceledException(ct); // released below; WAM finishes it on its own
+                    }
                 }
                 await Task.Delay(delay, CancellationToken.None);
                 delay = Math.Min(delay * 2, 50);
             }
+            started = false;
+            if (status == 3) // Error: get_ErrorCode
+            {
+                var hresult = WinRt.OutInt(info, 8);
+                throw new COMException(Marshal.GetExceptionForHR(hresult)?.Message ?? "The WAM request failed", hresult);
+            }
             return status switch
             {
                 1 => hasResult ? WinRt.Out(operation, 8) : IntPtr.Zero, // Completed: GetResults
-                2 => throw new OperationCanceledException(ct),
-                _ => throw Marshal.GetExceptionForHR(WinRt.OutInt(info, 8)) ?? new COMException("The WAM request failed"), // get_ErrorCode
+                _ => throw new OperationCanceledException(ct),
             };
         }
         finally
         {
             if (info != IntPtr.Zero)
             {
-                WinRt.Call(info, 10); // Close
+                if (!started)
+                {
+                    WinRt.Call(info, 10); // Close, which a running operation refuses
+                }
                 Marshal.Release(info);
             }
             Marshal.Release(operation);
@@ -443,11 +496,9 @@ static unsafe class WinRt
 
     static IntPtr Slot(IntPtr instance, int slot) => (*(IntPtr**)instance)[slot];
 
-    static int Check(int hresult)
-    {
-        Marshal.ThrowExceptionForHR(hresult);
-        return hresult;
-    }
+    /// <summary>A failed HRESULT as a COMException that keeps it (Marshal.ThrowExceptionForHR would make some of them other exceptions).</summary>
+    public static int Check(int hresult) => hresult >= 0 ? hresult
+        : throw new COMException(Marshal.GetExceptionForHR(hresult)?.Message ?? $"WAM failed (0x{hresult:X8})", hresult);
 
     [DllImport("combase.dll", ExactSpelling = true)]
     static extern int RoGetActivationFactory(IntPtr activatableClassId, in Guid iid, out IntPtr factory);

@@ -18,6 +18,10 @@ internal sealed class PendingFile(string driveId, string drivePath, string stagi
 {
     public string StagingPath { get; } = stagingPath;
     public DriveItemInfo? Base { get; set; } = baseItem;
+
+    /// <summary>What the front end passed when it created the file here (<see cref="FsEntry.Creator"/>).</summary>
+    public object? Creator { get; init; }
+
     public DateTimeOffset Modified { get; set; } = modified;
     public bool Dirty { get; set; }
     public bool HasWrites { get; set; }
@@ -59,6 +63,18 @@ internal sealed class PendingFile(string driveId, string drivePath, string stagi
     /// </summary>
     public AliasItem? Alias { get; set; }
 
+    /// <summary>Handles writing it (counted where they stage it); a close commits only when it was the last of them.</summary>
+    public int Writers { get; set; }
+
+    /// <summary>
+    /// Where an upload of this new file puts (or put) its item on the server: the path when it began, moved along with folders above.
+    /// The file renamed meanwhile, the item follows it once it is up.
+    /// </summary>
+    public string? ServerPath { get; set; }
+
+    /// <summary>An upload that failed without an answer (it may have gone through): checked before this content is sent again.</summary>
+    public UnconfirmedUpload? Unconfirmed { get; set; }
+
     /// <summary>The item this content went into (a conflict copy included) and its path, once uploaded. Handles follow it.</summary>
     public DriveItemInfo? Result { get; private set; }
     public string? ResultPath { get; private set; }
@@ -87,12 +103,21 @@ internal sealed class PendingFile(string driveId, string drivePath, string stagi
     public void Wrote() => Interlocked.Increment(ref writes);
 }
 
+/// <summary>Where an upload without an answer went, and the pending file's write count then: unchanged, the content is what it sent.</summary>
+internal sealed record UnconfirmedUpload(UploadTarget Target, int Writes);
+
 /// <summary>An upload that runs while the file is being written. Fragments go only once every byte before them is written.</summary>
 internal sealed class ProgressiveUpload(long size, string drivePath)
 {
     readonly SortedList<long, long> written = [];
 
     public long Size { get; } = size;
+
+    /// <summary>The next fragment's size: larger while fragments go quickly (<see cref="UploadSession.NextFragmentSize"/>).</summary>
+    public int Fragment { get; set; } = UploadSession.FragmentSize;
+
+    /// <summary>Fragments sent so far.</summary>
+    public int Fragments { get; set; }
 
     /// <summary>Where the session was aimed; a rename since then means starting over.</summary>
     public string DrivePath { get; } = drivePath;

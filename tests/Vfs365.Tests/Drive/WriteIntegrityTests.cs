@@ -649,6 +649,88 @@ public sealed class WriteIntegrityTests : IDisposable
     }
 
     [Fact]
+    public async Task An_unclaimed_original_renamed_onto_another_file_replaces_its_content()
+    {
+        // A save backing out onto another name: its content goes into that item, which keeps its identity, and its own item goes
+        api.Add("report.docx", content: "v1");
+        var other = api.Add("other.docx", content: "o1");
+        var engine = Create();
+        await engine.RenameAsync(Root + "report.docx", Root + "~WRL0001.tmp", false, default);
+        await engine.RenameAsync(Root + "~WRL0001.tmp", Root + "other.docx", true, default);
+
+        Assert.Null(await engine.GetEntryAsync(Root + "~WRL0001.tmp", default));
+        Assert.Null(await engine.GetEntryAsync(Root + "report.docx", default));
+        Assert.Equal("v1", await ReadAllAsync(engine, (await engine.GetEntryAsync(Root + "other.docx", default))!));
+        await DueAsync(engine, TimeSpan.FromMinutes(1));
+
+        Assert.Equal(other.Id, api.ItemAt("other.docx")!.Id);
+        Assert.Equal("v1", api.ContentOf("other.docx"));
+        Assert.Equal(["other.docx"], api.Paths);
+        Assert.Equal(0, api.Moves);
+    }
+
+    [Fact]
+    public async Task A_new_file_carries_its_creator_until_it_is_uploaded()
+    {
+        // The front end checks opens against the creating handle's sharing through it
+        var creator = new object();
+        var engine = Create();
+        var created = await engine.CreateAsync(Root + "new.txt", false, default, creator);
+        await File.WriteAllTextAsync(created.StagingPath!, "abc");
+        engine.MarkDirty(created);
+
+        Assert.Same(creator, created.Creator);
+        Assert.Same(creator, (await engine.GetEntryAsync(Root + "new.txt", default))!.Creator);
+        Assert.Same(creator, Assert.Single(await engine.ListAsync((await engine.GetEntryAsync("\\OneDrive", default))!, default)).Creator);
+        await engine.CommitAsync(created, default);
+        Assert.Null((await engine.GetEntryAsync(Root + "new.txt", default))!.Creator);
+    }
+
+    [Fact]
+    public async Task Lookups_and_listings_never_show_staged_content_deleted_meanwhile_as_empty()
+    {
+        // Staged content deleted between a lookup's look at local state and its size: the lookup shows what is there now
+        const int files = 200;
+        for (var i = 0; i < files; i++)
+        {
+            api.Add($"f{i}.txt", content: "abc");
+        }
+        var engine = Create();
+        var root = (await engine.GetEntryAsync(Root.TrimEnd('\\'), default))!;
+        var current = 0;
+        var empty = new System.Collections.Concurrent.ConcurrentQueue<string>();
+        using var stop = new CancellationTokenSource();
+        var readers = Enumerable.Range(0, 3).Select(r => Task.Run(async () =>
+        {
+            while (!stop.IsCancellationRequested)
+            {
+                var name = $"f{Volatile.Read(ref current)}.txt";
+                if (r == 0)
+                {
+                    foreach (var listed in (await engine.ListAsync(root, default)).Where(e => e.Size == 0))
+                    {
+                        empty.Enqueue($"listed {listed.Name}");
+                    }
+                }
+                else if (await engine.GetEntryAsync(Root + name, default) is { Size: 0 })
+                {
+                    empty.Enqueue($"found {name}");
+                }
+            }
+        })).ToList();
+        for (var i = 0; i < files; i++)
+        {
+            Volatile.Write(ref current, i);
+            await engine.StageAsync((await engine.GetEntryAsync($"{Root}f{i}.txt", default))!, truncate: false, default);
+            await engine.DeleteAsync($"{Root}f{i}.txt", default);
+        }
+        stop.Cancel();
+        await Task.WhenAll(readers);
+
+        Assert.Empty(empty);
+    }
+
+    [Fact]
     public async Task Deleting_a_folder_after_its_files_sends_one_delete()
     {
         api.Add("old", folder: true);
@@ -808,6 +890,383 @@ public sealed class WriteIntegrityTests : IDisposable
         Assert.Equal(0, api.Deletes);
         Assert.Equal(original.Id, api.ItemAt("report.docx")!.Id);
         Assert.Equal("v2", api.ContentOf("report.docx"));
+    }
+
+    /// <summary>A write through a handle, as the file system makes it: inside its lease.</summary>
+    static void Append(DriveEngine engine, FsEntry handle, string text)
+    {
+        using var lease = engine.BeginWrite(handle) ?? throw new InvalidOperationException("not staged");
+        File.AppendAllText(handle.StagingPath!, text);
+        engine.MarkDirty(handle);
+    }
+
+    bool JournalSaysFlushed() => File.ReadAllText(Assert.Single(Directory.GetFiles(Staging, "*.json"))).Contains("\"Flushed\":true", StringComparison.Ordinal);
+
+    [Fact]
+    public async Task A_save_whose_answer_got_lost_is_found_and_never_becomes_a_conflict_copy()
+    {
+        var original = api.Add("notes.txt", content: "v1");
+        var engine = Create();
+        api.LoseAnswer = _ => new TaskCanceledException("no answer within 100 s");
+
+        await SaveAsync(engine, "notes.txt", "v2");
+
+        Assert.Equal("v2", api.ContentOf("notes.txt"));
+        Assert.Equal(original.Id, api.ItemAt("notes.txt")!.Id);
+        Assert.Single(api.Uploads);
+        Assert.Equal(["notes.txt"], api.Paths);
+        Assert.Empty(engine.Unsaved());
+    }
+
+    [Fact]
+    public async Task A_save_whose_answer_got_lost_offline_is_looked_up_before_it_is_sent_again()
+    {
+        var original = api.Add("notes.txt", content: "v1");
+        var engine = Create();
+        api.LoseAnswer = _ => new HttpRequestException("connection reset");
+        api.FailUploadedLookup = () => new HttpRequestException("No such host is known.");
+
+        await SaveAsync(engine, "notes.txt", "v2");
+        Assert.Equal(1, engine.WaitingToUpload());
+
+        // Sent again with the eTag it had, it would get a 412 and end in a conflict copy of itself
+        api.LoseAnswer = null;
+        api.FailUploadedLookup = null;
+        await DueAsync(engine, TimeSpan.FromMinutes(1));
+
+        Assert.Equal("v2", api.ContentOf("notes.txt"));
+        Assert.Equal(original.Id, api.ItemAt("notes.txt")!.Id);
+        Assert.Single(api.Uploads);
+        Assert.Equal(["notes.txt"], api.Paths);
+        Assert.Empty(engine.Unsaved());
+    }
+
+    [Fact]
+    public async Task A_close_while_another_handle_still_writes_only_flushes_and_the_last_close_uploads_both()
+    {
+        api.Add("data.bin", content: "");
+        var engine = Create();
+        var file = (await engine.GetEntryAsync(Root + "data.bin", default))!;
+        var first = await engine.StageAsync(file, truncate: false, default);
+        var second = await engine.StageAsync(file, truncate: false, default);
+
+        Append(engine, first, "first ");
+        await engine.CommitAsync(first, default);
+        Assert.Empty(api.Uploads);
+        Assert.True(JournalSaysFlushed());
+        Assert.Equal(0, engine.WaitingToUpload());
+
+        Append(engine, second, "second");
+        await engine.CommitAsync(second, default);
+        Assert.Equal("first second", api.ContentOf("data.bin"));
+        Assert.Single(api.Uploads);
+    }
+
+    [Fact]
+    public async Task A_file_another_writer_keeps_open_still_uploads_minutes_after_the_first_close()
+    {
+        api.Add("data.bin", content: "");
+        var engine = Create();
+        var file = (await engine.GetEntryAsync(Root + "data.bin", default))!;
+        var first = await engine.StageAsync(file, truncate: false, default);
+        await engine.StageAsync(file, truncate: false, default);
+        Append(engine, first, "x");
+        await engine.CommitAsync(first, default);
+
+        await DueAsync(engine, TimeSpan.FromMinutes(5));
+        Assert.Empty(api.Uploads);
+        await DueAsync(engine, TimeSpan.FromMinutes(6));
+        Assert.Equal("x", api.ContentOf("data.bin"));
+    }
+
+    [Fact]
+    public async Task A_close_commits_only_what_its_handle_wrote()
+    {
+        api.Add("log.txt", content: "v1");
+        var engine = Create();
+        var first = await engine.StageAsync((await engine.GetEntryAsync(Root + "log.txt", default))!, truncate: true, default);
+        Append(engine, first, "v2");
+        engine.CommitLater(first); // mapped writes: uploads once they go quiet
+        await DueAsync(engine, TimeSpan.FromSeconds(5));
+        Assert.Equal("v2", api.ContentOf("log.txt"));
+
+        // Another handle is still writing when the first one closes: its half-written content isn't uploaded by that close
+        var second = await engine.StageAsync((await engine.GetEntryAsync(Root + "log.txt", default))!, truncate: false, default);
+        Append(engine, second, " partial");
+        await engine.CommitAsync(first, default);
+        Assert.Equal("v2", api.ContentOf("log.txt"));
+
+        Append(engine, second, " done");
+        await engine.CommitAsync(second, default);
+        Assert.Equal("v2 partial done", api.ContentOf("log.txt"));
+        Assert.Equal(2, api.Uploads.Count);
+    }
+
+    [Fact]
+    public async Task A_delete_never_takes_a_colleagues_newer_version_along()
+    {
+        api.Add("plan.txt", content: "v1");
+        var engine = Create();
+        await engine.DeleteAsync(Root + "plan.txt", default);
+        api.RemoteEdit("plan.txt", "theirs"); // saved elsewhere within the settle window
+
+        await DueAsync(engine, TimeSpan.FromMinutes(1));
+
+        Assert.Equal("theirs", api.ContentOf("plan.txt"));
+        Assert.Equal(0, api.Deletes);
+        Assert.Equal(api.ItemAt("plan.txt")!.CTag, (await engine.GetEntryAsync(Root + "plan.txt", default))!.ContentTag);
+        Assert.Equal("plan.txt", Assert.Single(notices, n => n.Kind == NoticeKind.NotDeleted).Name);
+    }
+
+    [Fact]
+    public async Task A_delete_goes_ahead_when_only_metadata_changed_meanwhile()
+    {
+        var original = api.Add("plan.txt", content: "v1");
+        var engine = Create();
+        await engine.DeleteAsync(Root + "plan.txt", default);
+        api.RemoteMetadataEdit("plan.txt"); // a column, a label: a new eTag, the same content
+
+        await DueAsync(engine, TimeSpan.FromMinutes(1));
+
+        Assert.Empty(api.Paths);
+        Assert.Equal(2, api.DeleteIfMatches.Count); // refused (412) for the eTag the user saw, then sent with the eTag now
+        Assert.Equal(original.ETag, api.DeleteIfMatches[0]);
+        Assert.NotEqual(original.ETag, api.DeleteIfMatches[1]);
+        Assert.Empty(notices);
+    }
+
+    [Fact]
+    public async Task Finished_background_work_is_not_kept()
+    {
+        var engine = Create(background: true);
+        api.Add("old.txt");
+        await engine.DeleteAsync(Root + "old.txt", default);
+        for (var i = 0; i < 20; i++)
+        {
+            await WriteNewAsync(engine, $"f{i}.txt", "x");
+        }
+        await DueAsync(engine, TimeSpan.FromMinutes(1));
+
+        for (var waited = 0; (Count(engine, "backgroundUploads") > 0 || Count(engine, "backgroundWork") > 0) && waited < 2000; waited += 20)
+        {
+            await Task.Delay(20);
+        }
+        Assert.Equal(0, Count(engine, "backgroundUploads"));
+        Assert.Equal(0, Count(engine, "backgroundWork"));
+        Assert.Equal(20, api.Uploads.Count);
+    }
+
+    /// <summary>Entries of one of the engine's own collections (no public view of it), under the lock the engine takes.</summary>
+    static int Count(DriveEngine engine, string field)
+    {
+        var collection = typeof(DriveEngine).GetField(field, System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!.GetValue(engine)!;
+        lock (collection)
+        {
+            return (int)collection.GetType().GetProperty("Count")!.GetValue(collection)!;
+        }
+    }
+
+    [Fact]
+    public async Task A_close_of_a_file_renamed_away_with_changes_is_on_disk_before_it_returns()
+    {
+        api.Add("notes.txt", content: "v1");
+        var engine = Create();
+        var handle = await SaveAsync(engine, "notes.txt", "v2", close: false);
+        await engine.RenameAsync(Root + "notes.txt", Root + "~notes.tmp", false, default); // renamed away: its upload waits for the settle window
+
+        await engine.CommitAsync(handle, default);
+
+        Assert.True(JournalSaysFlushed());
+        Assert.Empty(api.Uploads);
+    }
+
+    [Fact]
+    public async Task An_original_renamed_to_a_real_name_after_a_new_file_took_over_its_item_never_moves_the_item()
+    {
+        // The original steps aside, a new file is made under its name (taking over its item), and the original becomes the backup
+        var original = api.Add("drawing.dwg", content: "v1");
+        var engine = Create();
+        Assert.Equal("v1", await ReadAllAsync(engine, (await engine.GetEntryAsync(Root + "drawing.dwg", default))!));
+        await engine.RenameAsync(Root + "drawing.dwg", Root + "~drawing.tmp", false, default);
+        var saved = await WriteNewAsync(engine, "drawing.dwg", "v2", close: false);
+        await engine.RenameAsync(Root + "~drawing.tmp", Root + "drawing.bak", false, default);
+        await engine.CommitAsync(saved, default);
+        await DueAsync(engine, TimeSpan.FromMinutes(1));
+
+        Assert.Equal(original.Id, api.ItemAt("drawing.dwg")!.Id);
+        Assert.Equal("v2", api.ContentOf("drawing.dwg"));
+        Assert.Equal("v1", api.ContentOf("drawing.bak"));
+        Assert.Equal(["drawing.bak", "drawing.dwg"], api.Paths);
+    }
+
+    [Fact]
+    public async Task A_create_at_a_name_waiting_to_be_deleted_sends_that_delete_at_once_in_the_foreground()
+    {
+        for (var i = 0; i < 8; i++)
+        {
+            api.Add($"f{i}.txt", content: $"{i}");
+        }
+        var engine = Create();
+        for (var i = 0; i < 8; i++)
+        {
+            await engine.DeleteAsync(Root + $"f{i}.txt", default);
+        }
+        // Background requests held, as for minutes after throttling; promoted ones go
+        var paused = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        api.BeforeDelete = async () =>
+        {
+            if (RequestPriority.Current is { IsBackground: true } priority)
+            {
+                await Task.WhenAny(paused.Task, priority.Promoted);
+            }
+        };
+        now += TimeSpan.FromMinutes(1);
+        await engine.ProcessDueAsync(false, default);
+
+        for (var i = 0; i < 8; i++)
+        {
+            Assert.Null((await engine.CreateAsync(Root + $"f{i}.txt", false, default).WaitAsync(TimeSpan.FromSeconds(10))).ItemId);
+        }
+        Assert.Equal(8, api.Deletes);
+        paused.SetResult();
+        await engine.WaitForUploadsAsync();
+    }
+
+    /// <summary>True for each operation that went through, false for each refused with a name collision.</summary>
+    static async Task<bool[]> OutcomesAsync(params Task[] operations)
+    {
+        var outcomes = new bool[operations.Length];
+        for (var i = 0; i < operations.Length; i++)
+        {
+            try
+            {
+                await operations[i];
+                outcomes[i] = true;
+            }
+            catch (FsException e) when (e.Error == FsError.NameCollision)
+            {
+            }
+        }
+        return outcomes;
+    }
+
+    [Fact]
+    public async Task A_create_and_a_rename_onto_one_name_at_once_leave_one_file_there()
+    {
+        for (var i = 0; i < 20; i++)
+        {
+            api.Add($"src{i}.txt", content: "moved");
+        }
+        var engine = Create(background: true);
+        for (var i = 0; i < 20; i++)
+        {
+            var create = Task.Run(() => engine.CreateAsync(Root + $"dst{i}.txt", false, default));
+            var rename = Task.Run(() => engine.RenameAsync(Root + $"src{i}.txt", Root + $"dst{i}.txt", false, default));
+            var outcomes = await OutcomesAsync(create, rename);
+            Assert.Single(outcomes, won => won);
+            if (outcomes[0])
+            {
+                await engine.CommitAsync(await create, default);
+            }
+        }
+        await engine.WaitForUploadsAsync();
+
+        for (var i = 0; i < 20; i++)
+        {
+            var moved = api.ContentOf($"dst{i}.txt") == "moved";
+            Assert.True(moved ? api.ItemAt($"src{i}.txt") is null : api.ContentOf($"dst{i}.txt") == "" && api.ItemAt($"src{i}.txt") is not null);
+        }
+        Assert.DoesNotContain(api.Paths, p => p.Contains("(conflict", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task Two_renames_onto_one_name_at_once_leave_both_files()
+    {
+        // Files on the server, and new ones whose uploads are still running
+        for (var i = 0; i < 20; i += 2)
+        {
+            api.Add($"a{i}.txt", content: "a");
+            api.Add($"b{i}.txt", content: "b");
+        }
+        var engine = Create(background: true);
+        var network = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        api.BeforeUpload = () => network.Task;
+        for (var i = 0; i < 20; i++)
+        {
+            if (i % 2 == 1)
+            {
+                await WriteNewAsync(engine, $"a{i}.txt", "a");
+                await WriteNewAsync(engine, $"b{i}.txt", "b");
+            }
+            var outcomes = await OutcomesAsync(
+                Task.Run(() => engine.RenameAsync(Root + $"a{i}.txt", Root + $"c{i}.txt", false, default)),
+                Task.Run(() => engine.RenameAsync(Root + $"b{i}.txt", Root + $"c{i}.txt", false, default)));
+            Assert.Single(outcomes, won => won);
+        }
+        network.SetResult();
+        await engine.WaitForUploadsAsync();
+
+        for (var i = 0; i < 20; i++)
+        {
+            Assert.NotNull(api.ItemAt($"c{i}.txt"));
+            Assert.Single(new[] { $"a{i}.txt", $"b{i}.txt" }, p => api.ItemAt(p) is not null);
+        }
+        Assert.Equal(40, api.Paths.Count());
+    }
+
+    [Fact]
+    public async Task A_delete_and_a_create_at_one_name_at_once_never_lose_the_new_file()
+    {
+        var originals = Enumerable.Range(0, 20).Select(i => api.Add($"x{i}.txt", content: "old")).ToArray();
+        var engine = Create();
+        var created = new bool[20];
+        for (var i = 0; i < 20; i++)
+        {
+            var name = $"x{i}.txt";
+            var delete = Task.Run(() => engine.DeleteAsync(Root + name, default));
+            var create = Task.Run(async () =>
+            {
+                var entry = await engine.CreateAsync(Root + name, false, default);
+                Append(engine, entry, "new");
+                await engine.CommitAsync(entry, default);
+            });
+            var outcomes = await OutcomesAsync(delete, create);
+            Assert.True(outcomes[0]);
+            created[i] = outcomes[1];
+        }
+        await DueAsync(engine, TimeSpan.FromMinutes(1));
+
+        for (var i = 0; i < 20; i++)
+        {
+            // Made after the delete, the new file took over the item; refused before it, the delete went ahead
+            Assert.Equal(created[i] ? "new" : null, api.ContentOf($"x{i}.txt"));
+            Assert.Equal(created[i] ? originals[i].Id : null, api.ItemAt($"x{i}.txt")?.Id);
+        }
+    }
+
+    [Fact]
+    public async Task A_new_file_at_the_old_name_of_one_that_moved_while_it_uploads_waits_for_that_upload()
+    {
+        var engine = Create(background: true);
+        var hold = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        api.BeforeUpload = () => { started.TrySetResult(); return hold.Task; };
+        await WriteNewAsync(engine, "report.pdf", "first");
+        await started.Task;
+        await engine.RenameAsync(Root + "report.pdf", Root + "first.pdf", false, default);
+        api.BeforeUpload = null;
+
+        // The first file is up under that name until it moves: a new one there would collide with it
+        var create = WriteNewAsync(engine, "report.pdf", "second");
+        await Task.Delay(100);
+        Assert.False(create.IsCompleted);
+        hold.SetResult();
+        await create;
+        await engine.WaitForUploadsAsync();
+
+        Assert.Equal(["first.pdf", "report.pdf"], api.Paths);
+        Assert.Equal("first", api.ContentOf("first.pdf"));
+        Assert.Equal("second", api.ContentOf("report.pdf"));
     }
 
     public void Dispose()

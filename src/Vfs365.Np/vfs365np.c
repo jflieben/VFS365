@@ -218,8 +218,9 @@ EXPORT DWORD WINAPI NPGetConnection(LPWSTR localName, LPWSTR remoteName, LPDWORD
     const int deviceLength = (int)(sizeof(Device) / sizeof(WCHAR)) - 1;
     if (!localName || !bufferLength || lstrlenW(localName) != 2 || localName[1] != L':')
         return WN_NOT_CONNECTED;
-    WCHAR target[MAX_PATH + 16];
-    DWORD read = QueryDosDeviceW(localName, target, MAX_PATH + 16);
+    // Targets as long as the agent reads them (1024 characters, DosDevices.Target) plus the device prefix; about 2 KB of stack
+    WCHAR target[1024 + 16];
+    DWORD read = QueryDosDeviceW(localName, target, sizeof(target) / sizeof(WCHAR));
     if (read == 0 || CompareStringOrdinal(target, deviceLength, Device, deviceLength, TRUE) != CSTR_EQUAL)
         return WN_NOT_CONNECTED;
 

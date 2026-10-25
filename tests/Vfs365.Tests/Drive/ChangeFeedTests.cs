@@ -470,15 +470,15 @@ public sealed class ChangeFeedTests : IDisposable
     }
 
     [Fact]
-    public async Task A_folder_opened_by_path_gets_the_folders_above_it_listed_and_stays_current()
+    public async Task A_folder_opened_by_path_gets_the_folders_above_it_looked_up_and_stays_current()
     {
+        // Each folder above is read as one item, not listed: listing a big one would cost a page per thousand items
         var (fake, api) = ClientFolders(listable: true);
         var engine = Create(api);
         await engine.PollAsync("b!me");
         Assert.Equal(["order.xlsx"], await Names(engine, "\\Clients\\Acme\\2026"));
-        await Eventually(() => fake.ListCalls == 3); // Clients and Acme too, in the background
-        await Names(engine, "\\Clients\\Acme"); // joins those loads
-        await Names(engine, "\\Clients");
+        await Eventually(() => fake.GetCalls == 3); // 2026 itself, then Acme and Clients in the background
+        await Task.Delay(50);
 
         now += TimeSpan.FromHours(1);
         var gets = fake.GetCalls;
@@ -490,7 +490,29 @@ public sealed class ChangeFeedTests : IDisposable
 
         Assert.Null(await engine.GetEntryAsync("\\Clients\\Acme\\2026\\order.xlsx", default));
         Assert.True(Saw("\\Clients", ChangeKind.Removed));
-        Assert.Equal(["Clients/Acme/2026", "Clients/Acme", "Clients"], api.Listed.Order(StringComparer.Ordinal).Reverse());
+        Assert.Equal(["Clients/Acme/2026"], api.Listed);
+    }
+
+    [Fact]
+    public async Task Folders_above_a_cached_listing_known_by_id_survive_a_restart()
+    {
+        var (fake, api) = ClientFolders(listable: true);
+        var first = Create(api);
+        await first.PollAsync("b!me");
+        await Names(first, "\\Clients\\Acme\\2026");
+        await Eventually(() => fake.GetCalls == 3);
+        await Task.Delay(50);
+        var snapshots = first.ExportSnapshots(100);
+        Assert.Equal(["Clients", "Clients/Acme"], snapshots.Single().Ancestors!.Select(a => a.Path).Order(StringComparer.Ordinal));
+
+        var second = Create(api);
+        second.ImportSnapshots(snapshots);
+        await second.PollAsync("b!me");
+        fake.RemoteMove("Clients/Acme", "Clients/Acme (archive)");
+        await second.PollAsync("b!me");
+
+        Assert.True(Saw("\\Clients\\Acme", ChangeKind.Removed));
+        Assert.Null(await second.GetEntryAsync("\\Clients\\Acme\\2026\\order.xlsx", default));
     }
 
     [Fact]
@@ -664,6 +686,255 @@ public sealed class ChangeFeedTests : IDisposable
 
         Assert.Equal(["b!me"], engine.ActiveDrives());
         Assert.Empty(engine.PushDrives());
+    }
+
+    [Fact]
+    public async Task Deleting_or_renaming_a_subfolder_keeps_its_folder_listed()
+    {
+        var api = new FakeDriveApi();
+        api.Add("big", folder: true);
+        for (var i = 0; i < 5; i++)
+        {
+            api.Add($"big/f{i}.txt");
+        }
+        api.Add("big/old", folder: true);
+        api.Add("big/sub", folder: true);
+        api.Add("big/sub/x.txt");
+        var engine = Create(api);
+        await engine.PollAsync("b!me");
+        await Names(engine, "\\big");
+        Assert.Equal(["x.txt"], await Names(engine, "\\big\\sub"));
+        var (lists, gets) = (api.ListCalls, api.GetCalls);
+
+        await engine.DeleteAsync("\\big\\old", default);
+        await engine.RenameAsync("\\big\\sub", "\\big\\renamed", replace: false, default);
+
+        // Before, each of the two listed \big again (a page per thousand items)
+        Assert.Equal(["f0.txt", "f1.txt", "f2.txt", "f3.txt", "f4.txt", "renamed"], await Names(engine, "\\big"));
+        Assert.Equal(lists, api.ListCalls);
+        Assert.Null(await engine.GetEntryAsync("\\big\\sub\\x.txt", default));
+        Assert.Equal(gets, api.GetCalls);
+        Assert.Equal(["x.txt"], await Names(engine, "\\big\\renamed"));
+    }
+
+    [Fact]
+    public async Task Reading_a_stale_listing_again_reads_only_that_folder()
+    {
+        var api = new FakeDriveApi { DeltaUnavailable = true, PageSize = 2 };
+        foreach (var folder in new[] { "a", "a/b", "a/b/c" })
+        {
+            api.Add(folder, folder: true);
+            for (var i = 0; i < 4; i++)
+            {
+                api.Add($"{folder}/f{i}.txt");
+            }
+        }
+        var engine = Create(api);
+        await Names(engine, "\\a");
+        await Names(engine, "\\a\\b");
+        await Names(engine, "\\a\\b\\c");
+        now += TimeSpan.FromMinutes(2); // all stale: the feed doesn't work
+        var (pages, gets) = (api.ListPages, api.GetCalls);
+
+        Assert.NotNull(await engine.GetEntryAsync("\\a\\b\\c\\f1.txt", default));
+        await Eventually(() => api.ListPages >= pages + 2);
+        await Task.Delay(100);
+
+        // c's 4 items in pages of 2; before, b and a were read again too (6 pages more)
+        Assert.Equal(pages + 2, api.ListPages);
+        Assert.Equal(gets + 2, api.GetCalls); // the file, and c itself for its ID
+    }
+
+    [Fact]
+    public async Task Cached_folders_deleted_children_first_all_go()
+    {
+        static DriveItemInfo Folder(string id, string name) => new(id, name, true, 0, DateTimeOffset.UnixEpoch, DateTimeOffset.UnixEpoch, $"e-{id}", null);
+        var subs = Enumerable.Range(0, 300).Select(i => Folder($"s{i}", $"s{i:D3}")).ToList();
+        var folders = new List<FolderSnapshot> { new("", "root", [Folder("top", "top")], now), new("top", "top", subs, now, "root") };
+        folders.AddRange(subs.Select(s => new FolderSnapshot($"top/{s.Name}", s.Id, [Folder($"{s.Id}-x", "x")], now, "top")));
+        var api = new StallingDriveApi(new FakeDriveApi());
+        var engine = Create(api);
+        engine.ImportSnapshots([new DriveSnapshot("b!me", "delta:0", now, folders)]);
+        api.Scripted.Enqueue(new DeltaPage([.. subs.Select(s => new DriveChange(s.Id, "top", null, true)), new DriveChange("top", "root", null, true)], null, "delta:0"));
+
+        await engine.PollAsync("b!me");
+
+        Assert.Empty(await Names(engine, "\\"));
+        Assert.True(Saw("\\top", ChangeKind.Removed));
+        Assert.Equal([""], engine.ExportSnapshots(1000).Single().Folders.Select(f => f.Path));
+    }
+
+    [Fact]
+    public async Task After_a_week_away_a_catch_up_still_running_does_not_make_old_listings_current()
+    {
+        var fake = new FakeDriveApi();
+        fake.Add("docs", folder: true);
+        fake.Add("docs/a.txt", content: "one");
+        var api = new StallingDriveApi(fake);
+        var first = Create(api);
+        await first.PollAsync("b!me");
+        await Names(first, "\\");
+        await Names(first, "\\docs");
+        var snapshots = first.ExportSnapshots(100);
+
+        now += TimeSpan.FromDays(7);
+        fake.RemoteEdit("docs/a.txt", "two two");
+        var held = new TaskCompletionSource();
+        api.AfterDeltaRead = () => held.Task; // hundreds of pages to catch up on
+        var second = Create(api);
+        second.ImportSnapshots(snapshots);
+        var gets = fake.GetCalls;
+
+        var entry = await second.GetEntryAsync("\\docs\\a.txt", default); // waits briefly for the catch-up, then asks
+        held.SetResult();
+
+        Assert.Equal(7, entry!.Size);
+        Assert.Equal(gets + 1, fake.GetCalls);
+    }
+
+    [Fact]
+    public async Task The_metadata_version_ignores_what_the_snapshot_does_not_keep()
+    {
+        var api = new FakeDriveApi();
+        api.Add("docs", folder: true);
+        api.Add("docs/sub", folder: true);
+        api.Add("docs/sub/a.txt");
+        var engine = Create(api);
+        await engine.PollAsync("b!me");
+        await Names(engine, "\\docs");
+        var version = engine.MetadataVersion;
+
+        Assert.NotNull(await engine.GetEntryAsync("\\docs\\sub\\a.txt", default)); // a lookup
+        api.RemoteMetadataEdit("docs/sub"); // what a change below \docs\sub does to it: a new eTag and size
+        await engine.PollAsync("b!me");
+        Assert.Equal(version, engine.MetadataVersion);
+        Assert.False(Saw("\\docs\\sub", ChangeKind.Modified)); // nor is Explorer told to read \docs again
+
+        // A drive whose feed doesn't work keeps nothing
+        var broken = new FakeDriveApi { DeltaUnavailable = true };
+        broken.Add("docs", folder: true);
+        var other = Create(broken);
+        var before = other.MetadataVersion;
+        await Names(other, "\\docs");
+        await other.CreateAsync("\\docs\\new.txt", false, default);
+        Assert.Equal(before, other.MetadataVersion);
+
+        api.Add("docs/b.txt");
+        await engine.PollAsync("b!me");
+        Assert.NotEqual(version, engine.MetadataVersion);
+    }
+
+    [Fact]
+    public async Task A_catch_up_that_fails_midway_goes_on_from_the_page_that_failed()
+    {
+        var fake = new FakeDriveApi { DeltaPageSize = 1 };
+        fake.Add("docs", folder: true);
+        var api = new StallingDriveApi(fake);
+        var engine = Create(api);
+        await engine.PollAsync("b!me");
+        await Names(engine, "\\docs");
+        for (var i = 0; i < 6; i++)
+        {
+            fake.Add($"docs/f{i}.txt");
+        }
+        var reads = 0;
+        api.AfterDeltaRead = () => ++reads == 3 ? throw new HttpRequestException("connection reset") : Task.CompletedTask;
+
+        await engine.PollAsync("b!me"); // pages 1 and 2 are applied, the third fails
+        Assert.Equal(["f0.txt", "f1.txt"], await Names(engine, "\\docs"));
+        var calls = api.DeltaCalls;
+        now += TimeSpan.FromMinutes(2); // past the back-off
+        await engine.PollAsync("b!me");
+
+        Assert.Equal(calls + 4, api.DeltaCalls); // pages 3 to 6, not all 6 again
+        Assert.Equal(6, (await Names(engine, "\\docs")).Length);
+    }
+
+    [Fact]
+    public async Task A_file_looked_up_by_path_shows_a_remote_change_after_the_next_read()
+    {
+        var api = new FakeDriveApi();
+        api.Add("a", folder: true);
+        api.Add("a/b", folder: true);
+        api.Add("a/b/report.txt", content: "one");
+        var engine = Create(api);
+        await engine.PollAsync("b!me");
+        Assert.NotNull(await engine.GetEntryAsync("\\a\\b", default));
+        Assert.Equal(3, (await engine.GetEntryAsync("\\a\\b\\report.txt", default))!.Size);
+        Assert.Null(await engine.GetEntryAsync("\\a\\b\\new.txt", default));
+
+        // Their folder isn't cached; before, the lookups answered as they were until they expired
+        api.RemoteEdit("a/b/report.txt", "two two");
+        api.Add("a/b/new.txt");
+        await engine.PollAsync("b!me");
+
+        Assert.Equal(7, (await engine.GetEntryAsync("\\a\\b\\report.txt", default))!.Size);
+        Assert.NotNull(await engine.GetEntryAsync("\\a\\b\\new.txt", default));
+    }
+
+    [Fact]
+    public async Task A_lookup_in_a_folder_still_loading_uses_what_arrived()
+    {
+        var api = new FakeDriveApi { PageSize = 2 };
+        api.Add("docs", folder: true);
+        for (var i = 1; i <= 5; i++)
+        {
+            api.Add($"docs/f{i}.txt");
+        }
+        var engine = Create(api);
+        var rest = new TaskCompletionSource();
+        api.BeforeNextPage = () => rest.Task;
+        var docs = (await engine.GetEntryAsync("\\docs", default))!;
+        await using var batches = engine.ListStreamAsync(docs, default).GetAsyncEnumerator();
+        Assert.True(await batches.MoveNextAsync()); // the first page is in
+        var gets = api.GetCalls;
+
+        Assert.NotNull(await engine.GetEntryAsync("\\docs\\f1.txt", default));
+
+        Assert.Equal(gets, api.GetCalls);
+        rest.SetResult();
+    }
+
+    [Fact]
+    public async Task A_library_no_longer_shown_leaves_the_snapshot()
+    {
+        static LibraryEntry Library(string site) => new($"k-{site}", "s", "w", "l", $"https://x.sharepoint.com/sites/{site}", site, "Documents", false, 1, $"b!{site}");
+        var api = new FakeDriveApi();
+        api.Add("docs", folder: true);
+        var ns = DriveNamespace.Build(new MyDrive("b!me", "https://x-my.sharepoint.com/personal/u"), [Library("Finance"), Library("HR")], (_, _) => Task.FromResult("unused"));
+        var engine = new DriveEngine(ns, api, new ContentCache(Path.Combine(directory, "cache"), api),
+            new DriveEngineOptions { StagingDirectory = Path.Combine(directory, "staging"), Clock = () => now });
+        foreach (var site in new[] { "Finance", "HR" })
+        {
+            await engine.PollAsync($"b!{site}");
+            await engine.ListAsync((await engine.GetEntryAsync($"\\Sites\\{site}\\Documents\\docs", default))!, default);
+        }
+        Assert.Equal(["b!Finance", "b!HR"], engine.ExportSnapshots(100).Select(s => s.DriveId).Order(StringComparer.Ordinal));
+
+        engine.SetLibraries([Library("Finance")]);
+
+        Assert.Equal(["b!Finance"], engine.ExportSnapshots(100).Select(s => s.DriveId));
+        Assert.Equal(["b!Finance"], engine.ActiveDrives());
+    }
+
+    [Fact]
+    public async Task A_restored_library_only_glanced_at_starts_no_change_feed()
+    {
+        var api = new FakeDriveApi();
+        api.Add("docs", folder: true);
+        var first = Create(api);
+        await first.PollAsync("b!me");
+        await Names(first, "\\");
+        await Names(first, "\\docs");
+        var snapshots = first.ExportSnapshots(100);
+        var second = Create(api);
+        second.ImportSnapshots(snapshots);
+        var calls = api.DeltaCalls;
+
+        await Names(second, "\\"); // Explorer drawing the library's thumbnail
+
+        Assert.Equal(calls, api.DeltaCalls);
+        Assert.Empty(second.ActiveDrives());
     }
 
     public void Dispose()

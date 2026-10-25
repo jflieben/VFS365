@@ -62,12 +62,42 @@ public sealed class ClaimsChallengeTests
     }
 
     [Fact]
-    public async Task A_second_challenge_or_a_plain_401_fails()
+    public async Task A_second_challenge_or_a_second_plain_401_fails()
     {
-        var client = new M365Client(new HttpClient(new Server(_ => Challenge())), new Tokens());
-        var plain = new M365Client(new HttpClient(new Server(_ => new HttpResponseMessage(HttpStatusCode.Unauthorized))), new Tokens());
+        var challenges = new Server(_ => Challenge());
+        var client = new M365Client(new HttpClient(challenges), new Tokens());
+        var plainServer = new Server(_ => new HttpResponseMessage(HttpStatusCode.Unauthorized));
+        var plain = new M365Client(new HttpClient(plainServer), new Tokens());
 
         await Assert.ThrowsAsync<M365RequestException>(() => client.GetJsonAsync(new Uri("https://graph.microsoft.com/v1.0/me"), default));
         await Assert.ThrowsAsync<M365RequestException>(() => plain.GetJsonAsync(new Uri("https://graph.microsoft.com/v1.0/me"), default));
+        Assert.Equal(2, challenges.Tokens.Count);
+        Assert.Equal(2, plainServer.Tokens.Count);
+    }
+
+    [Fact]
+    public async Task A_401_without_a_challenge_gets_one_retry_with_a_token_asked_for_anew()
+    {
+        var server = new Server(_ => new HttpResponseMessage(HttpStatusCode.Unauthorized), _ => Ok());
+        var tokens = new Tokens();
+        var client = new M365Client(new HttpClient(server), tokens);
+
+        using var doc = await client.GetJsonAsync(new Uri("https://graph.microsoft.com/v1.0/me"), default);
+
+        // Through the claims overload (which skips the token cache) with an empty claims object: nothing more is asked for
+        Assert.Equal([null, "{}"], tokens.Requests);
+        Assert.Equal(["plain", "with-claims"], server.Tokens);
+    }
+
+    [Fact]
+    public async Task A_challenge_after_the_plain_retry_is_still_answered()
+    {
+        var server = new Server(_ => new HttpResponseMessage(HttpStatusCode.Unauthorized), _ => Challenge(), _ => Ok());
+        var tokens = new Tokens();
+        var client = new M365Client(new HttpClient(server), tokens);
+
+        using var doc = await client.GetJsonAsync(new Uri("https://graph.microsoft.com/v1.0/me"), default);
+
+        Assert.Equal([null, "{}", Claims], tokens.Requests);
     }
 }

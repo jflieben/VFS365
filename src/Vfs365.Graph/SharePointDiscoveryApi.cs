@@ -44,6 +44,22 @@ public sealed class SharePointDiscoveryApi(M365Client client) : ISharePointDisco
             $"&Properties='{Uri.EscapeDataString("EnableMultiGeoSearch:true")}'&ClientType='{ClientType}'");
     }
 
+    /// <summary>The document libraries search returns below one web (`vfs365 why --check`): one page, the same rows as discovery's search.</summary>
+    public async Task<IReadOnlyList<DiscoveredLibrary>> SearchWebLibrariesAsync(string tenantRoot, string webUrl, CancellationToken ct)
+    {
+        using var doc = await RequiredAsync(WebSearchUri(tenantRoot, webUrl), ct);
+        return ParseSearchPage(doc.RootElement).Libraries;
+    }
+
+    /// <summary>Discovery's query, limited to paths below <paramref name="webUrl"/> (a Path prefix, as discovery's own query excludes OneDrives).</summary>
+    public static Uri WebSearchUri(string tenantRoot, string webUrl)
+    {
+        var kql = $"contentclass:STS_List_DocumentLibrary Path:\"{Uri.UnescapeDataString(webUrl.TrimEnd('/'))}/*\"";
+        return new Uri($"{tenantRoot}/_api/search/query?querytext='{Uri.EscapeDataString(kql.Replace("'", "''"))}'&trimduplicates=false" +
+            $"&rowlimit={DiscoveryService.SearchPageSize}&selectproperties='{Uri.EscapeDataString(SelectProperties)}'" +
+            $"&Properties='{Uri.EscapeDataString("EnableMultiGeoSearch:true")}'&ClientType='{ClientType}'");
+    }
+
     /// <summary>
     /// A 403 (access to a library, not to the site) counts as neither read-only nor locked: the libraries still show, and SharePoint
     /// refuses what the user may not do.

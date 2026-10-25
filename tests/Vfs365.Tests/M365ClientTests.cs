@@ -28,12 +28,18 @@ public sealed class M365ClientTests
         }
     }
 
-    /// <summary>A clock that waiting moves forward; waits of a minute or more block until <see cref="Release"/>.</summary>
+    /// <summary>
+    /// A clock that waiting moves forward; waits of a minute or more block until <see cref="Release"/>. Elapsed is the monotonic
+    /// time, Now the wall time, which <see cref="WallStep"/> can set back or forward.
+    /// </summary>
     sealed class Time
     {
+        static readonly DateTimeOffset Start = new(2026, 10, 12, 8, 0, 0, TimeSpan.Zero);
         readonly Lock gate = new();
         TaskCompletionSource release = new(TaskCreationOptions.RunContinuationsAsynchronously);
-        public DateTimeOffset Now = new(2026, 10, 12, 8, 0, 0, TimeSpan.Zero);
+        public TimeSpan Elapsed = TimeSpan.FromHours(1);
+        public TimeSpan WallStep;
+        public DateTimeOffset Now => Start + Elapsed + WallStep;
         public List<TimeSpan> Waits { get; } = [];
         public TimeSpan Blocking = TimeSpan.FromMinutes(1);
 
@@ -52,7 +58,7 @@ public sealed class M365ClientTests
                 Waits.Add(wait);
                 if (wait < Blocking)
                 {
-                    Now += wait;
+                    Elapsed += wait;
                     return Task.CompletedTask;
                 }
                 return release.Task;
@@ -63,7 +69,7 @@ public sealed class M365ClientTests
         {
             lock (gate)
             {
-                Now += by;
+                Elapsed += by;
                 var released = release;
                 release = new(TaskCreationOptions.RunContinuationsAsynchronously);
                 released.SetResult();
@@ -91,8 +97,8 @@ public sealed class M365ClientTests
         return response;
     }
 
-    static M365Client Client(Server server, Time time, double random = 0, RequestBudget? budget = null) =>
-        new(new HttpClient(server), new Tokens(), budget) { Clock = () => time.Now, Random = () => random, Delay = time.Delay };
+    static M365Client Client(HttpMessageHandler server, Time time, double random = 0, RequestBudget? budget = null) =>
+        new(new HttpClient(server), new Tokens(), budget) { Clock = () => time.Now, Monotonic = () => time.Elapsed, Random = () => random, Delay = time.Delay };
 
     static readonly Uri Item = new("https://graph.microsoft.com/v1.0/drives/b!x/items/1");
 
@@ -177,7 +183,7 @@ public sealed class M365ClientTests
         var clock = time ?? new Time();
         return new(new HttpClient(server) { Timeout = Timeout.InfiniteTimeSpan }, new Tokens())
         {
-            HeaderTimeout = Short, StallTimeout = Short, Clock = () => clock.Now, Random = () => 0, Delay = clock.Delay,
+            HeaderTimeout = Short, StallTimeout = Short, Clock = () => clock.Now, Monotonic = () => clock.Elapsed, Random = () => 0, Delay = clock.Delay,
         };
     }
 
@@ -452,7 +458,7 @@ public sealed class M365ClientTests
     public async Task The_resource_unit_header_replaces_the_estimate()
     {
         var time = new Time();
-        var budget = new RequestBudget(60, () => time.Now);
+        var budget = new RequestBudget(60, () => time.Elapsed);
         var client = Client(new Server(_ => Ok(("x-ms-resource-unit", "3"))), time, budget: budget);
 
         (await client.GetJsonAsync(Item, default))!.Dispose();
@@ -502,5 +508,247 @@ public sealed class M365ClientTests
         (await client.SendJsonAsync(HttpMethod.Put, new Uri("https://upload.example/session"), () => new StringContent("x"), default, authenticate: false))!.Dispose();
 
         Assert.Single(server.Requests);
+    }
+
+    [Fact]
+    public async Task A_wall_clock_set_back_holds_no_request()
+    {
+        // Throttled once (10 s), with a budget; then w32time sets the clock back 10 minutes in the middle of the pause
+        var time = new Time { Blocking = TimeSpan.FromSeconds(5) };
+        var budget = new RequestBudget(60, () => time.Elapsed, time.Delay);
+        var client = Client(new Server(_ => Status(429, TimeSpan.FromSeconds(10)), _ => Ok()), time, budget: budget);
+        var first = client.GetJsonAsync(Item, default);
+        for (var i = 0; i < 200 && time.Snapshot().Length == 0; i++)
+        {
+            await Task.Delay(10);
+        }
+        time.WallStep = -TimeSpan.FromMinutes(10);
+        time.Release(TimeSpan.FromSeconds(10));
+        (await first.WaitAsync(TimeSpan.FromSeconds(10)))!.Dispose();
+
+        // The pause ended after its 10 s, and neither the budget nor the release slots wait for the step
+        Assert.Equal([TimeSpan.FromSeconds(10)], time.Snapshot());
+        for (var i = 0; i < 20; i++)
+        {
+            (await client.GetJsonAsync(Item, default).WaitAsync(TimeSpan.FromSeconds(10)))!.Dispose();
+        }
+        Assert.Equal([TimeSpan.FromSeconds(10)], time.Snapshot());
+
+        // Background work waits the rest of its 15 minutes, told in the new wall time; the tray's "throttled" ends on time too
+        Assert.True(client.BackgroundPaused);
+        Assert.Equal(time.Now + TimeSpan.FromMinutes(15) - TimeSpan.FromSeconds(10), client.BackgroundPausedUntil);
+        Assert.True(client.ThrottledWithin(TimeSpan.FromMinutes(2)));
+        time.Elapsed += TimeSpan.FromMinutes(2);
+        Assert.False(client.ThrottledWithin(TimeSpan.FromMinutes(2)));
+    }
+
+    static byte[] Gzipped(string text)
+    {
+        using var buffer = new MemoryStream();
+        using (var gzip = new System.IO.Compression.GZipStream(buffer, System.IO.Compression.CompressionLevel.Optimal, leaveOpen: true))
+        {
+            gzip.Write(Encoding.UTF8.GetBytes(text));
+        }
+        return buffer.ToArray();
+    }
+
+    /// <summary>Answers gzip when asked for it; records whether each request asked.</summary>
+    sealed class GzipServer(HttpStatusCode status, string body) : HttpMessageHandler
+    {
+        public List<bool> AskedGzip { get; } = [];
+        public int Sent;
+
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
+        {
+            var asked = request.Headers.AcceptEncoding.Any(e => e.Value == "gzip");
+            AskedGzip.Add(asked);
+            var bytes = asked ? Gzipped(body) : Encoding.UTF8.GetBytes(body);
+            Sent = bytes.Length;
+            var content = new ByteArrayContent(bytes);
+            content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/json");
+            if (asked)
+            {
+                content.Headers.ContentEncoding.Add("gzip");
+            }
+            return Task.FromResult(new HttpResponseMessage(status) { Content = content });
+        }
+    }
+
+    [Fact]
+    public async Task Json_requests_ask_for_gzip_and_count_the_bytes_on_the_wire()
+    {
+        var page = $$"""{"value":[{{string.Join(',', Enumerable.Range(0, 200).Select(i => $$"""{"id":"{{i}}","name":"file {{i}}.docx"}"""))}}]}""";
+        var server = new GzipServer(HttpStatusCode.OK, page);
+        var client = Client(server, new Time());
+
+        using var doc = await client.GetJsonAsync(new Uri("https://graph.microsoft.com/v1.0/drives/b!x/root/children"), default);
+
+        Assert.Equal(200, doc!.RootElement.GetProperty("value").GetArrayLength());
+        Assert.Equal([true], server.AskedGzip);
+        Assert.Equal(server.Sent, client.Usage.BytesReceived);
+        Assert.True(server.Sent < page.Length / 3);
+    }
+
+    [Fact]
+    public async Task A_gzip_error_body_still_tells_maintenance_from_access_denied()
+    {
+        var server = new GzipServer(HttpStatusCode.Forbidden, """{"error":{"code":"serviceReadOnly","message":"Database Is Read Only"}}""");
+
+        var e = await Assert.ThrowsAsync<M365RequestException>(() => Client(server, new Time()).GetJsonAsync(Item, default));
+
+        Assert.Equal(RemoteError.ReadOnly, e.Error);
+        Assert.Contains("Database Is Read Only", e.Message);
+    }
+
+    [Fact]
+    public async Task Downloads_and_upload_sessions_never_ask_for_gzip()
+    {
+        var server = new GzipServer(HttpStatusCode.OK, "plain bytes");
+        var client = Client(server, new Time());
+
+        var (stream, _) = await client.OpenStreamAsync(new Uri("https://contoso.sharepoint.com/download.aspx?tempauth=x"), 0, default);
+        await using (stream)
+        {
+            Assert.Equal("plain bytes", await new StreamReader(stream).ReadToEndAsync());
+        }
+        var status = new GzipServer(HttpStatusCode.OK, """{"nextExpectedRanges":["0-"]}""");
+        (await Client(status, new Time()).SendJsonAsync(HttpMethod.Get, UploadUrl, null, default, authenticate: false))!.Dispose();
+
+        Assert.Equal([false], server.AskedGzip);
+        Assert.Equal([false], status.AskedGzip);
+    }
+
+    [Fact]
+    public async Task A_503_without_retry_after_holds_background_work_a_minute_not_the_throttle_pause()
+    {
+        var time = new Time { Blocking = TimeSpan.FromHours(1) };
+        var unwell = Client(new Server(_ => Status(503), _ => Ok()), time);
+        unwell.ThrottlePause = TimeSpan.FromMinutes(15);
+        var notices = new List<ThrottleNotice>();
+        unwell.Throttled = notices.Add;
+
+        (await unwell.GetJsonAsync(Item, default))!.Dispose();
+
+        // Back-off 2 s for the retry; background work a minute from the 503
+        Assert.Equal(TimeSpan.FromSeconds(2), time.Waits[0]);
+        Assert.Equal(TimeSpan.FromMinutes(1), Assert.Single(notices).BackgroundPause);
+        Assert.Equal(time.Now - TimeSpan.FromSeconds(2) + TimeSpan.FromMinutes(1), unwell.BackgroundPausedUntil);
+
+        // With Retry-After it is throttling: the whole pause
+        var throttled = Client(new Server(_ => Status(503, TimeSpan.FromSeconds(5)), _ => Ok()), time);
+        throttled.ThrottlePause = TimeSpan.FromMinutes(15);
+        (await throttled.GetJsonAsync(Item, default))!.Dispose();
+        Assert.Equal(time.Now - TimeSpan.FromSeconds(5) + TimeSpan.FromMinutes(15), throttled.BackgroundPausedUntil);
+    }
+
+    [Fact]
+    public async Task Overlapping_pauses_count_their_throttled_time_once()
+    {
+        // Two requests on their way when the tenant throttles: both answered 429 with Retry-After 10 s
+        var arrived = 0;
+        var both = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var server = new Scripted(Throttle, Throttle, (_, _) => Task.FromResult(Ok()));
+        async Task<HttpResponseMessage> Throttle(HttpRequestMessage request, CancellationToken ct)
+        {
+            if (Interlocked.Increment(ref arrived) == 2)
+            {
+                both.SetResult();
+            }
+            await both.Task.WaitAsync(ct);
+            return Status(429, TimeSpan.FromSeconds(10));
+        }
+        var time = new Time { Blocking = TimeSpan.FromSeconds(5) };
+        var client = Client(server, time);
+
+        var requests = new[] { client.GetJsonAsync(Item, default), client.GetJsonAsync(Item, default) };
+        for (var i = 0; i < 200 && time.Snapshot().Count(w => w >= TimeSpan.FromSeconds(5)) < 2; i++)
+        {
+            await Task.Delay(10);
+        }
+        time.Release(TimeSpan.FromSeconds(10));
+        foreach (var request in requests)
+        {
+            (await request.WaitAsync(TimeSpan.FromSeconds(10)))!.Dispose();
+        }
+
+        Assert.Equal(2, client.Usage.Throttled);
+        Assert.Equal(10, client.Usage.ThrottledSeconds);
+    }
+
+    [Fact]
+    public async Task A_read_whose_connection_dropped_is_sent_once_more()
+    {
+        static Task<HttpResponseMessage> Dropped(HttpRequestMessage request, CancellationToken ct) =>
+            throw new HttpRequestException(HttpRequestError.ResponseEnded, "The response ended prematurely.");
+
+        var once = new Scripted(Dropped, (_, _) => Task.FromResult(Ok()));
+        using (var doc = await Timed(once).GetJsonAsync(Item, default))
+        {
+            Assert.Equal(1, doc!.RootElement.GetProperty("value").GetInt32());
+        }
+        Assert.Equal(2, once.Requests);
+
+        var twice = new Scripted(Dropped, Dropped, (_, _) => Task.FromResult(Ok()));
+        await Assert.ThrowsAsync<HttpRequestException>(() => Timed(twice).GetJsonAsync(Item, default));
+        Assert.Equal(2, twice.Requests);
+    }
+
+    [Fact]
+    public async Task A_failed_connect_is_not_sent_again()
+    {
+        var refused = new Scripted((_, _) => throw new HttpRequestException(HttpRequestError.ConnectionError, "No connection could be made"), (_, _) => Task.FromResult(Ok()));
+        await Assert.ThrowsAsync<HttpRequestException>(() => Timed(refused).GetJsonAsync(Item, default));
+        Assert.Equal(1, refused.Requests);
+
+        // The handler's connect timeout (HttpClient wraps it in its own timeout): a timeout in the handler's words, not "no answer"
+        var blackHole = new Scripted((_, _) => throw new TaskCanceledException("The operation was canceled.",
+            new TimeoutException("A connection could not be established within the configured ConnectTimeout.")), (_, _) => Task.FromResult(Ok()));
+        var e = await Assert.ThrowsAsync<TaskCanceledException>(() => Timed(blackHole).GetJsonAsync(Item, default));
+        Assert.IsType<TimeoutException>(e.InnerException);
+        Assert.Contains("ConnectTimeout", e.Message);
+        Assert.Contains("timed out", e.Message);
+        Assert.Equal(1, blackHole.Requests);
+    }
+
+    [Fact]
+    public async Task A_background_read_without_an_answer_is_sent_once_more_and_a_users_fails()
+    {
+        var background = new Scripted(Never, (_, _) => Task.FromResult(Ok()));
+        using (await InBackground(() => Timed(background).GetJsonAsync(Item, default), new PriorityHolder()).WaitAsync(TimeSpan.FromSeconds(10)))
+        {
+        }
+        Assert.Equal(2, background.Requests);
+
+        var foreground = new Scripted(Never, (_, _) => Task.FromResult(Ok()));
+        await Assert.ThrowsAsync<TaskCanceledException>(() => Timed(foreground).GetJsonAsync(Item, default)).WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Equal(1, foreground.Requests);
+    }
+
+    [Fact]
+    public async Task A_transfer_url_that_reports_resource_units_is_counted()
+    {
+        var time = new Time();
+        var budget = new RequestBudget(60, () => time.Elapsed);
+        var download = new Server(_ => Ok(("x-ms-resource-unit", "1")));
+        var client = Client(download, time, budget: budget);
+
+        var (stream, _) = await client.OpenStreamAsync(new Uri("https://contoso.sharepoint.com/download.aspx?tempauth=x"), 0, default);
+        await stream.DisposeAsync();
+
+        Assert.Equal(1, client.Usage.ResourceUnits);
+        Assert.False(budget.TryTake(60, background: false, out _));
+    }
+
+    [Fact]
+    public void The_handler_signs_in_to_proxies_and_gives_up_connecting_after_15_seconds()
+    {
+        using var handler = M365Client.CreateHandler();
+
+        Assert.Same(CredentialCache.DefaultCredentials, handler.DefaultProxyCredentials);
+        Assert.True(handler.UseProxy);
+        Assert.Equal(TimeSpan.FromSeconds(15), handler.ConnectTimeout);
+        Assert.InRange(handler.PooledConnectionLifetime, TimeSpan.FromMinutes(5), TimeSpan.FromMinutes(10));
+        Assert.InRange(handler.PooledConnectionIdleTimeout, TimeSpan.FromMinutes(1), TimeSpan.FromMinutes(4));
+        Assert.Equal(DecompressionMethods.None, handler.AutomaticDecompression);
     }
 }

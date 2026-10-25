@@ -20,17 +20,29 @@ public sealed class DriveHost : IDisposable
     /// </summary>
     static readonly TimeSpan IrpTimeout = TimeSpan.FromMinutes(10);
 
+    /// <summary>
+    /// WinFsp dispatcher threads. Reads, writes and listings that wait answer later, but opens, closes (uploads), renames and lookups
+    /// still hold a thread while they wait for Microsoft 365.
+    /// </summary>
+    const uint ThreadCount = 64;
+
     readonly FileSystemHost host;
     readonly Channel<EngineChange> changes = Channel.CreateUnbounded<EngineChange>(new UnboundedChannelOptions { SingleReader = true });
     readonly Task notifier;
 
     readonly Action<string>? log;
 
-    DriveHost(FileSystemHost host, string? driveLetter, Action<string>? log)
+    DriveHost(FileSystemHost host, string? driveLetter, bool namespaceLocked, Action<string>? log)
     {
-        (this.host, DriveLetter, this.log) = (host, driveLetter, log);
+        (this.host, DriveLetter, NamespaceLocked, this.log) = (host, driveLetter, namespaceLocked, log);
         notifier = Task.Run(NotifyLoopAsync);
     }
+
+    /// <summary>
+    /// True when WinFsp's own operation guard serializes the namespace (asked for, or kept because the native layout didn't match);
+    /// false when only the engine's per-key locking does.
+    /// </summary>
+    public bool NamespaceLocked { get; }
 
     /// <summary>Tells Windows (Explorer, apps watching folders) about a change that didn't come through this volume. Queued; never blocks.</summary>
     public void Notify(EngineChange change) => changes.Writer.TryWrite(change);
@@ -101,15 +113,21 @@ public sealed class DriveHost : IDisposable
     /// <param name="mountPoint">Drive letter such as "M:", or null for the first free one counting down from Z.</param>
     /// <param name="keepDriveLetter">False removes the drive letter after mounting; the volume stays reachable through its UNC path.</param>
     /// <param name="uncPrefix">Network prefix with single backslashes, for example \VFS365\contoso.</param>
+    /// <param name="winFspGuard">
+    /// True keeps WinFsp's FINE operation guard, which holds a volume-wide lock exclusively around creates, overwrites, deletes and
+    /// renames (so one slow lookup, folder delete or upload in them stops every open and listing). False, the default, replaces it
+    /// with none: the engine orders changes per key. WinFsp's driver still holds every open while a rename runs, whatever the guard.
+    /// </param>
     public static DriveHost Mount(DriveEngine engine, string? mountPoint, bool keepDriveLetter, string uncPrefix, string label,
-        Action<string>? log, Action<string>? trace = null)
+        Action<string>? log, Action<string>? trace = null, bool winFspGuard = false)
     {
-        var host = new FileSystemHost(new Vfs365FileSystem(engine, label, log, trace)) { Prefix = uncPrefix };
+        var fileSystem = new Vfs365FileSystem(engine, label, log, trace, winFspGuard);
+        var host = new FileSystemHost(fileSystem) { Prefix = uncPrefix };
         if (!WinFspNative.SetIrpTimeout(host, IrpTimeout))
         {
             log?.Invoke($"WinFsp's request timeout could not be set to {IrpTimeout.TotalMinutes:0} min; it stays at WinFsp's default");
         }
-        var status = host.MountEx(mountPoint, 16, null, false, 0);
+        var status = host.MountEx(mountPoint, ThreadCount, null, false, 0);
         if (status < 0)
         {
             host.Dispose();
@@ -121,10 +139,10 @@ public sealed class DriveHost : IDisposable
         }
         if (keepDriveLetter)
         {
-            return new DriveHost(host, host.MountPoint(), log);
+            return new DriveHost(host, host.MountPoint(), !fileSystem.GuardReplaced, log);
         }
         RemoveMountPoint(host);
-        return new DriveHost(host, null, log);
+        return new DriveHost(host, null, !fileSystem.GuardReplaced, log);
     }
 
     public void Dispose()

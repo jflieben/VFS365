@@ -89,7 +89,7 @@ public sealed class DriveNotificationsTests
     [Fact]
     public async Task Reconnects_back_off_with_jitter_and_start_over_only_after_a_minute_up()
     {
-        var now = DateTimeOffset.UnixEpoch;
+        var now = TimeSpan.FromHours(1);
         var waits = new List<TimeSpan>();
         var states = new List<bool>();
         var problems = new List<string>();
@@ -98,7 +98,7 @@ public sealed class DriveNotificationsTests
         var notifications = new DriveNotifications(new M365Client(new HttpClient(new Endpoints()), new Tokens()))
         {
             Problem = problems.Add,
-            Clock = () => now,
+            Monotonic = () => now,
             Random = () => 1, // the full 100% extra
             Delay = (wait, ct) =>
             {

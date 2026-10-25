@@ -40,6 +40,30 @@ public static class KnownFolders
 
     public static IEnumerable<string> Names => ByName.Keys;
 
+    /// <summary>
+    /// The folders above as values in HKCU\...\Explorer\User Shell Folders (a legacy name, else the ID in braces), with the ID and
+    /// Windows' default below %USERPROFILE%: the uninstall resets values left in VFS365 to these.
+    /// </summary>
+    public static readonly IReadOnlyList<(string Value, Guid Id, string Default)> ShellFolderValues =
+    [
+        ("Desktop", ByName["Desktop"][0], "Desktop"),
+        ("Personal", ByName["Documents"][0], "Documents"),
+        ("{F42EE2D3-909F-4907-8871-4C22FC0BF756}", ByName["Documents"][1], "Documents"),
+        ("{374DE290-123F-4565-9164-39C4925E467B}", ByName["Downloads"][0], "Downloads"),
+        ("{7D83EE9B-2244-4E70-B1F5-5393042AF1E4}", ByName["Downloads"][1], "Downloads"),
+        ("My Music", ByName["Music"][0], "Music"),
+        ("{A0C69A99-21C8-4671-8703-7934162FCF1D}", ByName["Music"][1], "Music"),
+        ("My Pictures", ByName["Pictures"][0], "Pictures"),
+        ("{0DDD015D-B06C-45D5-8C4C-F59713854639}", ByName["Pictures"][1], "Pictures"),
+        ("My Video", ByName["Videos"][0], "Videos"),
+        ("{35286A68-3C57-41A1-BBB1-0EAE73D76C95}", ByName["Videos"][1], "Videos"),
+        ("Favorites", ByName["Favorites"][0], "Favorites"),
+        ("{56784854-C6CB-462B-8169-88E350ACB882}", ByName["Contacts"][0], "Contacts"),
+        ("{BFB9D5E0-C6A9-404C-B2B2-AE6DB6AF4968}", ByName["Links"][0], "Links"),
+        ("{4C5C32FF-BB9D-43B0-B5B4-2D72E54EAAA4}", ByName["SavedGames"][0], "Saved Games"),
+        ("{7D1D3A04-DEBB-4115-95CF-2F29DA2920DA}", ByName["SavedSearches"][0], "Searches"),
+    ];
+
     /// <summary>"Documents" (also "My Documents"), or "{GUID}": the IDs to move, the first being the one to read.</summary>
     public static bool TryParse(string text, out string name, out Guid[] ids)
     {

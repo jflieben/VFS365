@@ -16,14 +16,14 @@ public sealed class PushDebounce(Func<Task> read) : IDisposable
     readonly Lock gate = new();
     readonly CancellationTokenSource stop = new();
     bool pending;
-    DateTimeOffset lastRead = DateTimeOffset.MinValue;
+    TimeSpan? lastRead;
 
     public TimeSpan Settle { get; init; } = TimeSpan.FromSeconds(3);
     public TimeSpan MaxJitter { get; init; } = TimeSpan.FromSeconds(10);
     public TimeSpan MinInterval { get; init; } = TimeSpan.FromSeconds(30);
 
-    /// <summary>Time, randomness (0 to 1) and waiting; replaceable for tests.</summary>
-    public Func<DateTimeOffset> Clock { get; init; } = () => DateTimeOffset.UtcNow;
+    /// <summary>Monotonic time (<see cref="MonotonicClock"/>), randomness (0 to 1) and waiting; replaceable for tests.</summary>
+    public Func<TimeSpan> Monotonic { get; init; } = MonotonicClock.Now;
     public Func<double> Random { get; init; } = System.Random.Shared.NextDouble;
     public Func<TimeSpan, CancellationToken, Task> Delay { get; init; } = Task.Delay;
 
@@ -37,11 +37,11 @@ public sealed class PushDebounce(Func<Task> read) : IDisposable
                 return;
             }
             pending = true;
-            var now = Clock();
+            var now = Monotonic();
             var due = now + Settle + MaxJitter * Random();
-            if (lastRead != DateTimeOffset.MinValue && lastRead + MinInterval > due)
+            if (lastRead is { } last && last + MinInterval > due)
             {
-                due = lastRead + MinInterval;
+                due = last + MinInterval;
             }
             wait = due - now;
         }
@@ -61,7 +61,7 @@ public sealed class PushDebounce(Func<Task> read) : IDisposable
         lock (gate)
         {
             pending = false;
-            lastRead = Clock();
+            lastRead = Monotonic();
         }
         try
         {
@@ -98,8 +98,8 @@ public sealed class DriveNotifications(M365Client client)
     /// <summary>Why a channel dropped or couldn't open.</summary>
     public Action<string>? Problem { get; set; }
 
-    /// <summary>Time, randomness (0 to 1) and the wait between connections; replaceable for tests.</summary>
-    public Func<DateTimeOffset> Clock { get; init; } = () => DateTimeOffset.UtcNow;
+    /// <summary>Monotonic time (<see cref="MonotonicClock"/>), randomness (0 to 1) and the wait between connections; replaceable for tests.</summary>
+    public Func<TimeSpan> Monotonic { get; init; } = MonotonicClock.Now;
     public Func<double> Random { get; init; } = System.Random.Shared.NextDouble;
     public Func<TimeSpan, CancellationToken, Task> Delay { get; init; } = Task.Delay;
 
@@ -124,13 +124,13 @@ public sealed class DriveNotifications(M365Client client)
         var delay = FirstRetry;
         while (!ct.IsCancellationRequested)
         {
-            DateTimeOffset? upSince = null;
+            TimeSpan? upSince = null;
             try
             {
                 var endpoint = await GetEndpointAsync(driveId, ct);
                 await ReceiveAsync(endpoint, changed, () =>
                 {
-                    upSince = Clock();
+                    upSince = Monotonic();
                     connected(true);
                 }, ct);
             }
@@ -143,7 +143,7 @@ public sealed class DriveNotifications(M365Client client)
                 Problem?.Invoke($"push channel of drive {driveId}: {e.Message}");
             }
             connected(false);
-            if (upSince is { } since && Clock() - since >= StableAfter)
+            if (upSince is { } since && Monotonic() - since >= StableAfter)
             {
                 delay = FirstRetry;
             }
@@ -159,15 +159,23 @@ public sealed class DriveNotifications(M365Client client)
         }
     }
 
+    /// <summary>The proxy and its Windows sign-in, and the connect timeout, of the HTTP requests (<see cref="M365Client.CreateHandler"/>).</summary>
+    static readonly HttpMessageInvoker sockets = new(M365Client.CreateHandler());
+
+    /// <summary>
+    /// Without WebSocket keep-alive frames (30 s by default): Engine.IO's pings keep the channel up and find a dead one, so those would
+    /// only double the traffic.
+    /// </summary>
     static async Task<WebSocket> ConnectAsync(Uri uri, CancellationToken ct)
     {
         var socket = new ClientWebSocket();
         socket.Options.SetRequestHeader("User-Agent", GraphUserAgent.Value);
+        socket.Options.KeepAliveInterval = TimeSpan.Zero;
         using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
         deadline.CancelAfter(ConnectTimeout);
         try
         {
-            await socket.ConnectAsync(uri, deadline.Token);
+            await socket.ConnectAsync(uri, sockets, deadline.Token);
             return socket;
         }
         catch (OperationCanceledException e) when (!ct.IsCancellationRequested)
@@ -192,6 +200,7 @@ public sealed class DriveNotifications(M365Client client)
         var nsp = endpoint.AbsolutePath;
         using var socket = await Connect(new Uri($"wss://{endpoint.Authority}/socket.io/?EIO=3&transport=websocket{(query.Length > 0 ? "&" + query : "")}"), ct);
         using var stop = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        using var sending = new SemaphoreSlim(1, 1); // a WebSocket takes one send at a time: the pinger's and the loop's
         var silence = DefaultPingInterval + DefaultPingTimeout;
         stop.CancelAfter(silence);
         Task? pinger = null;
@@ -209,12 +218,12 @@ public sealed class DriveNotifications(M365Client client)
                     var interval = Milliseconds(open.RootElement, "pingInterval") ?? DefaultPingInterval;
                     silence = interval + (Milliseconds(open.RootElement, "pingTimeout") ?? DefaultPingTimeout);
                     stop.CancelAfter(silence);
-                    await SendAsync(socket, $"40{nsp}{(query.Length > 0 ? "?" + query : "")},", stop.Token);
-                    pinger = PingAsync(socket, interval, stop.Token);
+                    await SendAsync(socket, sending, $"40{nsp}{(query.Length > 0 ? "?" + query : "")},", stop.Token);
+                    pinger ??= PingAsync(socket, sending, interval, stop.Token);
                 }
                 else if (message == "2")
                 {
-                    await SendAsync(socket, "3", stop.Token);
+                    await SendAsync(socket, sending, "3", stop.Token);
                 }
                 else if (message.StartsWith($"40{nsp}", StringComparison.Ordinal))
                 {
@@ -257,17 +266,27 @@ public sealed class DriveNotifications(M365Client client)
     static TimeSpan? Milliseconds(JsonElement open, string name) =>
         open.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.Number && value.TryGetInt32(out var ms) && ms > 0 ? TimeSpan.FromMilliseconds(ms) : null;
 
-    static async Task PingAsync(WebSocket socket, TimeSpan interval, CancellationToken ct)
+    static async Task PingAsync(WebSocket socket, SemaphoreSlim sending, TimeSpan interval, CancellationToken ct)
     {
         while (true)
         {
             await Task.Delay(interval, ct);
-            await SendAsync(socket, "2", ct);
+            await SendAsync(socket, sending, "2", ct);
         }
     }
 
-    static Task SendAsync(WebSocket socket, string text, CancellationToken ct) =>
-        socket.SendAsync(Encoding.UTF8.GetBytes(text), WebSocketMessageType.Text, true, ct);
+    static async Task SendAsync(WebSocket socket, SemaphoreSlim sending, string text, CancellationToken ct)
+    {
+        await sending.WaitAsync(ct);
+        try
+        {
+            await socket.SendAsync(Encoding.UTF8.GetBytes(text), WebSocketMessageType.Text, true, ct);
+        }
+        finally
+        {
+            sending.Release();
+        }
+    }
 
     /// <summary>One whole text message; empty when the server closed the socket.</summary>
     static async Task<string> ReadAsync(WebSocket socket, byte[] buffer, CancellationToken ct)

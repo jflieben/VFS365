@@ -82,15 +82,19 @@ flowchart LR
 
 Idle drives make no calls. Discovery and change checks yield to what users open and save, and back off when Microsoft throttles; see [API use](docs/DEPLOYMENT.md#api-use).
 
+### Explorer menu
+
+Right-click a file or folder in the drive (on Windows 11 under "Show more options"), then VFS365: Open in browser, Open in desktop app (Word, Excel, PowerPoint, co-authoring included), Copy link (for people who already have access; no sharing link is made), Version history, and Share in browser (opens the item in the browser, where its Share button is). On a conflict copy also Keep this version (the copy becomes a new version of the original; the other version stays in its version history) and Compare with the original.
+
 ### Tray
 
-The tray icon follows the taskbar theme and shows whether everything is saved (plain), something is waiting to upload (amber) or needs attention (red). Its menu has Show files, Show log, Refresh, Restart, Sign in when needed, and Help (your own service desk page by policy). English or Dutch, by the Windows display language.
+The tray icon follows the taskbar theme and shows whether everything is saved (plain), something is waiting to upload (amber) or needs attention (red). Its menu has Show files, Show log, Collect diagnostics (one zip for the helpdesk, tokens removed), Refresh, Restart, Sign in when needed, and Help (your own service desk page by policy). English or Dutch, by the Windows display language.
 
 <img src="assets/tray/preview.png" width="420" alt="Tray icons: normal, waiting and problem, for dark and light taskbars">
 
 ### Monitoring
 
-With the `MonitoringUrl` policy, every device reports errors, daily usage and installs to your own Azure table storage. The [dashboard](monitoring/vfs365-monitoring.html) is one HTML file that reads those tables with a read-only SAS and shows what needs attention, trends and per-device and per-user details:
+With the `MonitoringUrl` policy, every device reports errors, daily usage and installs to your own Azure table storage. The [dashboard](monitoring/vfs365-monitoring.html) is one HTML file that reads those tables with a read-only SAS and shows what needs attention, trends, per-device and per-user details, and the headroom left under Microsoft's per-app limits for the next rollout wave:
 
 ![Monitoring dashboard with sample data](assets/screenshots/dashboard.png)
 
@@ -105,9 +109,9 @@ You need an Azure storage account with three tables and two shared access signat
 The [template](monitoring/azuredeploy.json) creates, in a resource group you choose:
 - a storage account (StorageV2, TLS 1.2, no public blob access) with the tables `errors`, `statistics` and `devices`;
 - the dashboard on the account's static website (`https://<account>.z<n>.web.core.windows.net/`, the latest release's page), with CORS that lets only that address read the tables;
-- two outputs (resource group > Deployments > the deployment > Outputs): `monitoringUrl`, the policy value for the devices (add only, two years), and `dashboardLink`, the dashboard connected with a read-only SAS (30 days).
+- four outputs (resource group > Deployments > the deployment > Outputs): `monitoringUrl`, the policy value for the devices (add only, two years); `dashboardUrl`, the dashboard's address; `dashboardLink`, the dashboard connected with a read-only SAS (30 days); and `dashboardSasUrl`, that read-only SAS URL on its own, to paste into the dashboard.
 
-Then set the policy (step 3 below). To renew both SAS URLs and update the dashboard page, deploy again into the same resource group: the account keeps its name and its rows.
+Then set the policy (step 3 below). To renew both SAS URLs and update the dashboard page, use the Deploy to Azure button again with the same resource group: the account keeps its name and its rows. Not the portal's Redeploy on the old deployment: it reuses that deployment's start time, so the SAS URLs would keep their old expiry dates and the page upload would fail.
 
 The outputs stay in the resource group's deployment history, where anyone who can read the group sees them; `dashboardSasDays` = 0 leaves the dashboard link out. Hosting the dashboard runs a short deployment script on Azure Container Instances; where a policy blocks that, set `hostDashboard` to false, open the page from disk and add `*` to `extraCorsOrigins`.
 
@@ -153,7 +157,7 @@ See [Monitoring in DEPLOYMENT.md](docs/DEPLOYMENT.md#monitoring) for every colum
 
 - Discovery uses SharePoint Search: sites excluded from search and Restricted Content Discovery sites aren't found. Pinned locations (policy, or `vfs365 pin` per user) fill the gap.
 - Byte-range locks don't cross machines: multi-user Access, QuickBooks and SQLite files are unsafe. The `DatabaseFiles` policy makes them read-only or blocks them if you want / expect concurrent use
-- No Office co-authoring from the drive; that works only through Microsoft's own client.
+- No Office co-authoring from the drive; that works only through Microsoft's own client. Right-click a Word, Excel or PowerPoint file, VFS365, Open in desktop app to open it from Microsoft 365 instead, where co-authoring works.
 - While a user's drive isn't running, `\\VFS365` is an ordinary server name to Windows. Turn off LLMNR and NetBIOS name resolution and own the DNS name, as in [The name VFS365 on the network](docs/DEPLOYMENT.md#the-name-vfs365-on-the-network).
 - x64 apps on ARM64 devices can't resolve typed `\\VFS365` paths in their file dialogs (files open and save normally); see [Known limitations](docs/DEPLOYMENT.md#known-limitations).
 

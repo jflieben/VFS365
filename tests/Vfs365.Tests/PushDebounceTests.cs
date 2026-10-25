@@ -4,10 +4,10 @@ namespace Vfs365.Tests;
 
 public sealed class PushDebounceTests
 {
-    /// <summary>Waits block until the test lets them go, moving the clock by their length.</summary>
+    /// <summary>Waits block until the test lets them go, moving the (monotonic) clock by their length.</summary>
     sealed class Waits
     {
-        public DateTimeOffset Now = DateTimeOffset.UnixEpoch;
+        public TimeSpan Now = TimeSpan.FromHours(1);
         public List<(TimeSpan Wait, TaskCompletionSource Done)> Pending { get; } = [];
 
         public Task Delay(TimeSpan wait, CancellationToken ct)
@@ -41,7 +41,7 @@ public sealed class PushDebounceTests
         var reads = 0;
         using var debounce = new PushDebounce(() => { Interlocked.Increment(ref reads); return Task.CompletedTask; })
         {
-            Clock = () => waits.Now, Random = () => 0.5, Delay = waits.Delay,
+            Monotonic = () => waits.Now, Random = () => 0.5, Delay = waits.Delay,
         };
 
         debounce.Notify();
@@ -61,7 +61,7 @@ public sealed class PushDebounceTests
         var reads = 0;
         using var debounce = new PushDebounce(() => { Interlocked.Increment(ref reads); return Task.CompletedTask; })
         {
-            Clock = () => waits.Now, Random = () => 0, Delay = waits.Delay,
+            Monotonic = () => waits.Now, Random = () => 0, Delay = waits.Delay,
         };
 
         debounce.Notify();
@@ -79,7 +79,7 @@ public sealed class PushDebounceTests
     {
         var waits = new Waits();
         var reads = 0;
-        var debounce = new PushDebounce(() => { reads++; return Task.CompletedTask; }) { Clock = () => waits.Now, Random = () => 0, Delay = waits.Delay };
+        var debounce = new PushDebounce(() => { reads++; return Task.CompletedTask; }) { Monotonic = () => waits.Now, Random = () => 0, Delay = waits.Delay };
 
         debounce.Notify();
         debounce.Dispose();

@@ -12,7 +12,7 @@ public sealed class ReadPathStallTests : IDisposable
     readonly FakeDriveApi fake = new();
     readonly StallingDriveApi api;
     readonly List<string> log = [];
-    readonly DateTimeOffset now = new(2026, 10, 24, 9, 0, 0, TimeSpan.Zero);
+    DateTimeOffset now = new(2026, 10, 24, 9, 0, 0, TimeSpan.Zero);
     static readonly TimeSpan Short = TimeSpan.FromMilliseconds(300);
     static readonly TimeSpan Patience = TimeSpan.FromSeconds(20);
 
@@ -27,6 +27,7 @@ public sealed class ReadPathStallTests : IDisposable
                 StagingDirectory = Path.Combine(directory, "staging"),
                 Clock = () => now,
                 CallTimeout = Short,
+                LookupDeadline = Short,
                 Random = () => 0.5,
                 Log = line => { lock (log) { log.Add(line); } },
             });
@@ -160,7 +161,7 @@ public sealed class ReadPathStallTests : IDisposable
 
         using (var source = await engine.OpenContentAsync(file, default))
         {
-            var read = source.ReadAsync(0, new byte[4096], default).AsTask();
+            var read = source.ReadAsync(200_000, new byte[4096], default).AsTask(); // past what was sent: chunks are served as they arrive
             Assert.Same(read, await Task.WhenAny(read, Task.Delay(Patience)));
             var failure = await Assert.ThrowsAnyAsync<Exception>(() => read);
             Assert.Contains("No download progress", failure.Message);
@@ -216,6 +217,118 @@ public sealed class ReadPathStallTests : IDisposable
 
         Assert.Equal(6, (await Within(listing)).Count);
         Assert.Single(api.ListPriorities);
+    }
+
+    /// <summary>The docs folder with 20 files, listed while the feed fails (so its listing goes stale after ListingTtl).</summary>
+    async Task<DriveEngine> StaleFolderAsync()
+    {
+        fake.DeltaUnavailable = true;
+        fake.Add("docs", folder: true);
+        for (var i = 0; i < 20; i++)
+        {
+            fake.Add($"docs/f{i:D2}.txt");
+        }
+        var engine = Create();
+        await engine.ListAsync((await engine.GetEntryAsync("\\docs", default))!, default);
+        now += TimeSpan.FromMinutes(2);
+        return engine;
+    }
+
+    [Fact]
+    public async Task Offline_only_the_first_lookup_waits_for_the_network_to_fail()
+    {
+        var engine = await StaleFolderAsync();
+        (api.Offline, api.FailAfter) = (true, TimeSpan.FromMilliseconds(200));
+        var calls = api.ItemCalls;
+
+        var watch = System.Diagnostics.Stopwatch.StartNew();
+        for (var i = 0; i < 20; i++)
+        {
+            Assert.NotNull(await Within(engine.GetEntryAsync($"\\docs\\f{i:D2}.txt", default)));
+        }
+
+        // Before: each of the 20 waited for its own failure (4 s here, 40 to 200 s on a black-holed network). Now the first does,
+        // and the background refresh of the folder looks its ID up once
+        Assert.InRange(api.ItemCalls - calls, 1, 2);
+        Assert.True(watch.Elapsed < TimeSpan.FromSeconds(2), $"{watch.ElapsedMilliseconds} ms");
+
+        // 30 s later a lookup still answers at once, and one asks again in the background
+        now += TimeSpan.FromSeconds(31);
+        api.Offline = false;
+        calls = api.ItemCalls;
+        watch.Restart();
+        Assert.NotNull(await Within(engine.GetEntryAsync("\\docs\\f00.txt", default)));
+        Assert.True(watch.Elapsed < TimeSpan.FromMilliseconds(150), $"{watch.ElapsedMilliseconds} ms");
+        await Eventually(() => api.ItemCalls > calls);
+
+        // That worked, so the next lookup asks Microsoft 365 again (and waits for its failure, offline again)
+        await Task.Delay(100);
+        now += TimeSpan.FromSeconds(61);
+        api.Offline = true;
+        watch.Restart();
+        Assert.NotNull(await Within(engine.GetEntryAsync("\\docs\\f01.txt", default)));
+        Assert.True(watch.Elapsed >= TimeSpan.FromMilliseconds(150), $"{watch.ElapsedMilliseconds} ms");
+    }
+
+    [Fact]
+    public async Task A_lookup_that_gets_no_answer_falls_back_to_the_stale_listing_after_its_deadline()
+    {
+        var engine = await StaleFolderAsync();
+        api.HangItems = true;
+        fake.PageSize = 2;
+        api.HangAfterPages = 0; // the refresh of the folder hangs too
+
+        var watch = System.Diagnostics.Stopwatch.StartNew();
+        Assert.NotNull(await Within(engine.GetEntryAsync("\\docs\\f00.txt", default)));
+        Assert.NotNull(await Within(engine.GetEntryAsync("\\docs\\f01.txt", default)));
+
+        Assert.InRange(watch.Elapsed, Short, Short * 6); // the first waits out its deadline, the second answers at once
+        Assert.Null(await Within(engine.GetEntryAsync("\\docs\\nope.txt", default)));
+    }
+
+    [Fact]
+    public async Task While_the_client_holds_background_requests_no_change_feed_is_read()
+    {
+        fake.Add("docs", folder: true);
+        var engine = Create();
+        await engine.PollAsync("b!me");
+        await engine.ListAsync((await engine.GetEntryAsync("\\docs", default))!, default);
+        var calls = api.DeltaCalls;
+
+        engine.HotPollingPaused = true;
+        now += TimeSpan.FromMinutes(5);
+        await engine.PollAsync("b!me");
+        await engine.NotifiedAsync("b!me");
+        await engine.PollActiveAsync();
+        Assert.Equal(calls, api.DeltaCalls);
+        Assert.NotNull(await Within(engine.GetEntryAsync("\\docs\\x.txt", default).ContinueWith(_ => (object)"done"))); // no catch-up to wait for
+
+        engine.HotPollingPaused = false;
+        await engine.PollActiveAsync();
+        Assert.Equal(calls + 1, api.DeltaCalls);
+    }
+
+    [Fact]
+    public async Task A_change_feed_read_held_by_the_client_during_throttling_breaks_nothing()
+    {
+        fake.Add("docs", folder: true);
+        var engine = Create();
+        await engine.PollAsync("b!me");
+        await engine.ListAsync((await engine.GetEntryAsync("\\docs", default))!, default);
+        api.HangDelta = true;
+
+        // A read starts, then the client starts holding background requests (a 429 elsewhere); the read times out meanwhile
+        var read = engine.PollAsync("b!me");
+        engine.HotPollingPaused = true;
+        await Within(read);
+        engine.HotPollingPaused = false;
+
+        Assert.Equal(["b!me"], engine.PushDrives()); // not broken: push stays, listings stay current
+        Assert.False(Logged("trying again in"));
+        api.HangDelta = false;
+        var calls = api.DeltaCalls;
+        await engine.PollAsync("b!me"); // no back-off
+        Assert.Equal(calls + 1, api.DeltaCalls);
     }
 
     static async Task Eventually(Func<bool> condition)
@@ -286,21 +399,35 @@ sealed class StallingDriveApi(FakeDriveApi inner) : IDriveApi
     /// <summary>No network: every read fails at once, as with no connection.</summary>
     public bool Offline { get; set; }
 
-    public int DeltaCalls;
+    /// <summary>With Offline, each read fails only after this long (a black-holed network: a TCP connect timeout).</summary>
+    public TimeSpan? FailAfter { get; set; }
+
+    /// <summary>Item lookups never answer.</summary>
+    public bool HangItems { get; set; }
+
+    /// <summary>Change feed pages served before the fake's own (for changes the fake can't make, such as children reported first).</summary>
+    public Queue<DeltaPage> Scripted { get; } = new();
+
+    public int DeltaCalls, ItemCalls, ListingCalls;
 
     internal Task Hang(CancellationToken ct) => IgnoreTokens ? new TaskCompletionSource().Task : Task.Delay(Timeout.Infinite, ct);
 
-    void Online()
+    async Task OnlineAsync(CancellationToken ct)
     {
         if (Offline)
         {
+            if (FailAfter is { } wait)
+            {
+                await Task.Delay(wait, ct);
+            }
             throw new HttpRequestException("No such host is known. (graph.microsoft.com:443)");
         }
     }
 
     public async IAsyncEnumerable<IReadOnlyList<DriveItemInfo>> ListChildrenAsync(string driveId, string folderPath, [EnumeratorCancellation] CancellationToken ct)
     {
-        Online();
+        Interlocked.Increment(ref ListingCalls);
+        await OnlineAsync(ct);
         lock (ListPriorities)
         {
             ListPriorities.Add(RequestPriority.Current);
@@ -331,7 +458,7 @@ sealed class StallingDriveApi(FakeDriveApi inner) : IDriveApi
 
     public async Task<string> GetLatestDeltaLinkAsync(string driveId, CancellationToken ct)
     {
-        Online();
+        await OnlineAsync(ct);
         Interlocked.Increment(ref DeltaCalls);
         if (HangDelta)
         {
@@ -342,7 +469,7 @@ sealed class StallingDriveApi(FakeDriveApi inner) : IDriveApi
 
     public async Task<DeltaPage> GetDeltaAsync(string link, CancellationToken ct)
     {
-        Online();
+        await OnlineAsync(ct);
         Interlocked.Increment(ref DeltaCalls);
         if (FailDelta is { } failure)
         {
@@ -352,7 +479,7 @@ sealed class StallingDriveApi(FakeDriveApi inner) : IDriveApi
         {
             await Hang(ct);
         }
-        var page = await inner.GetDeltaAsync(link, ct);
+        var page = Scripted.TryDequeue(out var scripted) ? scripted : await inner.GetDeltaAsync(link, ct);
         if (AfterDeltaRead is { } hold)
         {
             await hold();
@@ -362,19 +489,25 @@ sealed class StallingDriveApi(FakeDriveApi inner) : IDriveApi
 
     public async Task<DriveItemInfo?> GetItemAsync(string driveId, string path, CancellationToken ct)
     {
-        Online();
+        Interlocked.Increment(ref ItemCalls);
+        await OnlineAsync(ct);
+        if (HangItems)
+        {
+            await Hang(ct);
+        }
         return await inner.GetItemAsync(driveId, path, ct) is { } item ? Map(item) : null;
     }
 
     public async Task<DriveItemInfo?> GetItemByIdAsync(string driveId, string itemId, CancellationToken ct)
     {
-        Online();
+        Interlocked.Increment(ref ItemCalls);
+        await OnlineAsync(ct);
         return await inner.GetItemByIdAsync(driveId, itemId, ct) is { } item ? Map(item) : null;
     }
 
     public async Task<Stream> OpenReadAsync(string driveId, string itemId, string? contentTag, long offset, long length, CancellationToken ct)
     {
-        Online();
+        await OnlineAsync(ct);
         var stream = await inner.OpenReadAsync(driveId, itemId, Unmap(contentTag), offset, length, ct);
         return StallAfterBytes is null && SlowPiece is null ? stream : new StallingStream(stream, this);
     }

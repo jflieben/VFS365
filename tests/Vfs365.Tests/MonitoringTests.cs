@@ -267,6 +267,27 @@ public sealed class MonitoringTests : IDisposable
     }
 
     [Fact]
+    public void Statistics_are_written_when_counts_change_and_running_time_alone_now_and_then()
+    {
+        var statistics = UsageStatistics.Load(statisticsFile);
+        var idle = new ClientUsage(0, 0, 0, 0, 0, 0, 0, 0, 0);
+        var start = new DateTime(2026, 10, 6, 9, 0, 0);
+        statistics.Fold(idle, 0, start);
+
+        Assert.True(statistics.SaveIfChanged(start)); // a new day
+        statistics.Fold(idle, 0, start.AddMinutes(1));
+        Assert.False(statistics.SaveIfChanged(start.AddMinutes(1))); // a minute of running time only
+        statistics.Fold(new ClientUsage(1, 0, 1, 0, 0, 0, 0, 0, 0), 0, start.AddMinutes(2));
+        Assert.True(statistics.SaveIfChanged(start.AddMinutes(2)));
+        statistics.Fold(new ClientUsage(1, 0, 1, 0, 0, 0, 0, 0, 0), 1, start.AddMinutes(3));
+        Assert.True(statistics.SaveIfChanged(start.AddMinutes(3))); // an error
+        statistics.Fold(new ClientUsage(1, 0, 1, 0, 0, 0, 0, 0, 0), 1, start.AddMinutes(4));
+        Assert.False(statistics.SaveIfChanged(start.AddMinutes(4)));
+        Assert.True(statistics.SaveIfChanged(start.AddMinutes(3) + UsageStatistics.RunningTimeSaves));
+        Assert.Equal(1, UsageStatistics.Load(statisticsFile).Days["2026-10-06"].GraphRequests);
+    }
+
+    [Fact]
     public async Task A_day_that_was_not_sent_is_kept_for_the_next_try()
     {
         var statistics = UsageStatistics.Load(statisticsFile);
@@ -444,6 +465,100 @@ public sealed class MonitoringTests : IDisposable
         Assert.NotEqual(first, again); // a new row key: the add isn't taken for a re-send (409) and dropped
         Assert.Equal(16, first!.Length); // random: nobody can add the day's row first
     }
+
+    static DateTimeOffset Utc(int day, int hour, int minute) => new(2026, 10, day, hour, minute, 0, TimeSpan.Zero);
+
+    /// <summary>A fold on a device two hours ahead of UTC: its local 2026-10-06 starts at 2026-10-05 22:00 UTC.</summary>
+    static void FoldAt(UsageStatistics statistics, long resourceUnits, DateTimeOffset utc) =>
+        statistics.Fold(new ClientUsage(0, 0, resourceUnits, 0, 0, 0, 0, 0, 0), 0, utc.ToOffset(TimeSpan.FromHours(2)).DateTime, utcNow: utc);
+
+    [Fact]
+    public void Resource_units_go_to_utc_hours_across_midnight_utc()
+    {
+        var statistics = UsageStatistics.Load(statisticsFile);
+        FoldAt(statistics, 10, Utc(5, 22, 30)); // 00:30 local
+        FoldAt(statistics, 30, Utc(5, 23, 40));
+        FoldAt(statistics, 35, Utc(6, 0, 10)); // midnight UTC, the same local day
+        FoldAt(statistics, 42, Utc(6, 21, 50)); // 23:50 local
+        FoldAt(statistics, 45, Utc(6, 22, 20)); // the next local day
+
+        var day = statistics.Days["2026-10-06"];
+        Assert.Equal(Utc(5, 22, 0), day.ResourceUnitsFromHour);
+        Assert.Equal([10, 20, 5, .. new long[20], 7], day.ResourceUnitsByHour);
+        Assert.Equal(42, day.ResourceUnits);
+        var next = statistics.Days["2026-10-07"];
+        Assert.Equal(Utc(6, 22, 0), next.ResourceUnitsFromHour);
+        Assert.Equal([3], next.ResourceUnitsByHour);
+    }
+
+    [Fact]
+    public void The_hours_and_the_peak_minute_carry_on_after_a_restart_mid_day()
+    {
+        var statistics = UsageStatistics.Load(statisticsFile);
+        FoldAt(statistics, 5, Utc(6, 9, 0));
+        FoldAt(statistics, 45, Utc(6, 9, 1)); // 40 in a minute
+        FoldAt(statistics, 57, Utc(6, 9, 2));
+        FoldAt(statistics, 157, Utc(6, 9, 12)); // 100 in 10 minutes (asleep): 10 a minute
+        statistics.Save();
+
+        // A new agent: its client counts from 0 again
+        var restarted = UsageStatistics.Load(statisticsFile);
+        Assert.Equal((40, Utc(6, 9, 1)), (restarted.Days["2026-10-06"].PeakMinuteResourceUnits, restarted.Days["2026-10-06"].PeakMinuteAt));
+        FoldAt(restarted, 30, Utc(6, 10, 5)); // a start's first fold counts as one minute
+        FoldAt(restarted, 80, Utc(6, 10, 6)); // 50 in a minute
+        FoldAt(restarted, 81, Utc(6, 10, 7));
+        restarted.Save();
+
+        var day = UsageStatistics.Load(statisticsFile).Days["2026-10-06"];
+        Assert.Equal(157 + 81, day.ResourceUnits);
+        Assert.Equal(Utc(6, 9, 0), day.ResourceUnitsFromHour);
+        Assert.Equal([157, 81], day.ResourceUnitsByHour);
+        Assert.Equal((50, Utc(6, 10, 6)), (day.PeakMinuteResourceUnits, day.PeakMinuteAt));
+    }
+
+    [Fact]
+    public void A_clock_set_back_keeps_the_hours_in_order()
+    {
+        var statistics = UsageStatistics.Load(statisticsFile);
+        FoldAt(statistics, 4, Utc(6, 10, 0));
+        FoldAt(statistics, 6, Utc(6, 8, 30));
+
+        var day = statistics.Days["2026-10-06"];
+        Assert.Equal(Utc(6, 8, 0), day.ResourceUnitsFromHour);
+        Assert.Equal([2, 0, 4], day.ResourceUnitsByHour);
+    }
+
+    [Fact]
+    public async Task Statistics_rows_carry_the_hours_and_the_peak_minute_and_older_days_leave_them_out()
+    {
+        File.WriteAllText(statisticsFile, """{"2026-10-05":{"ResourceUnits":3}}""");
+        var statistics = UsageStatistics.Load(statisticsFile);
+        FoldAt(statistics, 10, Utc(5, 22, 30));
+        FoldAt(statistics, 30, Utc(5, 23, 40)); // 20 in 70 minutes
+        FoldAt(statistics, 55, Utc(5, 23, 41)); // 25 in a minute
+        var monitoring = Create();
+        await statistics.SendCompletedAsync(new DateTime(2026, 10, 7, 9, 0, 0), (day, usage) =>
+            monitoring.StatisticsAsync(day, UsageStatistics.Values(day, usage), usage.User, usage.Version, usage.DeviceOr(HostA), usage.Salt));
+
+        var rows = new Dictionary<string, Dictionary<string, string?>>();
+        foreach (var request in server.Requests)
+        {
+            using var body = JsonDocument.Parse(request.Body);
+            rows[body.RootElement.GetProperty("PartitionKey").GetString()!] =
+                body.RootElement.EnumerateObject().ToDictionary(p => p.Name, p => p.Value.ValueKind == JsonValueKind.String ? p.Value.GetString() : p.Value.GetRawText());
+        }
+        var row = rows["2026-10-06"];
+        Assert.Equal("10,45", row["ResourceUnitsByHour"]);
+        Assert.Equal(("2026-10-05T22:00:00.000Z", "Edm.DateTime"), (row["ResourceUnitsFromHour"], row["ResourceUnitsFromHour@odata.type"]));
+        Assert.Equal(("25", "Edm.Int64"), (row["PeakMinuteResourceUnits"], row["PeakMinuteResourceUnits@odata.type"]));
+        Assert.Equal(("2026-10-05T23:41:00.000Z", "Edm.DateTime"), (row["PeakMinuteAt"], row["PeakMinuteAt@odata.type"]));
+        Assert.Equal("55", row["ResourceUnits"]);
+        var older = rows["2026-10-05"];
+        Assert.Equal("3", older["ResourceUnits"]);
+        Assert.DoesNotContain(older.Keys, k => k.StartsWith("ResourceUnitsByHour", StringComparison.Ordinal) || k.StartsWith("ResourceUnitsFromHour", StringComparison.Ordinal)
+            || k.StartsWith("PeakMinute", StringComparison.Ordinal));
+    }
+
     public void Dispose()
     {
         server.Dispose();

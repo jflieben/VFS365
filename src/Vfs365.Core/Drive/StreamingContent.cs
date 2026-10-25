@@ -1,11 +1,13 @@
+using System.Buffers;
 using Microsoft.Win32.SafeHandles;
 
 namespace Vfs365.Core.Drive;
 
 /// <summary>
-/// One item version downloaded on demand into a sparse local file in 1 MiB blocks. A read waits only for its own blocks.
-/// A sequential reader is fed by one streaming request that stays a few blocks ahead; a read elsewhere opens its own ranged request,
-/// and when MaxStreams are open already, the one that waited longest for a reader makes room.
+/// One item version downloaded on demand into a sparse local file in 1 MiB blocks. Each 64 KiB chunk can be read as soon as it is
+/// written (encrypted: sealed), so a read waits only for its own chunks.
+/// A sequential reader is fed by one streaming request that stays ahead of it, 1 block at first and up to 8 while the reader follows;
+/// a read elsewhere opens its own ranged request, and when MaxStreams are open already, the one that waited longest for a reader makes room.
 /// Streams pause when nobody reads near them and stop after a while, so peeking at a big file doesn't download all of it.
 /// Every stream asks for the version the listing named, so one download never mixes two versions.
 /// A failed stream is tried again after 1 and 2 s; reads fail only when all attempts did (and again after a cool-down), or for good
@@ -15,18 +17,20 @@ namespace Vfs365.Core.Drive;
 internal sealed class StreamingContent : IContentSource
 {
     public const int BlockSize = 1 << 20;
+
+    /// <summary>The unit readers get as soon as it is written: the cipher's chunk, also read from a stream at a time.</summary>
+    const int ChunkSize = CacheCipher.ChunkSize;
+    const int ChunksPerBlock = BlockSize / ChunkSize;
     const int ReadAhead = 8;
     const int MaxStreams = 3;
     const int MaxFailures = 3;
-
-    /// <summary>Bytes read from a stream at a time, so progress shows within a block on a slow line.</summary>
-    const int Piece = 64 * 1024;
     static readonly TimeSpan RetryDelay = TimeSpan.FromSeconds(1);
     static readonly TimeSpan IdleStop = TimeSpan.FromSeconds(30);
     static readonly TimeSpan FailureCooldown = TimeSpan.FromSeconds(10);
 
     /// <summary>
-    /// One streaming request. Demand is the furthest block its readers asked for; it runs at most ReadAhead blocks past that.
+    /// One streaming request. Demand is the furthest block its readers asked for; it runs at most Window blocks past that, a window
+    /// that starts at 1 (a random read pulls little) and doubles up to ReadAhead each time a reader follows it.
     /// ActiveAt is when a reader last wanted more or a block arrived: its own idle time, which other streams don't extend.
     /// ProgressAt is when it started or last got bytes; Flowing once it got any.
     /// </summary>
@@ -41,6 +45,7 @@ internal sealed class StreamingContent : IContentSource
 
         public int Next { get; set; }
         public int Demand { get; set; }
+        public int Window { get; set; } = 1;
         public long ActiveAt { get; set; } = Now;
         public long ProgressAt { get; set; } = Now;
         public bool Flowing { get; set; }
@@ -54,7 +59,7 @@ internal sealed class StreamingContent : IContentSource
     }
 
     readonly IDriveApi api;
-    readonly string driveId, itemId, partialPath, finalPath;
+    readonly string driveId, itemId, partialPath;
     readonly string? contentTag;
     readonly Action<StreamingContent> completed;
     readonly Action<StreamingContent>? failed;
@@ -62,7 +67,11 @@ internal sealed class StreamingContent : IContentSource
     readonly TimeSpan noProgress;
     readonly CacheCipher.SealedFile? sealedFile;
     readonly SafeFileHandle file;
+    readonly bool inPlace;
+
+    /// <summary>Per chunk: written (and readable), or being written by a stream.</summary>
     readonly bool[] present, claimed;
+    readonly int blocks;
     readonly Lock gate = new();
     readonly List<Runner> runners = [];
     readonly CancellationTokenSource disposed = new();
@@ -73,27 +82,32 @@ internal sealed class StreamingContent : IContentSource
     int presentCount, failures;
     long failedAt;
     Exception? failure;
-    bool finished;
+    bool finished, held;
     volatile bool moved;
 
     /// <param name="contentTag">The version to download (the listing's cTag, else eTag); every stream is checked against it.</param>
     /// <param name="name">The cache file's name, which its encrypted chunks are bound to.</param>
     /// <param name="failed">Called when the download gave up, so new readers can start a fresh one.</param>
     /// <param name="noProgress">A stream without bytes for this long is a failed attempt; a read waiting this long without progress fails.</param>
+    /// <param name="inPlace">Downloads straight into <paramref name="finalPath"/> (plain, replacing what is there) instead of a partial file moved there when complete.</param>
     public StreamingContent(IDriveApi api, string driveId, string itemId, string? contentTag, long length, string finalPath, string name, CacheCipher? cipher,
-        Action<StreamingContent> completed, Action<StreamingContent>? failed = null, Action<DriveItemInfo>? contentChanged = null, TimeSpan? noProgress = null)
+        Action<StreamingContent> completed, Action<StreamingContent>? failed = null, Action<DriveItemInfo>? contentChanged = null, TimeSpan? noProgress = null,
+        bool inPlace = false)
     {
-        (this.api, this.driveId, this.itemId, this.contentTag, this.finalPath) = (api, driveId, itemId, contentTag, finalPath);
+        (this.api, this.driveId, this.itemId, this.contentTag, FinalPath, this.inPlace) = (api, driveId, itemId, contentTag, finalPath, inPlace);
         (this.completed, this.failed, this.contentChanged) = (completed, failed, contentChanged);
         this.noProgress = noProgress ?? TimeSpan.FromSeconds(90);
         Length = length;
-        partialPath = $"{finalPath}.{Guid.NewGuid():N}.part";
+        partialPath = inPlace ? finalPath : $"{finalPath}.{Guid.NewGuid():N}.part";
         Directory.CreateDirectory(Path.GetDirectoryName(finalPath)!);
-        file = File.OpenHandle(partialPath, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.ReadWrite | FileShare.Delete);
+        file = File.OpenHandle(partialPath, inPlace ? FileMode.Create : FileMode.CreateNew, FileAccess.ReadWrite, FileShare.ReadWrite | FileShare.Delete);
         try
         {
-            SparseFile.Mark(file);
-            if (cipher is null)
+            if (!inPlace)
+            {
+                SparseFile.Mark(file);
+            }
+            if (cipher is null || inPlace)
             {
                 RandomAccess.SetLength(file, length);
             }
@@ -108,22 +122,51 @@ internal sealed class StreamingContent : IContentSource
             File.Delete(partialPath);
             throw;
         }
-        present = new bool[(int)((length + BlockSize - 1) / BlockSize)];
+        present = new bool[(int)((length + ChunkSize - 1) / ChunkSize)];
         claimed = new bool[present.Length];
+        blocks = (int)((length + BlockSize - 1) / BlockSize);
     }
 
     public long Length { get; }
 
+    /// <summary>Where the complete file goes (or, in place, is written).</summary>
+    public string FinalPath { get; }
+
     /// <summary>When the download was asked for: cached versions that completed before then are older.</summary>
     public DateTime StartedAt { get; } = DateTime.UtcNow;
 
-    /// <summary>Opened by the content cache; it disposes this when the last reader is done.</summary>
+    /// <summary>Every chunk is here and the file went to its final path (or couldn't).</summary>
+    public bool IsComplete => done.Task.IsCompleted;
+
+    /// <summary>Opened by the content cache; it disposes this when the last reader is done (an incomplete download a little later).</summary>
     internal int References { get; set; }
 
-    /// <summary>Set by the content cache when the item was deleted meanwhile: the finished file isn't kept.</summary>
-    internal volatile bool Forgotten;
+    /// <summary>Counts the content cache's releases, so a delayed drop of a released download skips one that was opened again meanwhile.</summary>
+    internal int Releases { get; set; }
+
+    /// <summary>Set by the content cache when the finished file isn't kept (the item was deleted meanwhile, the cache was emptied).</summary>
+    internal volatile bool Discard;
 
     static long Now => Environment.TickCount64;
+
+    /// <summary>Its last reader closed: streams finish the block they are in and wait there (they stop when nobody comes back).</summary>
+    internal void Released()
+    {
+        lock (gate)
+        {
+            held = true;
+        }
+    }
+
+    /// <summary>Opened again after its last reader closed: streams go on, and failed attempts before don't count (a download that gave up isn't reopened).</summary>
+    internal void Reopened()
+    {
+        lock (gate)
+        {
+            (held, failures) = (false, 0);
+            Signal();
+        }
+    }
 
     public async ValueTask<int> ReadAsync(long offset, Memory<byte> buffer, CancellationToken ct)
     {
@@ -132,11 +175,11 @@ internal sealed class StreamingContent : IContentSource
             return 0;
         }
         var length = (int)Math.Min(buffer.Length, Length - offset);
-        await EnsureAsync((int)(offset / BlockSize), (int)((offset + length - 1) / BlockSize), ct);
+        await EnsureAsync((int)(offset / ChunkSize), (int)((offset + length - 1) / ChunkSize), ct);
         return sealedFile?.Read(offset, buffer.Span[..length]) ?? RandomAccess.Read(file, buffer.Span[..length], offset);
     }
 
-    /// <summary>Waits until every block is here and the file has moved to its final cache path.</summary>
+    /// <summary>Waits until every chunk is here and the file has moved to its final path.</summary>
     public async Task CompleteAsync(CancellationToken ct)
     {
         if (present.Length > 0)
@@ -150,12 +193,14 @@ internal sealed class StreamingContent : IContentSource
         await done.Task.WaitAsync(ct);
     }
 
+    /// <summary>Waits until chunks <paramref name="first"/> to <paramref name="last"/> are here.</summary>
     async Task EnsureAsync(int first, int last, CancellationToken ct)
     {
         if (!RequestPriority.IsBackground)
         {
             priority.Promote();
         }
+        var lastBlock = last / ChunksPerBlock;
         CancellationTokenSource? cancel = null;
         var waitingFor = -1;
         var deadline = 0L;
@@ -173,15 +218,14 @@ internal sealed class StreamingContent : IContentSource
                     var moreDemand = false;
                     foreach (var ahead in runners)
                     {
-                        if (ahead.Next > last && ahead.Next <= last + ReadAhead + 1 && last > ahead.Demand)
+                        if (ahead.Next > lastBlock && ahead.Next <= lastBlock + ahead.Window + 1 && lastBlock > ahead.Demand)
                         {
-                            ahead.Demand = last; // keeps the stream just ahead of this reader going
-                            ahead.ActiveAt = Now;
+                            Follow(ahead, lastBlock); // keeps the stream just ahead of this reader going
                             moreDemand = true;
                         }
                     }
-                    var missing = Array.IndexOf(present, false, first, last - first + 1);
-                    if (missing < 0)
+                    var missingChunk = Array.IndexOf(present, false, first, last - first + 1);
+                    if (missingChunk < 0)
                     {
                         if (moreDemand)
                         {
@@ -189,12 +233,14 @@ internal sealed class StreamingContent : IContentSource
                         }
                         return;
                     }
-                    if (missing != waitingFor)
+                    if (missingChunk != waitingFor)
                     {
-                        // Progress on this read's own blocks; other streams' progress doesn't count
-                        (waitingFor, deadline) = (missing, Now + timeout);
+                        // Progress on this read's own chunks; other streams' progress doesn't count
+                        (waitingFor, deadline) = (missingChunk, Now + timeout);
+                        first = missingChunk; // the chunks before it stay here: not looked at again
                     }
-                    var runner = runners.FirstOrDefault(r => r.Next <= missing && missing <= r.Next + ReadAhead);
+                    var missing = missingChunk / ChunksPerBlock;
+                    var runner = runners.FirstOrDefault(r => r.Next <= missing && missing <= r.Next + r.Window);
                     if (runner is null)
                     {
                         if (failures >= MaxFailures)
@@ -216,19 +262,18 @@ internal sealed class StreamingContent : IContentSource
                         }
                         if (runners.Count < MaxStreams)
                         {
-                            runner = new Runner(missing, last, disposed.Token);
+                            runner = new Runner(missing, lastBlock, disposed.Token);
                             runners.Add(runner);
                             var started = runner;
                             _ = Task.Run(() => RunAsync(started));
                         }
                     }
-                    else if (last > runner.Demand)
+                    else if (lastBlock > runner.Demand)
                     {
-                        runner.Demand = last;
-                        runner.ActiveAt = Now;
+                        Follow(runner, lastBlock);
                         moreDemand = true;
                     }
-                    // Bytes arriving on the stream this read waits for count as its progress too (a slow line takes long per block)
+                    // Bytes arriving on the stream this read waits for count as its progress too (a slow line takes long per chunk)
                     left = (runner is { Flowing: true } ? Math.Max(deadline, runner.ProgressAt + timeout) : deadline) - Now;
                     if (left <= 0 && runner is not null && Now - runner.ProgressAt >= timeout)
                     {
@@ -283,6 +328,14 @@ internal sealed class StreamingContent : IContentSource
         }
     }
 
+    /// <summary>A reader wants blocks up to <paramref name="block"/> from this stream: it follows it, so the stream may run further ahead. Called under the gate.</summary>
+    static void Follow(Runner runner, int block)
+    {
+        runner.Demand = block;
+        runner.Window = Math.Min(ReadAhead, runner.Window * 2);
+        runner.ActiveAt = Now;
+    }
+
     static void Cancel(Runner runner)
     {
         try
@@ -294,12 +347,21 @@ internal sealed class StreamingContent : IContentSource
         }
     }
 
+    /// <summary>Every chunk of the block is here. Called under the gate.</summary>
+    bool BlockPresent(int block)
+    {
+        var first = block * ChunksPerBlock;
+        return Array.IndexOf(present, false, first, Math.Min(ChunksPerBlock, present.Length - first)) < 0;
+    }
+
     async Task RunAsync(Runner runner)
     {
         RequestPriority.Use(priority); // Task.Run copied the context of whoever started this stream
         var token = runner.Stop.Token;
         var stall = runner.Stall;
         var claim = -1;
+        var buffer = ArrayPool<byte>.Shared.Rent((int)Math.Min(ChunkSize, Length));
+        Task<int>? reading = null;
         try
         {
             int retry;
@@ -318,14 +380,13 @@ internal sealed class StreamingContent : IContentSource
             // WaitAsync as well as the token: a call that ignores its token can't hold the stream
             stall.CancelAfter(noProgress);
             await using var stream = await api.OpenReadAsync(driveId, itemId, contentTag, (long)runner.Next * BlockSize, Length, stall.Token).WaitAsync(stall.Token);
-            var buffer = new byte[BlockSize];
             while (true)
             {
                 int block;
                 lock (gate)
                 {
                     block = runner.Next;
-                    if (block >= present.Length || present[block])
+                    if (block >= blocks || BlockPresent(block))
                     {
                         return;
                     }
@@ -336,69 +397,78 @@ internal sealed class StreamingContent : IContentSource
                     return;
                 }
 
-                var length = (int)Math.Min(BlockSize, Length - (long)block * BlockSize);
-                for (var got = 0; got < length;)
+                var end = Math.Min((block + 1) * ChunksPerBlock, present.Length);
+                for (var chunk = block * ChunksPerBlock; chunk < end; chunk++)
                 {
-                    stall.CancelAfter(noProgress);
-                    var read = await stream.ReadAsync(buffer.AsMemory(got, Math.Min(Piece, length - got)), stall.Token).AsTask().WaitAsync(stall.Token);
-                    if (read == 0)
+                    var length = (int)Math.Min(ChunkSize, Length - (long)chunk * ChunkSize);
+                    for (var got = 0; got < length;)
                     {
-                        throw new EndOfStreamException($"The download ended at {(long)block * BlockSize + got} of {Length} bytes");
+                        stall.CancelAfter(noProgress);
+                        reading = stream.ReadAsync(buffer.AsMemory(got, length - got), stall.Token).AsTask();
+                        var read = await reading.WaitAsync(stall.Token);
+                        if (read == 0)
+                        {
+                            throw new EndOfStreamException($"The download ended at {(long)chunk * ChunkSize + got} of {Length} bytes");
+                        }
+                        got += read;
+                        lock (gate)
+                        {
+                            (runner.ProgressAt, runner.Flowing) = (Now, true);
+                        }
                     }
-                    got += read;
+                    bool write;
                     lock (gate)
                     {
-                        (runner.ProgressAt, runner.Flowing) = (Now, true);
+                        // Another stream may be writing this chunk: a chunk is written once
+                        write = !present[chunk] && !claimed[chunk];
+                        if (write)
+                        {
+                            (claimed[chunk], claim) = (true, chunk);
+                        }
                     }
-                }
-                bool write;
-                lock (gate)
-                {
-                    // Another stream may be writing this block: a block is written once
-                    write = !present[block] && !claimed[block];
                     if (write)
                     {
-                        (claimed[block], claim) = (true, block);
+                        if (sealedFile is not null)
+                        {
+                            sealedFile.Write((long)chunk * ChunkSize, buffer.AsSpan(0, length));
+                        }
+                        else
+                        {
+                            RandomAccess.Write(file, buffer.AsSpan(0, length), (long)chunk * ChunkSize);
+                        }
                     }
-                }
-                if (write)
-                {
-                    if (sealedFile is not null)
-                    {
-                        sealedFile.Write((long)block * BlockSize, buffer.AsSpan(0, length));
-                    }
-                    else
-                    {
-                        RandomAccess.Write(file, buffer.AsSpan(0, length), (long)block * BlockSize);
-                    }
-                }
-                bool complete;
-                lock (gate)
-                {
-                    if (write)
-                    {
-                        (claimed[block], claim) = (false, -1);
-                        present[block] = true;
-                        presentCount++;
-                    }
-                    runner.Next = block + 1;
-                    runner.ActiveAt = Now;
-                    failures = 0;
-                    complete = presentCount == present.Length;
-                    if (!complete)
-                    {
-                        Signal();
-                    }
-                }
-                if (complete)
-                {
-                    // Into the cache before readers wake, so a reader closing at once can't discard the finished download
-                    Finish();
+                    bool complete;
                     lock (gate)
                     {
-                        Signal();
+                        if (write)
+                        {
+                            // Readable only now: written, and sealed when encrypted
+                            (claimed[chunk], claim) = (false, -1);
+                            present[chunk] = true;
+                            presentCount++;
+                        }
+                        if (chunk == end - 1)
+                        {
+                            runner.Next = block + 1;
+                            runner.ActiveAt = Now;
+                            failures = 0;
+                        }
+                        complete = presentCount == present.Length;
+                        if (!complete && (write || chunk == end - 1))
+                        {
+                            Signal();
+                        }
                     }
-                    return;
+                    if (complete)
+                    {
+                        // Into the cache before readers wake, so a reader closing at once can't discard the finished download
+                        Finish();
+                        lock (gate)
+                        {
+                            Signal();
+                        }
+                        return;
+                    }
                 }
             }
         }
@@ -450,6 +520,10 @@ internal sealed class StreamingContent : IContentSource
             }
             runner.Stall.Dispose();
             runner.Stop.Dispose();
+            if (reading is not { IsCompleted: false })
+            {
+                ArrayPool<byte>.Shared.Return(buffer); // not while a read the stream never finished may still write into it
+            }
             if (complete)
             {
                 Finish();
@@ -458,8 +532,8 @@ internal sealed class StreamingContent : IContentSource
     }
 
     /// <summary>
-    /// Holds a stream back while it is more than ReadAhead blocks ahead of the readers. False when nobody came for IdleStop since the
-    /// stream was last active, or when it was stopped to make room for another.
+    /// Holds a stream back while it is more than its window ahead of the readers, or nobody holds the download. False when nobody came
+    /// for IdleStop since the stream was last active, or when it was stopped to make room for another.
     /// </summary>
     async Task<bool> WaitForDemandAsync(Runner runner, int block)
     {
@@ -469,7 +543,7 @@ internal sealed class StreamingContent : IContentSource
             long left;
             lock (gate)
             {
-                if (block <= runner.Demand + ReadAhead)
+                if (!held && block <= runner.Demand + runner.Window)
                 {
                     runner.Parked = false;
                     return true;
@@ -496,8 +570,8 @@ internal sealed class StreamingContent : IContentSource
         }
     }
 
-    /// <summary>Moves the complete file into the cache. Readers waiting for it are released whatever happens.</summary>
-    void Finish()
+    /// <summary>Moves the complete file to its final path (nothing to move in place). Readers waiting for it are released whatever happens.</summary>
+    internal void Finish()
     {
         lock (gate)
         {
@@ -511,7 +585,10 @@ internal sealed class StreamingContent : IContentSource
         {
             try
             {
-                File.Move(partialPath, finalPath, overwrite: false);
+                if (!inPlace)
+                {
+                    File.Move(partialPath, FinalPath, overwrite: false);
+                }
                 moved = true;
             }
             catch (Exception e) when (e is IOException or UnauthorizedAccessException)

@@ -44,4 +44,17 @@ public sealed class AgentControlTests
         Assert.True(stop.WaitOne(0));
         Assert.False(AgentControl.SetIfOwnedBy($@"Local\VFS365.Test.{Guid.NewGuid():N}", owner));
     }
+
+    [Fact]
+    public void The_stop_event_is_owned_by_the_user_also_in_an_elevated_agent()
+    {
+        // The agent's security on a test name: an elevated token would make Administrators the owner, which machine-stop refuses
+        var name = $@"Local\VFS365.Test.{Guid.NewGuid():N}";
+        using var stop = EventWaitHandleAcl.Create(false, EventResetMode.ManualReset, name, out var createdNew, AgentControl.StopEventSecurity());
+        var user = WindowsIdentity.GetCurrent().User!;
+
+        Assert.True(createdNew);
+        Assert.Equal(user, stop.GetAccessControl().GetOwner(typeof(SecurityIdentifier)));
+        Assert.True(AgentControl.SetIfOwnedBy(name, user));
+    }
 }

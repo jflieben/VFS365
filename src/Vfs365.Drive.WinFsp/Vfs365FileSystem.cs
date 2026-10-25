@@ -14,11 +14,14 @@ namespace Vfs365.Drive.WinFsp;
 /// <summary>
 /// WinFsp callbacks over the engine. Content lives in local files (downloaded or staged); the engine decides what reaches SharePoint.
 /// A handle keeps the entry it was given and follows it (<see cref="DriveEngine.Follow"/>), so it reads and writes the content it saw.
+/// Reads, writes and directory reads that have to wait answer later (STATUS_PENDING), so a slow download holds no dispatcher thread.
+/// With <paramref name="winFspGuard"/> false, WinFsp's namespace lock is replaced by none (<see cref="WinFspNative.ReplaceOperationGuard"/>).
 /// </summary>
-sealed class Vfs365FileSystem(DriveEngine engine, string label, Action<string>? log, Action<string>? trace = null) : FileSystemBase
+sealed class Vfs365FileSystem(DriveEngine engine, string label, Action<string>? log, Action<string>? trace = null, bool winFspGuard = false) : FileSystemBase
 {
     const uint AttributeReadOnly = 0x1, AttributeDirectory = 0x10, AttributeNormal = 0x80;
     const int AllocationUnit = 4096;
+    const uint FileSupersede = 0, FileOpenIf = 3, FileOverwriteIf = 5;
 
     sealed class Handle(FsEntry entry)
     {
@@ -31,11 +34,64 @@ sealed class Vfs365FileSystem(DriveEngine engine, string label, Action<string>? 
         /// <summary>The staging file or item version Source reads.</summary>
         public string? SourceVersion { get; set; }
 
-        /// <summary>Sources replaced by another version while a read may still use them; disposed with the handle.</summary>
+        /// <summary>Sources replaced by another version while a read may still use them; disposed when no read is running.</summary>
         public List<IContentSource> Retired { get; } = [];
+
+        /// <summary>Reads running on this handle (under Gate).</summary>
+        public int Reading { get; set; }
         public bool Wrote { get; set; }
         public Lock Gate { get; } = new();
+
+        /// <summary>For the handle that created its file: its access and sharing, which opens of the file are checked against.</summary>
+        public Sharing? Created { get; init; }
     }
+
+    /// <summary>
+    /// The access and sharing of a handle that created a file, until its cleanup or close. WinFsp checks sharing only once the create
+    /// is answered, and without the namespace lock another open can find the file before that: it then gets in first, or even ends
+    /// before the creator's check, which then passes on content the creator thinks is new and empty. So opens of a file whose creator
+    /// still holds it are checked here, with NTFS's rules (IoCheckShareAccess), as WinFsp would have if the creator had been first.
+    /// </summary>
+    sealed class Sharing(uint access, uint share)
+    {
+        const uint ReadData = 0x1, WriteData = 0x2, AppendData = 0x4, Execute = 0x20, Delete = 0x10000;
+        const uint ShareRead = 0x1, ShareWrite = 0x2, ShareDelete = 0x4;
+
+        volatile bool holding = true;
+
+        public void Release() => holding = false;
+
+        /// <summary>True when an open with this access and sharing must be refused while the creator holds the file.</summary>
+        public bool Refuses(uint openAccess, uint openShare)
+        {
+            if (!holding || !UsesData(access) || !UsesData(openAccess))
+            {
+                return false;
+            }
+            return Conflicts(openAccess, share) || Conflicts(access, openShare);
+        }
+
+        static bool UsesData(uint access) => (access & (ReadData | WriteData | AppendData | Execute | Delete)) != 0;
+
+        /// <summary>The access asks for something the other side doesn't share.</summary>
+        static bool Conflicts(uint access, uint shared) =>
+            (access & (ReadData | Execute)) != 0 && (shared & ShareRead) == 0
+            || (access & (WriteData | AppendData)) != 0 && (shared & ShareWrite) == 0
+            || (access & Delete) != 0 && (shared & ShareDelete) == 0;
+    }
+
+    /// <summary>An open of <paramref name="entry"/> its creator's sharing refuses (see <see cref="Sharing"/>).</summary>
+    static bool RefusedByCreator(FsEntry entry, uint grantedAccess) =>
+        entry.Creator is Sharing creator && Requester.ShareAccess() is { } share && creator.Refuses(grantedAccess, share);
+
+    FileSystemHost? host;
+
+    /// <summary>Pending operations answer only while the volume is mounted: after Unmounted the native file system is freed.</summary>
+    readonly ReaderWriterLockSlim answering = new();
+    bool unmounted;
+
+    /// <summary>True when WinFsp's namespace lock was replaced at the mount.</summary>
+    public bool GuardReplaced { get; private set; }
 
     /// <summary>Sorts "." and ".." first, then names case-insensitively. Listings and markers must agree on this order.</summary>
     static readonly Comparer<string> NameOrder = Comparer<string>.Create((a, b) =>
@@ -50,7 +106,7 @@ sealed class Vfs365FileSystem(DriveEngine engine, string label, Action<string>? 
 
     public override int Init(object host0)
     {
-        var host = (FileSystemHost)host0;
+        var host = this.host = (FileSystemHost)host0;
         host.SectorSize = AllocationUnit;
         host.SectorsPerAllocationUnit = 1;
         host.MaxComponentLength = 255;
@@ -59,11 +115,63 @@ sealed class Vfs365FileSystem(DriveEngine engine, string label, Action<string>? 
         host.CasePreservedNames = true;
         host.UnicodeOnDisk = true;
         host.PersistentAcls = false;
-        host.PostCleanupWhenModifiedOnly = true;
+        // Every close: WinFsp counts a new file closed without writes (Explorer's New > Text Document, a download's placeholder) as
+        // unmodified, and without its Cleanup the file would upload only at unmount
+        host.PostCleanupWhenModifiedOnly = false;
+        host.PassQueryDirectoryFileName = true; // a search for one exact name is a lookup (GetDirInfoByName), not a scan
         host.FileSystemName = "VFS365";
         host.VolumeCreationTime = (ulong)DateTime.UtcNow.ToFileTimeUtc();
         host.VolumeSerialNumber = 0x365365;
         return STATUS_SUCCESS;
+    }
+
+    /// <summary>After the mount point is set, before WinFsp's dispatcher starts: the moment to change the operation guard.</summary>
+    public override int Mounted(object host0)
+    {
+        if (!winFspGuard)
+        {
+            var kept = WinFspNative.ReplaceOperationGuard((FileSystemHost)host0);
+            GuardReplaced = kept is null;
+            if (kept is not null)
+            {
+                log?.Invoke($"WinFsp's namespace lock stays on: {kept}");
+            }
+        }
+        return STATUS_SUCCESS;
+    }
+
+    /// <summary>After WinFsp's dispatcher stopped (pending requests are cancelled then), before the native file system is freed.</summary>
+    public override void Unmounted(object host0)
+    {
+        answering.EnterWriteLock();
+        unmounted = true;
+        answering.ExitWriteLock();
+    }
+
+    /// <summary>
+    /// Answers a pending operation (<see cref="FileSystemHost.GetOperationRequestHint"/>), WinFsp's buffer included, unless the volume
+    /// is gone. WinFsp drops an answer whose request was cancelled meanwhile (the caller killed, the request timed out), but it unmaps
+    /// that request's buffer at once, and nothing tells user mode: a late copy into it can fault. A callback that blocks has the same
+    /// exposure; WinFsp offers no way to check a request is still alive.
+    /// </summary>
+    void Answer(Action<FileSystemHost> send)
+    {
+        answering.EnterReadLock();
+        try
+        {
+            if (!unmounted)
+            {
+                send(host!);
+            }
+        }
+        catch (Exception e)
+        {
+            log?.Invoke($"error: answering a pending request: {e.GetType().Name}: {e.Message}");
+        }
+        finally
+        {
+            answering.ExitReadLock();
+        }
     }
 
     public override int GetVolumeInfo(out VolumeInfo volumeInfo)
@@ -117,12 +225,41 @@ sealed class Vfs365FileSystem(DriveEngine engine, string label, Action<string>? 
             return STATUS_ACCESS_DENIED;
         }
         var isDirectory = (createOptions & FILE_DIRECTORY_FILE) != 0;
-        trace?.Invoke($"create {fileName} dir={isDirectory} allocation={allocationSize}");
-        var handle = new Handle(Run(engine.CreateAsync(fileName, isDirectory, default))) { Wrote = !isDirectory };
-        if (handle.Entry.StagingPath is { } staging)
+        trace?.Invoke($"create {fileName} dir={isDirectory} allocation={allocationSize} access=0x{grantedAccess:X} share=0x{Requester.ShareAccess():X}");
+        Handle handle;
+        try
         {
-            handle.Content = OpenStaging(staging);
-            handle.ContentPath = staging;
+            var sharing = !isDirectory && Requester.ShareAccess() is { } share ? new Sharing(grantedAccess, share) : null;
+            handle = new Handle(Run(engine.CreateAsync(fileName, isDirectory, default, sharing))) { Wrote = !isDirectory, Created = sharing };
+            if (handle.Entry.StagingPath is { } staging)
+            {
+                try
+                {
+                    handle.Content = OpenStaging(staging);
+                    handle.ContentPath = staging;
+                }
+                catch (FileNotFoundException)
+                {
+                    // Deleted or replaced through another handle already (no namespace lock): writes follow it (STATUS_FILE_INVALID)
+                    trace?.Invoke($"create {fileName}: gone meanwhile");
+                }
+            }
+        }
+        catch (FsException e) when (e.Error == FsError.NameCollision && (createOptions >> 24) is FileOpenIf or FileOverwriteIf or FileSupersede
+            && Run(engine.GetEntryAsync(fileName, default)) is { Blocked: false } existing && existing.IsDirectory == isDirectory)
+        {
+            // Created by another open-or-create since WinFsp found it missing (no namespace lock serializes them): opened, and WinFsp's
+            // share check decides. An overwrite can't truncate here, before that check: one of an empty file changes nothing, one of
+            // a file its creator is writing (most likely still open) is refused as NTFS would then, as is one its creator's sharing refuses.
+            if ((createOptions >> 24) != FileOpenIf && existing.Size > 0 || RefusedByCreator(existing, grantedAccess))
+            {
+                trace?.Invoke($"create {fileName}: created meanwhile, refused");
+                fileDesc = null;
+                fileInfo = default;
+                return STATUS_SHARING_VIOLATION;
+            }
+            trace?.Invoke($"create {fileName}: created meanwhile, opened");
+            handle = new Handle(existing);
         }
         fileDesc = handle;
         fileInfo = Info(handle);
@@ -141,12 +278,24 @@ sealed class Vfs365FileSystem(DriveEngine engine, string label, Action<string>? 
             return STATUS_ACCESS_DENIED;
         }
         var entry = Run(engine.GetEntryAsync(fileName, default));
+        if (entry is { StagingPath: { } staging } && !File.Exists(staging))
+        {
+            // Staged content deleted or replaced while it was looked up (no namespace lock orders deletes and opens): what is there now
+            entry = Run(engine.GetEntryAsync(fileName, default));
+        }
         if (entry is null || entry.Blocked)
         {
             trace?.Invoke($"open {fileName}: {(entry is null ? "not found" : "blocked")}");
             fileDesc = null;
             fileInfo = default;
             return entry is null ? STATUS_OBJECT_NAME_NOT_FOUND : STATUS_ACCESS_DENIED;
+        }
+        if (RefusedByCreator(entry, grantedAccess))
+        {
+            trace?.Invoke($"open {fileName}: refused by its creator's sharing");
+            fileDesc = null;
+            fileInfo = default;
+            return STATUS_SHARING_VIOLATION;
         }
         trace?.Invoke($"open {fileName}");
         var handle = new Handle(entry);
@@ -172,6 +321,7 @@ sealed class Vfs365FileSystem(DriveEngine engine, string label, Action<string>? 
     public override void Cleanup(object fileNode, object fileDesc, string fileName, uint flags)
     {
         var handle = (Handle)fileDesc;
+        handle.Created?.Release();
         var path = fileName ?? handle.Entry.Path;
         trace?.Invoke($"cleanup {path} flags=0x{flags:X} wrote={handle.Wrote}");
         try
@@ -182,8 +332,7 @@ sealed class Vfs365FileSystem(DriveEngine engine, string label, Action<string>? 
             }
             else if (handle.Wrote)
             {
-                path = (handle.Entry = engine.Follow(handle.Entry)).Path;
-                Run(engine.CommitAsync(path, default));
+                Run(engine.CommitAsync(handle.Entry, default)); // only the content this handle wrote
             }
         }
         catch (FsException e) when (e.Error == FsError.Invalid)
@@ -199,6 +348,7 @@ sealed class Vfs365FileSystem(DriveEngine engine, string label, Action<string>? 
     public override void Close(object fileNode, object fileDesc)
     {
         var handle = (Handle)fileDesc;
+        handle.Created?.Release(); // a create WinFsp refused after all (sharing) gets no cleanup
         handle.Content?.Dispose();
         handle.Source?.Dispose();
         foreach (var retired in handle.Retired)
@@ -214,71 +364,195 @@ sealed class Vfs365FileSystem(DriveEngine engine, string label, Action<string>? 
         return STATUS_SUCCESS;
     }
 
-    public override unsafe int Read(object fileNode, object fileDesc, IntPtr buffer, ulong offset, uint length, out uint bytesTransferred)
+    /// <summary>
+    /// Answers at once when the bytes are here (cached, staged, already downloaded); otherwise when they arrive. WinFsp's buffer is
+    /// written only while the request is surely alive: in this callback, or in <see cref="Answer"/> right before the answer (WinFsp
+    /// unmaps it when the request is cancelled, and at the unmount).
+    /// </summary>
+    public override int Read(object fileNode, object fileDesc, IntPtr buffer, ulong offset, uint length, out uint bytesTransferred)
     {
         var handle = (Handle)fileDesc;
         trace?.Invoke($"read {handle.Entry.Path} offset={offset} length={length}");
-        bytesTransferred = 0;
-        var source = Readable(handle);
-        if ((long)offset >= source.Length)
-        {
-            return STATUS_END_OF_FILE;
-        }
         var bytes = ArrayPool<byte>.Shared.Rent((int)length);
+        var reading = ReadAsync(handle, (long)offset, bytes.AsMemory(0, (int)length));
+        if (reading.IsCompleted)
+        {
+            int status;
+            (status, bytesTransferred) = reading.Result;
+            Marshal.Copy(bytes, 0, buffer, (int)bytesTransferred);
+            ArrayPool<byte>.Shared.Return(bytes);
+            return status;
+        }
+        trace?.Invoke($"read {handle.Entry.Path}: pending");
+        var hint = host!.GetOperationRequestHint();
+        _ = AnswerReadAsync(reading, bytes, buffer, hint);
+        bytesTransferred = 0;
+        return STATUS_PENDING;
+    }
+
+    async Task AnswerReadAsync(ValueTask<(int Status, uint Bytes)> reading, byte[] bytes, IntPtr buffer, ulong hint)
+    {
+        var (status, read) = await reading;
+        Answer(host =>
+        {
+            Marshal.Copy(bytes, 0, buffer, (int)read);
+            host.SendReadResponse(hint, status, read);
+        });
+        ArrayPool<byte>.Shared.Return(bytes);
+    }
+
+    /// <summary>Reads into <paramref name="bytes"/>. An empty file needs no content. Errors become the status to answer with.</summary>
+    async ValueTask<(int Status, uint Bytes)> ReadAsync(Handle handle, long offset, Memory<byte> bytes)
+    {
+        IContentSource? source = null;
         try
         {
-            var read = Run(source.ReadAsync((long)offset, bytes.AsMemory(0, (int)length), default).AsTask());
-            bytes.AsSpan(0, read).CopyTo(new Span<byte>((void*)buffer, read));
-            bytesTransferred = (uint)read;
+            source = await ReadableAsync(handle);
+            if (source is null || offset >= source.Length)
+            {
+                return (STATUS_END_OF_FILE, 0);
+            }
+            return (STATUS_SUCCESS, (uint)await source.ReadAsync(offset, bytes, default));
         }
-        catch (Exception e) when (e is not FsException)
+        catch (Exception e)
         {
-            if (e is not ContentChangedException) // the engine logged it, with the sizes
+            if (e is not (FsException or ContentChangedException)) // ContentChangedException: the engine logged it, with the sizes
             {
                 log?.Invoke($"error: reading {handle.Entry.Path}: {e.GetType().Name}: {e.Message}");
             }
-            return Status(e);
+            return (Status(e), 0);
         }
         finally
         {
-            ArrayPool<byte>.Shared.Return(bytes);
+            if (source is not null)
+            {
+                DoneReading(handle);
+            }
         }
-        return STATUS_SUCCESS;
     }
 
+    /// <summary>
+    /// Copies to the staging file at once; answers when the engine took the write in, which waits while a streaming upload's
+    /// previous fragment is in flight (and, for a handle's first write, while the file stages: then the bytes are copied out of
+    /// WinFsp's buffer first, which may be gone by the time staging ends).
+    /// </summary>
     public override unsafe int Write(object fileNode, object fileDesc, IntPtr buffer, ulong offset, uint length, bool writeToEndOfFile, bool constrainedIo,
         out uint bytesTransferred, out FileInfo fileInfo)
     {
         var handle = (Handle)fileDesc;
         trace?.Invoke($"write {handle.Entry.Path} offset={offset} length={length} eof={writeToEndOfFile} constrained={constrainedIo}");
-        var (content, entry, lease) = BeginWrite(handle);
-        long position;
+        ValueTask<(int Status, uint Bytes)> writing;
+        try
+        {
+            writing = TryWrite(handle, new ReadOnlySpan<byte>((void*)buffer, (int)length), (long)offset, toEnd: writeToEndOfFile, constrainedIo) is { } done
+                ? WrittenAsync(handle, done, constrainedIo)
+                : WriteAsync(handle, new ReadOnlySpan<byte>((void*)buffer, (int)length).ToArray(), (long)offset, writeToEndOfFile, constrainedIo);
+        }
+        catch (Exception e)
+        {
+            writing = ValueTask.FromResult(Failed(handle, e));
+        }
+        if (writing.IsCompleted)
+        {
+            (var status, bytesTransferred) = writing.Result;
+            fileInfo = status == STATUS_SUCCESS ? Info(handle) : default;
+            return status;
+        }
+        trace?.Invoke($"write {handle.Entry.Path}: pending");
+        var hint = host!.GetOperationRequestHint();
+        _ = AnswerWriteAsync(writing, hint, handle);
+        bytesTransferred = 0;
+        fileInfo = default;
+        return STATUS_PENDING;
+    }
+
+    async Task AnswerWriteAsync(ValueTask<(int Status, uint Bytes)> writing, ulong hint, Handle handle)
+    {
+        var (status, bytes) = await writing;
+        var info = status == STATUS_SUCCESS ? Info(handle) : default;
+        Answer(host => host.SendWriteResponse(hint, status, bytes, ref info));
+    }
+
+    /// <summary>A write that has to stage first, with its bytes copied out of WinFsp's buffer.</summary>
+    async ValueTask<(int Status, uint Bytes)> WriteAsync(Handle handle, byte[] data, long offset, bool toEnd, bool constrained)
+    {
+        try
+        {
+            while (true)
+            {
+                await StageAsync(handle, truncate: false);
+                if (TryWrite(handle, data, offset, toEnd, constrained) is { } done)
+                {
+                    return await WrittenAsync(handle, done, constrained);
+                }
+            }
+        }
+        catch (Exception e)
+        {
+            return Failed(handle, e);
+        }
+    }
+
+    /// <summary>After the bytes are in the staging file: tells the engine, which may wait for a streaming upload's fragment.</summary>
+    async ValueTask<(int Status, uint Bytes)> WrittenAsync(Handle handle, (FsEntry Entry, long Position, uint Length) done, bool constrained)
+    {
+        try
+        {
+            var (entry, position, written) = done;
+            if (written == 0)
+            {
+                return (STATUS_SUCCESS, 0);
+            }
+            if (constrained)
+            {
+                // Paging I/O: no cleanup may follow
+                engine.CommitLater(entry);
+            }
+            await engine.WrittenAsync(entry, position, written, default);
+            return (STATUS_SUCCESS, written);
+        }
+        catch (Exception e)
+        {
+            return Failed(handle, e);
+        }
+    }
+
+    (int Status, uint Bytes) Failed(Handle handle, Exception e)
+    {
+        if (e is not FsException)
+        {
+            log?.Invoke($"error: writing {handle.Entry.Path}: {e.GetType().Name}: {e.Message}");
+        }
+        return (Status(e), 0);
+    }
+
+    /// <summary>
+    /// Writes into the handle's staging file with the engine's write lease held (taken and let go on this thread); null when the
+    /// handle has to stage first. Constrained (paging) I/O never extends the file.
+    /// </summary>
+    (FsEntry Entry, long Position, uint Length)? TryWrite(Handle handle, ReadOnlySpan<byte> data, long offset, bool toEnd, bool constrained)
+    {
+        if (Writable(handle) is not { } writable)
+        {
+            return null;
+        }
+        var (content, entry, lease) = writable;
         using (lease)
         {
             var size = RandomAccess.GetLength(content);
-            if (constrainedIo)
+            if (constrained)
             {
-                if ((long)offset >= size)
+                if (offset >= size)
                 {
-                    bytesTransferred = 0;
-                    fileInfo = Info(handle);
-                    return STATUS_SUCCESS;
+                    return (entry, offset, 0);
                 }
-                length = (uint)Math.Min(length, size - (long)offset);
+                data = data[..(int)Math.Min(data.Length, size - offset)];
             }
-            position = writeToEndOfFile ? size : (long)offset;
-            RandomAccess.Write(content, new ReadOnlySpan<byte>((void*)buffer, (int)length), position);
+            var position = toEnd ? size : offset;
+            RandomAccess.Write(content, data, position);
             engine.MarkDirty(entry);
+            return (entry, position, (uint)data.Length);
         }
-        if (constrainedIo)
-        {
-            // Paging I/O: no cleanup may follow
-            engine.CommitLater(entry);
-        }
-        Run(engine.WrittenAsync(entry, position, length, default));
-        bytesTransferred = length;
-        fileInfo = Info(handle);
-        return STATUS_SUCCESS;
     }
 
     public override int SetFileSize(object fileNode, object fileDesc, ulong newSize, bool setAllocationSize, out FileInfo fileInfo)
@@ -353,14 +627,23 @@ sealed class Vfs365FileSystem(DriveEngine engine, string label, Action<string>? 
     public override int Rename(object fileNode, object fileDesc, string fileName, string newFileName, bool replaceIfExists)
     {
         var handle = (Handle)fileDesc;
-        Run(engine.RenameAsync(fileName, newFileName, replaceIfExists, default));
+        trace?.Invoke($"rename {fileName} to {newFileName} replace={replaceIfExists}");
+        try
+        {
+            Run(engine.RenameAsync(fileName, newFileName, replaceIfExists, default));
+        }
+        catch (Exception e) when (e is not FsException)
+        {
+            log?.Invoke($"error: renaming {fileName} to {newFileName}: {e.GetType().Name}: {e.Message}");
+            return Status(e);
+        }
         handle.Entry = Run(engine.GetEntryAsync(newFileName, default)) ?? handle.Entry;
         return STATUS_SUCCESS;
     }
 
     /// <summary>
-    /// Answers with the entries that are here, waiting only when there are none yet, and marks the end only when the listing is
-    /// complete. WinFsp passes a partial answer on to the caller and asks again after its last name, so a folder still loading page
+    /// Answers with the entries that are here, waiting (pending) only when there are none yet, and marks the end only when the listing
+    /// is complete. WinFsp passes a partial answer on to the caller and asks again after its last name, so a folder still loading page
     /// by page shows its first page at once.
     /// </summary>
     public override int ReadDirectory(object fileNode, object fileDesc, string pattern, string marker, IntPtr buffer, uint length, out uint bytesTransferred)
@@ -377,29 +660,69 @@ sealed class Vfs365FileSystem(DriveEngine engine, string label, Action<string>? 
             }
             reader = handle.Reader ??= new DirectoryReader(engine.ListStreamAsync(handle.Entry, default).GetAsyncEnumerator(), handle.Entry, handle.Entry.Path != "\\");
         }
-
-        uint transferred = 0;
-        var start = reader.After(marker);
-        for (var index = start; ; index++)
+        if (reader.TryAnswer(marker, buffer, length, out bytesTransferred))
         {
-            var (found, ended) = index == start ? reader.Wait(index) : reader.Peek(index);
-            if (found is var (name, entry))
-            {
-                var info = entry is null ? new FileInfo { FileAttributes = AttributeDirectory } : Info(entry, entry.Size);
-                if (!WinFspNative.AddEntry(name, info, buffer, length, ref transferred))
-                {
-                    break;
-                }
-                continue;
-            }
-            if (ended)
-            {
-                WinFspNative.AddEnd(buffer, length, ref transferred);
-            }
-            break;
+            trace?.Invoke($"readdir {handle.Entry.Path} marker={marker ?? "-"} bytes={bytesTransferred}");
+            return STATUS_SUCCESS;
         }
-        bytesTransferred = transferred;
-        trace?.Invoke($"readdir {handle.Entry.Path} marker={marker ?? "-"} start={start} bytes={transferred}");
+        trace?.Invoke($"readdir {handle.Entry.Path} marker={marker ?? "-"}: pending");
+        var hint = host!.GetOperationRequestHint();
+        _ = AnswerReadDirectoryAsync(reader, marker, buffer, length, hint, handle.Entry.Path);
+        return STATUS_PENDING;
+    }
+
+    /// <summary>Fills a buffer of its own while it waits; WinFsp's is written only right before the answer (see <see cref="Read"/>).</summary>
+    async Task AnswerReadDirectoryAsync(DirectoryReader reader, string? marker, IntPtr buffer, uint length, ulong hint, string path)
+    {
+        var (status, transferred) = (STATUS_SUCCESS, 0u);
+        var own = GC.AllocateUninitializedArray<byte>((int)length, pinned: true);
+        try
+        {
+            while (!reader.TryAnswer(marker, Marshal.UnsafeAddrOfPinnedArrayElement(own, 0), length, out transferred))
+            {
+                await reader.MoreAsync();
+            }
+        }
+        catch (Exception e)
+        {
+            if (e is not FsException)
+            {
+                log?.Invoke($"error: listing {path}: {e.GetType().Name}: {e.Message}");
+            }
+            (status, transferred) = (Status(e), 0);
+        }
+        Answer(host =>
+        {
+            Marshal.Copy(own, 0, buffer, (int)transferred);
+            host.SendReadDirectoryResponse(hint, status, transferred);
+        });
+    }
+
+    /// <summary>One name in a directory, for a search on that exact name (FindFirstFile on a path without wildcards): a lookup.</summary>
+    public override int GetDirInfoByName(object fileNode, object fileDesc, string fileName, out string? normalizedName, out FileInfo fileInfo)
+    {
+        var directory = ((Handle)fileDesc).Entry;
+        normalizedName = null;
+        fileInfo = default;
+        if (fileName is "." or "..")
+        {
+            // As listed: not in the root
+            if (directory.Path == "\\")
+            {
+                return STATUS_OBJECT_NAME_NOT_FOUND;
+            }
+            normalizedName = fileName;
+            fileInfo = fileName == "." ? Info(directory, directory.Size) : new FileInfo { FileAttributes = AttributeDirectory };
+            return STATUS_SUCCESS;
+        }
+        var entry = Run(engine.GetEntryAsync(directory.Path == "\\" ? $"\\{fileName}" : $"{directory.Path}\\{fileName}", default));
+        trace?.Invoke($"dirinfo {directory.Path} {fileName}: {(entry is null ? "not found" : "found")}");
+        if (entry is null)
+        {
+            return STATUS_OBJECT_NAME_NOT_FOUND;
+        }
+        normalizedName = entry.Name;
+        fileInfo = Info(entry, entry.Size);
         return STATUS_SUCCESS;
     }
 
@@ -427,69 +750,76 @@ sealed class Vfs365FileSystem(DriveEngine engine, string label, Action<string>? 
 
         Task<bool>? moving;
 
-        /// <summary>Position after the entry WinFsp last returned; 0 for a new scan.</summary>
-        public int After(string? marker)
+        /// <summary>
+        /// Fills WinFsp's buffer with the entries after <paramref name="marker"/> (from the start when null) that are here, and the end
+        /// marker when the listing is complete. False when none is here yet: wait for <see cref="MoreAsync"/> and try again.
+        /// </summary>
+        public bool TryAnswer(string? marker, IntPtr buffer, uint length, out uint transferred)
         {
-            if (marker is null)
-            {
-                return 0;
-            }
+            transferred = 0;
             lock (gate)
             {
-                while (!positions.ContainsKey(marker) && !done)
+                Arrived();
+                var start = marker is null ? 0 : positions.TryGetValue(marker, out var position) ? position + 1 : done ? entries.Count : -1;
+                if (start < 0 || start >= entries.Count && !done)
                 {
-                    Take(wait: true);
+                    return false;
                 }
-                return positions.TryGetValue(marker, out var position) ? position + 1 : entries.Count;
+                for (var index = start; index < entries.Count; index++)
+                {
+                    var (name, entry) = entries[index];
+                    var info = entry is null ? new FileInfo { FileAttributes = AttributeDirectory } : Info(entry, entry.Size);
+                    if (!WinFspNative.AddEntry(name, info, buffer, length, ref transferred))
+                    {
+                        return true;
+                    }
+                }
+                if (done)
+                {
+                    WinFspNative.AddEnd(buffer, length, ref transferred);
+                }
+                return true;
             }
         }
 
-        /// <summary>The entry at <paramref name="index"/>, waiting for the next batch when it isn't here yet. Ended past the last one.</summary>
-        public ((string Name, FsEntry? Entry)? Found, bool Ended) Wait(int index)
+        /// <summary>Completes when the next batch is in (or the listing ended); throws when the listing failed.</summary>
+        public Task MoreAsync()
         {
             lock (gate)
             {
-                while (index >= entries.Count && !done)
-                {
-                    Take(wait: true);
-                }
-                return index < entries.Count ? (entries[index], false) : (null, true);
+                return done ? Task.CompletedTask : moving ??= batches.MoveNextAsync().AsTask();
             }
         }
 
-        /// <summary>Like Wait, but without waiting: neither found nor ended means the next batch isn't here yet.</summary>
-        public ((string Name, FsEntry? Entry)? Found, bool Ended) Peek(int index)
+        /// <summary>
+        /// Takes in every batch that is here and starts fetching the next (one MoveNextAsync at a time), so a cached folder is one
+        /// answer. A failed listing throws here, for every answer on this handle. Under gate.
+        /// </summary>
+        void Arrived()
         {
-            lock (gate)
+            while (!done && (moving ??= batches.MoveNextAsync().AsTask()) is { IsCompleted: true } arrived)
             {
-                if (index >= entries.Count && !done)
+                var more = arrived.GetAwaiter().GetResult();
+                moving = null;
+                if (!more)
                 {
-                    Take(wait: false);
+                    done = true;
+                    return;
                 }
-                return index < entries.Count ? (entries[index], false) : (null, done);
-            }
-        }
-
-        /// <summary>Takes in the next batch; without waiting only when it is already here (a pending fetch is kept for later).</summary>
-        void Take(bool wait)
-        {
-            moving ??= batches.MoveNextAsync().AsTask();
-            if (!wait && !moving.IsCompleted)
-            {
-                return;
-            }
-            var more = Run(moving);
-            moving = null;
-            if (more)
-            {
-                foreach (var entry in batches.Current.OrderBy(e => e.Name, NameOrder))
+                var batch = batches.Current;
+                // Usually sorted already (cached listings are); sorted here only when not
+                for (var i = 1; i < batch.Count; i++)
+                {
+                    if (NameOrder.Compare(batch[i - 1].Name, batch[i].Name) > 0)
+                    {
+                        batch = [.. batch.OrderBy(e => e.Name, NameOrder)];
+                        break;
+                    }
+                }
+                foreach (var entry in batch)
                 {
                     Add(entry.Name, entry);
                 }
-            }
-            else
-            {
-                done = true;
             }
         }
 
@@ -547,10 +877,11 @@ sealed class Vfs365FileSystem(DriveEngine engine, string label, Action<string>? 
         };
 
     /// <summary>
-    /// The handle's current content: the staging file while the file is being changed, else the cached or streaming download of the
-    /// version it follows. A file deleted while open keeps serving what the handle already had.
+    /// The handle's current content, counted as in use until <see cref="DoneReading"/>: the staging file while the file is being
+    /// changed, else the cached or streaming download of the version it follows; null for an empty file, which needs none. A file
+    /// deleted while open keeps serving what the handle already had.
     /// </summary>
-    IContentSource Readable(Handle handle)
+    async ValueTask<IContentSource?> ReadableAsync(Handle handle)
     {
         FsEntry entry;
         try
@@ -563,22 +894,29 @@ sealed class Vfs365FileSystem(DriveEngine engine, string label, Action<string>? 
             {
                 if (handle.Source is { } kept)
                 {
+                    handle.Reading++;
                     return kept;
                 }
             }
             throw;
+        }
+        if (entry.StagingPath is null && entry.Size == 0)
+        {
+            return null;
         }
         var version = VersionOf(entry);
         lock (handle.Gate)
         {
             if (handle.Source is not null && handle.SourceVersion == version)
             {
+                handle.Reading++;
                 return handle.Source;
             }
         }
-        var source = Run(engine.OpenContentAsync(entry, default));
+        var source = await engine.OpenContentAsync(entry, default);
         lock (handle.Gate)
         {
+            handle.Reading++;
             if (handle.Source is not null && handle.SourceVersion == version)
             {
                 source.Dispose(); // another read on this handle opened it meanwhile
@@ -594,43 +932,88 @@ sealed class Vfs365FileSystem(DriveEngine engine, string label, Action<string>? 
         }
     }
 
+    /// <summary>Ends a read's use of the handle's content; the last one running disposes the versions replaced meanwhile.</summary>
+    static void DoneReading(Handle handle)
+    {
+        IContentSource[] idle = [];
+        lock (handle.Gate)
+        {
+            if (--handle.Reading == 0 && handle.Retired.Count > 0)
+            {
+                idle = [.. handle.Retired];
+                handle.Retired.Clear();
+            }
+        }
+        foreach (var source in idle)
+        {
+            source.Dispose();
+        }
+    }
+
     static string VersionOf(FsEntry entry) => entry.StagingPath ?? $"{entry.ItemId}|{entry.ContentTag}";
 
     /// <summary>
-    /// The staging file a write goes to, with the engine's write lease taken: dispose it after the write and MarkDirty. A handle whose
-    /// content was uploaded stages again from the item it went into (a conflict copy included), never from a version it didn't write;
-    /// once its content was deleted or replaced, writes fail (STATUS_FILE_INVALID).
+    /// The staging file a write goes to, with the engine's write lease taken: dispose it after the write and MarkDirty. Null when the
+    /// handle has to stage first: a handle whose content was uploaded stages again from the item it went into (a conflict copy
+    /// included), never from a version it didn't write; once its content was deleted or replaced, Follow throws (STATUS_FILE_INVALID).
     /// </summary>
+    (SafeFileHandle Content, FsEntry Entry, IDisposable Lease)? Writable(Handle handle)
+    {
+        var entry = handle.Entry = engine.Follow(handle.Entry);
+        lock (handle.Gate)
+        {
+            return handle.Wrote && handle.Content is { } content && handle.ContentPath == entry.StagingPath && engine.BeginWrite(entry) is { } lease
+                ? (content, entry, lease)
+                : null;
+        }
+    }
+
+    /// <summary><see cref="Writable"/>, staging as often as needed, on this thread.</summary>
     (SafeFileHandle Content, FsEntry Entry, IDisposable Lease) BeginWrite(Handle handle)
     {
         while (true)
         {
-            var entry = handle.Entry = engine.Follow(handle.Entry);
-            lock (handle.Gate)
+            if (Writable(handle) is { } writable)
             {
-                if (handle.Wrote && handle.Content is { } content && handle.ContentPath == entry.StagingPath && engine.BeginWrite(entry) is { } lease)
-                {
-                    return (content, entry, lease);
-                }
+                return writable;
             }
             Stage(handle, truncate: false);
         }
     }
 
-    SafeFileHandle Stage(Handle handle, bool truncate)
+    void Stage(Handle handle, bool truncate) => Run(StageAsync(handle, truncate));
+
+    /// <summary>
+    /// Stages the handle's file and opens the staging file. Staged content deleted, replaced or uploaded through another handle before
+    /// it is opened (no namespace lock orders them) is followed: staged again where it went, else Follow throws (STATUS_FILE_INVALID).
+    /// </summary>
+    async Task StageAsync(Handle handle, bool truncate)
     {
-        var staged = Run(engine.StageAsync(handle.Entry, truncate, default));
-        lock (handle.Gate)
+        while (true)
         {
-            handle.Entry = staged;
-            if (handle.ContentPath != staged.StagingPath || handle.Content is null)
+            var staged = await engine.StageAsync(handle.Entry, truncate, default);
+            lock (handle.Gate)
             {
-                handle.Content?.Dispose();
-                handle.Content = OpenStaging(staged.StagingPath!);
-                handle.ContentPath = staged.StagingPath;
+                handle.Entry = staged;
+                if (handle.ContentPath != staged.StagingPath || handle.Content is null)
+                {
+                    handle.Content?.Dispose();
+                    handle.Content = null;
+                    handle.ContentPath = null;
+                    try
+                    {
+                        handle.Content = OpenStaging(staged.StagingPath!);
+                    }
+                    catch (FileNotFoundException)
+                    {
+                        handle.Entry = engine.Follow(staged);
+                        continue;
+                    }
+                    handle.ContentPath = staged.StagingPath;
+                }
+                handle.Wrote = true;
+                return;
             }
-            handle.Wrote = true;
-            return handle.Content;
         }
     }
 
@@ -744,7 +1127,7 @@ sealed class Vfs365FileSystem(DriveEngine engine, string label, Action<string>? 
     static unsafe class Requester
     {
         const uint CreateKind = 1; // FspFsctlTransactCreateKind
-        const int KindOffset = 4, AccessTokenOffset = 40, TokenUser = 1;
+        const int KindOffset = 4, AccessTokenOffset = 40, ShareAccessOffset = 56, TokenUser = 1;
         const uint FileReadAttributes = 0x80;
 
         /// <summary>
@@ -763,6 +1146,17 @@ sealed class Vfs365FileSystem(DriveEngine engine, string label, Action<string>? 
                 Architecture.X86 => "winfsp-x86.dll",
                 _ => "winfsp-x64.dll",
             }), "FspFileSystemGetOperationContext");
+
+        /// <summary>The FILE_SHARE_* flags of the create request being served (Req.Create.ShareAccess); null outside one.</summary>
+        public static uint? ShareAccess()
+        {
+            var context = (byte**)OperationContext();
+            if (context is null || *context is null || *(uint*)(*context + KindOffset) != CreateKind)
+            {
+                return null;
+            }
+            return *(uint*)(*context + ShareAccessOffset);
+        }
 
         /// <summary>
         /// Only creates carry a token. Other requests act on handles that passed this check, and creates without a token come from

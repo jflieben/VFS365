@@ -76,7 +76,8 @@ $winFsp = @{
     Sha256 = '073a70e00f77423e34bed98b86e600def93393ba5822204fac57a29324db9f7a'
 }
 
-#Zig (zig cc) builds the network provider without a C runtime; a build tool only, nothing of it ships
+#Zig (zig cc) builds the network provider without a C runtime; a build tool only, nothing of it ships. The workflows key their Zig
+#cache on the first indented "Version = '...'" line of this file: keep it this one.
 $zig = @{
     Version = '0.17.0'
     Sha256 = @{
@@ -107,7 +108,17 @@ function Get-Zig(){
         Remove-Item -LiteralPath $zip
         Throw "$name.zip does not match its pinned SHA256"
     }
-    Expand-Archive -LiteralPath $zip -DestinationPath $root
+    #Windows' own tar unpacks the zip far faster than Expand-Archive; unpacked aside first, so a broken run leaves no half folder
+    $partial = Join-Path $root "$name.partial"
+    foreach($folder in $partial, (Join-Path $root $name)){
+        if(Test-Path -LiteralPath $folder){ Remove-Item -LiteralPath $folder -Recurse -Force }
+    }
+    New-Item -ItemType Directory -Path $partial | Out-Null
+    & "$env:SystemRoot\System32\tar.exe" -xf $zip -C $partial
+    if($LASTEXITCODE -ne 0){ Throw "tar could not unpack $name.zip ($LASTEXITCODE)" }
+    Move-Item -LiteralPath (Join-Path $partial $name) -Destination $root
+    #Only the folder stays (and is what CI caches)
+    Remove-Item -LiteralPath $partial, $zip -Recurse -Force
     return $exe
 }
 

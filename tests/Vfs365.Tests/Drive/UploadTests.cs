@@ -107,7 +107,7 @@ public sealed class UploadTests : IDisposable
     }
 
     [Fact]
-    public async Task A_rename_waits_for_the_upload_of_its_file()
+    public async Task A_new_file_renamed_while_it_uploads_moves_at_once_and_its_item_follows()
     {
         var engine = Create(background: true);
         var hold = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -116,16 +116,49 @@ public sealed class UploadTests : IDisposable
 
         await WriteNewAsync(engine, "a.txt", "x");
         await started.Task;
-        var rename = engine.RenameAsync(Root + "a.txt", Root + "b.txt", false, default);
-        await Task.Delay(100);
-        Assert.False(rename.IsCompleted);
+        await engine.RenameAsync(Root + "a.txt", Root + "b.txt", false, default);
+        Assert.Null(await engine.GetEntryAsync(Root + "a.txt", default));
+        Assert.NotNull(await engine.GetEntryAsync(Root + "b.txt", default));
 
+        // A delete at the new name waits for the upload and the rename after it
+        var delete = engine.DeleteAsync(Root + "b.txt", default);
+        await Task.Delay(100);
+        Assert.False(delete.IsCompleted);
         hold.SetResult();
-        await rename;
-        await engine.WaitForUploadsAsync();
+        await delete;
         Assert.Equal(["b.txt"], api.Paths);
         Assert.Equal("x", api.ContentOf("b.txt"));
         Assert.Single(api.Uploads);
+        Assert.Equal(1, api.Moves);
+        Assert.Null(await engine.GetEntryAsync(Root + "b.txt", default));
+    }
+
+    [Fact]
+    public async Task A_new_file_renamed_after_its_upload_went_but_before_the_answer_is_not_uploaded_twice()
+    {
+        var engine = Create(background: true);
+        var hold = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        api.BeforeUpload = () => { started.TrySetResult(); return hold.Task; };
+        api.LoseAnswer = _ => new TaskCanceledException("no answer within 100 s");
+        api.FailMove = true;
+
+        await WriteNewAsync(engine, "report.pdf.part", "pdf");
+        await started.Task;
+        await engine.RenameAsync(Root + "report.pdf.part", Root + "report.pdf", false, default);
+        hold.SetResult();
+        await engine.WaitForUploadsAsync();
+        Assert.Equal(["report.pdf.part"], api.Paths); // up under its first name, the rename and the answer lost
+
+        api.LoseAnswer = null;
+        api.FailMove = false;
+        now += TimeSpan.FromMinutes(1);
+        await engine.ProcessDueAsync(false, default);
+        await engine.WaitForUploadsAsync();
+
+        Assert.Equal(["report.pdf"], api.Paths);
+        Assert.Single(api.Uploads);
+        Assert.Empty(engine.Unsaved());
     }
 
     [Fact]

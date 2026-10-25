@@ -90,6 +90,82 @@ public sealed class StreamingTests : IDisposable
         }
     }
 
+    [Fact]
+    public async Task A_random_read_pulls_little()
+    {
+        // A stream starts 1 block ahead of its reader and goes further only while the reader follows it
+        var data = Data(48 * MiB);
+        api.Add("model.db", data);
+        var file = (await engine.GetEntryAsync("\\OneDrive\\model.db", default))!;
+
+        using var source = await engine.OpenContentAsync(file, default);
+        var page = new byte[4096];
+        await source.ReadAsync(20L * MiB, page, default);
+        await Task.Delay(300); // what the stream reads ahead meanwhile
+
+        Assert.Equal(data.AsSpan(20 * MiB, 4096).ToArray(), page);
+        Assert.True(api.BytesStreamed <= 2 * MiB, $"pulled {api.BytesStreamed / (double)MiB:0.0} MiB for one 4 KiB read");
+    }
+
+    [Fact]
+    public async Task A_read_is_served_as_soon_as_its_chunk_arrives_and_never_from_one_still_arriving()
+    {
+        var fake = new FakeDriveApi();
+        var data = Data(3 * MiB);
+        var item = fake.Add("big.bin", data);
+        var stalling = new StallingDriveApi(fake) { StallAfterBytes = 100_000 }; // the first 64 KiB chunk and part of the second
+        var cache = new ContentCache(Path.Combine(directory, "stalled"), stalling, new ContentCacheOptions { NoProgressTimeout = TimeSpan.FromMilliseconds(300) });
+
+        using var source = cache.Open("d", item.Id, item.CTag, item.Size);
+        var head = new byte[4096];
+        Assert.Equal(4096, await source.ReadAsync(0, head, default));
+        var failure = await Assert.ThrowsAnyAsync<Exception>(() => source.ReadAsync(70_000, new byte[4096], default).AsTask());
+
+        Assert.Equal(data.AsSpan(0, 4096).ToArray(), head);
+        Assert.Contains("No download progress", failure.Message);
+    }
+
+    [Fact]
+    public async Task A_stream_stops_at_the_block_it_is_in_when_its_last_reader_closes()
+    {
+        // Kept for a reopen, but not read further ahead for nobody: 64 KiB every 10 ms, a block in 160 ms
+        var fake = new FakeDriveApi();
+        var item = fake.Add("clip.mp4", Data(8 * MiB));
+        var slow = new StallingDriveApi(fake) { SlowPiece = 64 * 1024, PieceDelay = TimeSpan.FromMilliseconds(10) };
+        var cache = new ContentCache(Path.Combine(directory, "slow"), slow);
+
+        using (var source = cache.Open("d", item.Id, item.CTag, item.Size))
+        {
+            await source.ReadAsync(0, new byte[4096], default);
+        }
+        await Task.Delay(600);
+
+        Assert.True(fake.BytesStreamed <= MiB, $"pulled {fake.BytesStreamed / (double)MiB:0.0} MiB after the close");
+    }
+
+    [Fact]
+    public async Task Streams_that_meet_write_each_chunk_once_and_the_file_reads_whole()
+    {
+        var data = Data(12 * MiB + 777);
+        api.Add("big.bin", data);
+        var file = (await engine.GetEntryAsync("\\OneDrive\\big.bin", default))!;
+
+        using (var source = await engine.OpenContentAsync(file, default))
+        {
+            await source.ReadAsync(5L * MiB + 100, new byte[4096], default); // a stream from block 5, then one from the start reaching it
+            var copy = new byte[data.Length];
+            for (var offset = 0; offset < copy.Length;)
+            {
+                offset += await source.ReadAsync(offset, copy.AsMemory(offset, Math.Min(256 * 1024, copy.Length - offset)), default);
+            }
+            Assert.Equal(data, copy);
+        }
+        using var cached = await engine.OpenContentAsync(file, default);
+
+        Assert.Equal(data.Length, cached.Length);
+        Assert.Equal(2, api.Downloads);
+    }
+
     async Task<FsEntry> CopyInAsync(string name, byte[] data, bool presize, int chunk = MiB, bool outOfOrder = false, bool patchHeader = false)
     {
         var path = "\\OneDrive\\" + name;

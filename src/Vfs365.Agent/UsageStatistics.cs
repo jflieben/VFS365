@@ -33,6 +33,17 @@ public sealed class UsageStatistics(string filePath)
         public int Errors { get; set; }
         public double MinutesRunning { get; set; }
 
+        /// <summary>
+        /// Resource units per UTC hour, from <see cref="ResourceUnitsFromHour"/> on (one value per hour), so devices in other time zones
+        /// add up. Null in files of earlier versions; the hours count what this version counted.
+        /// </summary>
+        public List<long>? ResourceUnitsByHour { get; set; }
+        public DateTimeOffset? ResourceUnitsFromHour { get; set; }
+
+        /// <summary>The busiest minute (one fold; a longer fold counts its average minute) and when it ended, to the minute (UTC).</summary>
+        public long PeakMinuteResourceUnits { get; set; }
+        public DateTimeOffset? PeakMinuteAt { get; set; }
+
         /// <summary>The last signed-in account (UPN) and VFS365 version of that day, kept for a send before the first token or after an update.</summary>
         public string? User { get; set; }
         public string? Version { get; set; }
@@ -51,12 +62,19 @@ public sealed class UsageStatistics(string filePath)
         public DeviceInfo DeviceOr(DeviceInfo current) => DeviceId is null ? current : new(DeviceName ?? DeviceId, DeviceId, EntraDeviceId);
     }
 
+    /// <summary>Hours a day keeps at most: a local day spans 23 to 26 UTC hours, more only when the clock jumps.</summary>
+    public const int MaxHours = 48;
+
+    /// <summary>Running time alone (no requests, no errors) is saved at most this often; a crash loses that much of it at most.</summary>
+    public static readonly TimeSpan RunningTimeSaves = TimeSpan.FromMinutes(15);
+
     readonly string filePath = filePath;
     readonly Lock gate = new(), saving = new();
     Dictionary<string, Day> days = new(StringComparer.Ordinal);
     ClientUsage seen;
     int seenErrors;
-    DateTime? lastFold;
+    DateTime? lastFold, lastSave;
+    bool changed;
 
     public static string DefaultPath => Path.Combine(DiscoveryStore.DataDirectory, "statistics.json");
 
@@ -97,10 +115,13 @@ public sealed class UsageStatistics(string filePath)
 
     /// <summary>
     /// Adds what the client and the error count did since the last call to the day of <paramref name="localNow"/> on
-    /// <paramref name="device"/>. A day of an earlier version without a device becomes this device's.
+    /// <paramref name="device"/>. A day of an earlier version without a device becomes this device's. Resource units also go to the
+    /// UTC hour of <paramref name="utcNow"/> (default: <paramref name="localNow"/> in UTC).
     /// </summary>
-    public void Fold(ClientUsage usage, int errors, DateTime localNow, string? user = null, string? version = null, DeviceInfo? device = null)
+    public void Fold(ClientUsage usage, int errors, DateTime localNow, string? user = null, string? version = null, DeviceInfo? device = null,
+        DateTimeOffset? utcNow = null)
     {
+        var utc = utcNow ?? new DateTimeOffset(localNow.ToUniversalTime(), TimeSpan.Zero);
         lock (gate)
         {
             var delta = usage.Since(seen);
@@ -117,7 +138,9 @@ public sealed class UsageStatistics(string filePath)
                 }
                 (day.DeviceName, day.DeviceId, day.EntraDeviceId) = (device?.Name, device?.Id, device?.EntraDeviceId);
                 days[key] = day;
+                changed = true;
             }
+            changed |= delta != default || errors != seenErrors || (user is not null && user != day.User) || (version is not null && version != day.Version);
             day.User = user ?? day.User;
             day.Version = version ?? day.Version;
             day.GraphRequests += delta.GraphRequests;
@@ -135,8 +158,45 @@ public sealed class UsageStatistics(string filePath)
             {
                 day.MinutesRunning += Math.Clamp((localNow - last).TotalMinutes, 0, MaxFoldGap.TotalMinutes);
             }
+            if (delta.ResourceUnits > 0)
+            {
+                AddToHour(day, utc, delta.ResourceUnits);
+                // Folds come every minute; a longer one (sleep, the final uploads) counts its average minute, a start's first one as one minute
+                var minutes = lastFold is { } previous ? (localNow - previous).TotalMinutes : 1;
+                var perMinute = minutes > 1 ? (long)Math.Round(delta.ResourceUnits / minutes) : delta.ResourceUnits;
+                if (perMinute > day.PeakMinuteResourceUnits)
+                {
+                    day.PeakMinuteResourceUnits = perMinute;
+                    day.PeakMinuteAt = new DateTimeOffset(utc.UtcTicks - (utc.UtcTicks % TimeSpan.TicksPerMinute), TimeSpan.Zero);
+                }
+            }
             (seen, seenErrors, lastFold) = (usage, errors, localNow);
         }
+    }
+
+    static void AddToHour(Day day, DateTimeOffset utc, long units)
+    {
+        var hour = new DateTimeOffset(utc.UtcTicks - (utc.UtcTicks % TimeSpan.TicksPerHour), TimeSpan.Zero);
+        if (day.ResourceUnitsFromHour is not { } from || day.ResourceUnitsByHour is not { } hours)
+        {
+            (day.ResourceUnitsFromHour, day.ResourceUnitsByHour) = (hour, [units]);
+            return;
+        }
+        var at = (int)Math.Floor((hour - from).TotalHours);
+        if (at < 0 && hours.Count - at <= MaxHours)
+        {
+            hours.InsertRange(0, new long[-at]); // the clock went back
+            (day.ResourceUnitsFromHour, at) = (hour, 0);
+        }
+        if (at < 0 || at >= MaxHours)
+        {
+            return; // still in the day's total
+        }
+        while (hours.Count <= at)
+        {
+            hours.Add(0);
+        }
+        hours[at] += units;
     }
 
     /// <summary>Keys of days before the day of <paramref name="localNow"/>, ready to send.</summary>
@@ -209,9 +269,32 @@ public sealed class UsageStatistics(string filePath)
         ("Throttled", usage.Throttled), ("ThrottledSeconds", usage.ThrottledSeconds), ("BudgetWaitSeconds", usage.BudgetWaitSeconds),
         ("BudgetWaitForegroundSeconds", usage.BudgetWaitForegroundSeconds), ("BudgetWaitBackgroundSeconds", usage.BudgetWaitBackgroundSeconds),
         ("Errors", usage.Errors), ("MinutesRunning", (int)Math.Round(usage.MinutesRunning)),
+        // Days of earlier versions have neither: left out, so unknown rather than 0
+        ("ResourceUnitsByHour", usage.ResourceUnitsByHour is { } hours ? string.Join(",", hours.Select(h => h.ToString(CultureInfo.InvariantCulture))) : null),
+        ("ResourceUnitsFromHour", usage.ResourceUnitsByHour is null ? null : usage.ResourceUnitsFromHour),
+        ("PeakMinuteResourceUnits", usage.PeakMinuteAt is null ? null : usage.PeakMinuteResourceUnits), ("PeakMinuteAt", usage.PeakMinuteAt),
     ];
 
-    public void Save()
+    /// <summary>
+    /// Saves after a fold that counted requests or errors (or a new day); running time alone only every <see cref="RunningTimeSaves"/>.
+    /// True when it wrote the file.
+    /// </summary>
+    public bool SaveIfChanged(DateTime localNow)
+    {
+        lock (gate)
+        {
+            if (!changed && lastSave is { } last && localNow - last < RunningTimeSaves)
+            {
+                return false;
+            }
+        }
+        Save(localNow);
+        return true;
+    }
+
+    public void Save() => Save(DateTime.Now);
+
+    void Save(DateTime localNow)
     {
         try
         {
@@ -219,6 +302,7 @@ public sealed class UsageStatistics(string filePath)
             lock (gate)
             {
                 json = JsonSerializer.Serialize(days);
+                (changed, lastSave) = (false, localNow);
             }
             lock (saving)
             {
@@ -229,6 +313,10 @@ public sealed class UsageStatistics(string filePath)
         }
         catch (Exception e) when (e is IOException or UnauthorizedAccessException)
         {
+            lock (gate)
+            {
+                changed = true; // tried again at the next fold
+            }
         }
     }
 }

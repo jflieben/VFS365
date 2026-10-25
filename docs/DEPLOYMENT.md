@@ -34,12 +34,14 @@ The WinFsp MSI is upstream's, so it has no attestation from VFS365; `SHA256SUMS.
 
 ## Install (.exe)
 
-- **Setup (recommended):** Intune Win32 app or any deployment tool, device context. Install `VFS365-<version>-<arch>-setup.exe /quiet`, uninstall `VFS365-<version>-<arch>-setup.exe /uninstall /quiet`. Detection: the VFS365 product in Apps (or the file `C:\Program Files\VFS365\vfs365-agent.exe`).
+- **Setup (recommended):** Intune Win32 app or any deployment tool, device context. Install `VFS365-<version>-<arch>-setup.exe /quiet /norestart`, uninstall `VFS365-<version>-<arch>-setup.exe /uninstall /quiet /norestart`. Detection: the VFS365 product in Apps (or the file `C:\Program Files\VFS365\vfs365-agent.exe`).
 
 ## Install (2x msi)
 
 - **MSI:** deploy `winfsp-<version>.msi` first (in Intune as a dependency)
-- then `msiexec /i VFS365-<version>-<arch>.msi /qn`. The MSI refuses to install without WinFsp, and the x64 package refuses ARM64 devices (use the arm64 package there).
+- then `msiexec /i VFS365-<version>-<arch>.msi /qn /norestart`; uninstall with `msiexec /x VFS365-<version>-<arch>.msi /qn /norestart`. The MSI refuses to install without WinFsp, and the x64 package and setup refuse ARM64 devices (use the arm64 ones there).
+
+Keep `/norestart` in quiet commands: without it the setup or msiexec restarts the device by itself when a file it replaces is in use (`vfs365np.dll`, which Explorer loads). With it, exit code 3010 means done, with a restart pending (Intune: soft reboot).
 
 Both add a Start menu entry "VFS365" that starts the drive again after it was closed.
 
@@ -56,8 +58,9 @@ Through the setup, the MSI, or Settings, Apps. Before files are removed, `vfs365
 
 - Every signed-in user's agent is asked to stop: it removes its navigation pane entry, uploads pending changes and unmounts. Agents still running after 60 s are ended (their unsaved changes stay journaled).
 - Each user's `%LOCALAPPDATA%\VFS365` is removed (downloaded file copies, state, logs). A `staging` folder that still holds unsaved changes is kept, and the uninstall log names it. Links (junctions, symbolic links) in that path, a VFS365 folder owned by another account, and folders more than 64 levels deep are skipped and named in the log: the cleanup runs as SYSTEM and never follows them.
-- Explorer entries (navigation pane and drive name) are removed for signed-in users. Users who were signed out are cleaned up at their next sign-in (an Active Setup entry that stays in HKLM); normally their agent already removed its entry at logoff.
+- Explorer entries (navigation pane, drive name and the VFS365 menu) are removed for signed-in users. Users who were signed out are cleaned up at their next sign-in (an Active Setup entry that stays in HKLM); normally their agent already removed its entry at logoff.
 - `VFS365.Np` leaves the provider order. A `vfs365np.dll` still loaded by Explorer goes at the next restart.
+- The event source `VFS365` is unregistered; events already written stay in the Application log.
 - WinFsp stays installed, as other software may use it. Remove it separately if wanted.
 
 ## Settings
@@ -146,10 +149,10 @@ With `MonitoringUrl` set, VFS365 sends reports to your own Azure table storage. 
 |---|---|---|
 | `errors` | Partition: UTC date. `Source` (start, sign-in, upload, delete, conflict copy, discovery, file system, drive letter, security, crash, agent), `Message`, `OccurredAt` | At once; at most 20 an hour per user, the same error once an hour |
 | `errors`, source `throttled` | Partition: UTC date of the start. One row per throttling episode (from the first throttled response until 2 minutes without one): start (`OccurredAt`) and end (`ThrottledUntil`), `Responses` (`Status429` and `Status503` separately), `HeldSeconds` (the pause Microsoft asked for, not the longer `ThrottlePauseMinutes` background work waits), `LongestWaitSeconds`, `GraphResponses`, `SharePointResponses`, `BackgroundResponses`, and a message. Not counted as an error | When the episode ends; at most 12 an hour per user |
-| `statistics` | Partition: the day (`Day`), the device's local date, unlike the UTC dates of `errors`. One row per device and Windows user: `GraphRequests`, `SharePointRequests`, `ResourceUnits`, `BytesReceived`, `BytesSent`, `Throttled` (throttled responses) and `ThrottledSeconds`, seconds waited for the budget (`BudgetWaitSeconds`; from 0.3.0 also split into `BudgetWaitForegroundSeconds` for what users wait for and `BudgetWaitBackgroundSeconds`; added up over requests), `Errors`, `MinutesRunning` (time asleep doesn't count). `User`, `Version` and the device are that day's (with roaming profiles on pooled AVD, the device the day was used on); the RowKey ends in a random suffix | The next day, 1 to 15 minutes after the start or after midnight; a day that doesn't arrive is kept and tried again an hour later, for up to a week after its first failed send |
+| `statistics` | Partition: the day (`Day`), the device's local date, unlike the UTC dates of `errors`. One row per device and Windows user: `GraphRequests`, `SharePointRequests`, `ResourceUnits`, `BytesReceived`, `BytesSent`, `Throttled` (throttled responses) and `ThrottledSeconds`, seconds waited for the budget (`BudgetWaitSeconds`; from 0.3.0 also split into `BudgetWaitForegroundSeconds` for what users wait for and `BudgetWaitBackgroundSeconds`; added up over requests), `Errors`, `MinutesRunning` (time asleep doesn't count). From 0.7.0: `ResourceUnitsByHour` (comma-separated, one value per UTC hour from `ResourceUnitsFromHour` on, so devices in other time zones add up), `PeakMinuteResourceUnits` and `PeakMinuteAt` (the device's busiest minute and when it ended, UTC); rows of earlier versions lack them. `User`, `Version` and the device are that day's (with roaming profiles on pooled AVD, the device the day was used on); the RowKey ends in a random suffix | The next day, 1 to 15 minutes after the start or after midnight; a day that doesn't arrive is kept and tried again an hour later, for up to a week after its first failed send |
 | `devices` | Partition: device ID. `DeviceName`, `DeviceId`, `EntraDeviceId`, `Users` (signed in at the time), `Version`, `Action` (`install`, `update`, `uninstall`), `OccurredAt` | By the installer, at once |
 
-Rows in `errors` and `statistics` also carry `DeviceName`, `DeviceId`, `EntraDeviceId`, `User` (UPN), `WindowsUser` (domain\name), `TenantId` and `Version`. The device ID is Windows' `MachineGuid`. Error messages contain file and folder paths and the addresses of failed requests; with `MonitoringDetail` set to `NoPaths` they contain a short hash per path instead, and addresses keep only their host. User and device names are in every row. `crash` rows come from the agent after it was started again, and from `vfs365-agent.exe` itself when it gave up ("not started again", with the last known UPN); `security` rows when another user on the PC holds the user's `\\VFS365\<user>` path, or when the name VFS365 resolves to an address other than 0.0.0.0 or this PC (see [The name VFS365 on the network](#the-name-vfs365-on-the-network)). Reporting is best effort: nothing waits for it and error rows are not retried. The first failure after a start is written to the local log once, with the reason (for example a missing table or a SAS without the Add permission).
+Rows in `errors` and `statistics` also carry `DeviceName`, `DeviceId`, `EntraDeviceId`, `User` (UPN), `WindowsUser` (domain\name), `TenantId` and `Version`. The device ID is Windows' `MachineGuid`. Error messages contain file and folder paths and the addresses of failed requests; with `MonitoringDetail` set to `NoPaths` they contain a short hash per path instead, and addresses keep only their host. User and device names are in every row; statistics rows show per user in which hours VFS365 was used. `crash` rows come from the agent after it was started again, and from `vfs365-agent.exe` itself when it gave up ("not started again", with the last known UPN); `security` rows when another user on the PC holds the user's `\\VFS365\<user>` path, or when the name VFS365 resolves to an address other than 0.0.0.0 or this PC (see [The name VFS365 on the network](#the-name-vfs365-on-the-network)). Reporting is best effort: nothing waits for it and error rows are not retried. The first failure after a start is written to the local log once, with the reason (for example a missing table or a SAS without the Add permission).
 
 Setup: the [Deploy to Azure button in the README](../README.md#setting-up-monitoring) (template `monitoring/azuredeploy.json`) does steps 1 and 2 and the dashboard's hosting, SAS and CORS, and shows `monitoringUrl` for step 3 among the deployment's outputs; deploying it again into the same resource group renews both SAS URLs. By hand:
 
@@ -162,7 +165,7 @@ Setup: the [Deploy to Azure button in the README](../README.md#setting-up-monito
 
 `vfs365-monitoring.html` (in each release and in the repository's `monitoring` folder) shows the tables in a browser. It is one file; it reads straight from the storage account and sends nothing anywhere else.
 
-- **What it shows.** What needs attention: crashes, sign-in and upload problems, drive letter conflicts, throttling, older versions, quiet devices, an expiring SAS. Totals compared with the period before, charts per day, and tables of devices, users, errors (grouped by cause), throttling (who, when and how much: episodes with exact times, or per user per day) and installs. Click a row for its details. Every chart has a table view. The "Error reports" tile counts the rows reported (at most 20 an hour per user) and also shows the errors the agents counted. The last 3 days of statistics are marked as still arriving. Statistics rows for the same day, device and Windows user count once, the newest. Rows are not signed: anyone with the agents' SAS can add rows.
+- **What it shows.** What needs attention: crashes, sign-in and upload problems, drive letter conflicts, throttling, older versions, quiet devices, an expiring SAS. Totals compared with the period before, charts per day, and tables of devices, users, errors (grouped by cause), throttling (who, when and how much: episodes with exact times, or per user per day) and installs. Click a row for its details. **Headroom** compares the tenant's resource units with Microsoft's limits per app per tenant (per minute and per 24 hours, by the license count you enter; kept in that browser): the busiest hours and days, use per active user, and how many more users fit with a safety margin you choose. These are estimates: devices report hours, so minute peaks across devices don't show, and each device's busiest minute is its own. Every chart has a table view. The "Error reports" tile counts the rows reported (at most 20 an hour per user) and also shows the errors the agents counted. The last 3 days of statistics are marked as still arriving. Statistics rows for the same day, device and Windows user count once, the newest. Rows are not signed: anyone with the agents' SAS can add rows.
 - **Refresh.** Every 5 minutes by default (1 minute to 1 hour, or off). A refresh reads only the last days again.
 - **A SAS of its own.** Allowed services Table, resource type **Object**, permission **Read**, HTTPS only, an expiry date. That is all it needs: it reads the rows of the three tables and never lists tables (Container and List add nothing). Paste its Table service SAS URL or its connection string. The dashboard checks the SAS first (expired, not valid yet, missing permissions, more than reading) and explains what Azure refuses.
 - **A CORS rule**, so a browser may read the storage account. Under Settings, Resource sharing (CORS), Table service: allowed origins `*`, methods GET and OPTIONS, allowed headers `*`, exposed headers `*`, max age 3600. A page opened from disk (`file://`) sends `Origin: null`, so it needs `*`; to allow one address only, host the page on https and allow that address. Exposed headers are always needed: Azure can split results before 1000 rows, and the page warns when it can't see the headers. Or run:
@@ -180,9 +183,11 @@ Azure Storage Explorer, Excel and Power BI (Azure Table Storage connector) read 
 - Tree walks (copying a folder tree, searching, backups) get up to `WalkPrefetchFolders` folders listed ahead of them, in their own order; the log reports per walk how many were used.
 - Copies of many small files run at about disk speed: to the drive, new files upload right after they are closed (`BackgroundUploads`); out of the drive, the next small files are downloaded ahead (`ReadAheadFiles`). Measured with 300 small files and Microsoft Defender on: to the drive 3 s (all uploaded after 29 s), out of the drive 21 s with nothing cached.
 - Apps that write a file in many small pieces, or append and close it again and again, upload it once when done or once per `RepeatSaveSeconds`, not on every close.
-- A tray icon shows the status (up to date, changes waiting to upload, offline, Microsoft 365 limiting requests, sign-in needed) and notifies about conflict copies, uploads that wait, with the cause in plain words, and sign-in problems. Notifications within a few seconds are combined ("27 files are waiting to upload: offline"), and each kind shows at most once a minute; a refused delete says why. Its menu: Status, Sign in (when needed), Show files, Show log, Refresh (reads all libraries and folders again; once a day, and only when the libraries were read more than an hour ago; a Refresh that fails says so and doesn't count; when greyed out, the item says from when, and pointing at it says why), Restart, Help (`HelpUrl`), and the version, which opens the JSolve website. A click opens the files; the menu also opens from the keyboard (Windows+B, then the menu key or Enter). Menu, tooltips and notifications are in Dutch on Dutch Windows, else in English.
+- A tray icon shows the status (up to date, changes waiting to upload, offline, Microsoft 365 limiting requests, sign-in needed) and notifies about conflict copies, uploads that wait, with the cause in plain words, and sign-in problems. Notifications within a few seconds are combined ("27 files are waiting to upload: offline"), and each kind shows at most once a minute; a refused delete says why. Its menu: Status, Sign in (when needed), Show files, Show log, Collect diagnostics (a [support bundle](#troubleshooting)), Refresh (reads all libraries and folders again; once a day, and only when the libraries were read more than an hour ago; a Refresh that fails says so and doesn't count; when greyed out, the item says from when, and pointing at it says why), Restart, Help (`HelpUrl`), and the version, which opens the JSolve website. A click opens the files; the menu also opens from the keyboard (Windows+B, then the menu key or Enter). Menu, tooltips and notifications are in Dutch on Dutch Windows, else in English.
 - With the tray icon, VFS365 never shows a sign-in window by itself once it runs: when a silent sign-in fails (a password change, MFA, sign-in frequency), the tray shows "sign-in needed" and a notification; clicking it, or Sign in in the menu, opens the window. Files that can't upload meanwhile wait on the PC. With `TrayIcon` = `0` there is no Sign in, so the window opens by itself, once per problem.
 - If the drive can't start (a problem only an admin solves, another user holding `\\VFS365\<user>`), the tray icon stays with the cause, Retry and Show log.
+- Right-clicking a file or folder in the drive (the drive letter, `\\VFS365\<user>` and the `DriveMappings` letters) shows a VFS365 submenu; Windows 11 shows it under "Show more options". Open in browser, Open in desktop app (Word, Excel and PowerPoint through Office's URI schemes, so they edit the copy in Microsoft 365 and co-authoring works), Copy link (the item's address, for people who already have access: no sharing link is made, no permission changes), Version history (SharePoint's page), Share in browser (SharePoint has no documented address for its share dialog, so this opens the item where its Share button is). On conflict copies also Keep this version and Compare with the original. One item at a time. The entries are per user (HKCU) and go when the drive stops.
+- A conflict copy's notification names who saved the other version and when.
 - `vfs365.exe pin <url>` adds a site, library or folder link for the user (`unpin`, `pins` to list); it shows after Restart.
 - `vfs365.exe signout` stops the drive and removes local data (cached file copies, folder listings, discovery state; unsaved changes stay); the next start signs in again with the Windows account.
 
@@ -195,6 +200,9 @@ Per user in `%LOCALAPPDATA%\VFS365`:
 | `cache\` | Copies of opened files, one per version | AES-256, key in `cache.key` wrapped by DPAPI (this user only); limited by `CacheSizeMB` |
 | `metadata.bin` | Folder listings for a fast start | AES-GCM with the same key |
 | `discovery.json` | Libraries shown, their drive IDs, the OneDrive | Plain (site and library names) |
+| `discovery-report.json` | What the last discovery left out and why, for `vfs365.exe why` and support bundles | Plain (site and library names) |
+| `status.json` | What the running agent reports for `vfs365.exe health`: state, drive letter, account, counts, last error, files waiting to upload | Plain (paths) |
+| `support\` | Support bundles (Collect diagnostics, `vfs365.exe support-bundle`), the newest 5 | Plain zip, tokens and secrets removed |
 | `pinned.json` | Locations the user added with `vfs365 pin` | Plain (URLs) |
 | `staging\` | Unsaved changes until they upload | Plain, deleted after upload |
 | `statistics.json` | Usage per day until it is sent to monitoring (only with `MonitoringUrl`) | Plain (counts) |
@@ -204,7 +212,7 @@ Per user in `%LOCALAPPDATA%\VFS365`:
 | `agent.log` | Log of the current sign-in, starting with the settings in effect and where each comes from | Plain |
 | `logs\` | Logs of earlier sign-ins (`agent-<time of the last line>.log`): kept 7 days, at most 50 files; a log that reaches 10 MB continues in a new file | Plain |
 
-Wiped automatically: cached copies and folder listings on another account or tenant and when the device leaves Intune (MDM unenrollment); a library's copies when it is no longer shown; an item's copies when it is deleted. `vfs365.exe signout` removes the cache, the folder listings, the discovery state and `cache.key`. Staging is never wiped.
+Wiped automatically: cached copies and folder listings on another account or tenant and when the device leaves Intune (MDM unenrollment); a library's copies when it is no longer shown; an item's copies when it is deleted. `vfs365.exe signout` removes the cache, the folder listings, the discovery state (with its report) and `cache.key`. Staging is never wiped.
 
 ## Antivirus
 
@@ -253,10 +261,57 @@ At each start the agent checks whether the name VFS365 resolves. When it does, t
 - Drive letters are per session: with `DriveLetter` set, every user has the same path (for example `M:\`). Set one when apps store file paths that other users open.
 - Downloaded file copies go to `%LOCALAPPDATA%\VFS365\cache`, which FSLogix puts in the profile container by default; `CacheSizeMB` bounds it. Excluding `AppData\Local\VFS365\cache` in FSLogix `redirections.xml` keeps profiles smaller at the cost of downloading again in a new session. Keep `AppData\Local\VFS365\staging` (unsaved changes), `cache.key`, `metadata.bin` and `discovery.json` (fast start), and `pinned.json` (the user's pins).
 
+## Health and Intune remediation
+
+`vfs365.exe health` checks the device and the signed-in user's drive: exit code 0 when nothing needs a fix, 1 with the reasons, 2 for a wrong command line. `--json` gives the result as JSON with a one-line `Summary`. `--all-users`, as SYSTEM or an elevated administrator, checks every signed-in session (active or disconnected) instead of the current one.
+
+- Device: WinFsp installed (the version is shown), `WinFsp.Np` and `VFS365.Np` in the network provider order.
+- Per user: an agent runs in the session; its status (`%LOCALAPPDATA%\VFS365\status.json`, written when something changes and at least every 5 minutes) is less than 15 minutes old; the drive is mounted (an agent started less than 5 minutes ago may still be starting); no sign-in is needed.
+- Shown but not counted: offline, throttled, files waiting to upload, changes kept on the PC, whether the event source is registered.
+
+For Intune Remediations (Devices, Scripts and remediations, Create), use the scripts in the repository's `deploy/intune` folder (Windows PowerShell 5.1 or later):
+
+- Detection `Detect-VFS365.ps1` runs `vfs365.exe health --all-users --json` from `C:\Program Files\VFS365` and prints its summary line, which Intune shows as the detection output. Exit 1 (remediate) when something is unhealthy, VFS365 is missing or health gives no report.
+- Remediation `Remediate-VFS365.ps1` runs `vfs365.exe machine-setup` (VFS365.Np back in the provider order) and `vfs365.exe machine-start` (the agent in every signed-in session without one), waits up to a minute for a started agent to mount, and prints the health summary with what the steps did.
+- Run this script using the logged-on credentials: **No** (SYSTEM). Run script in 64-bit PowerShell: **Yes**. Enforce script signature check: **No**, unless you sign the scripts. Schedule: hourly or daily.
+- What remediation can't fix stays in the output: a user who must sign in (Sign in in the tray), a missing WinFsp (deploy the setup or the WinFsp MSI), a policy that sets the provider order without `WinFsp.Np` or `VFS365.Np` (fix that policy; it would replace the order again).
+
+## Windows Event Log
+
+The agent writes important events to the Application log under source `VFS365`, with the user's SID, so Microsoft Defender for Endpoint, Microsoft Sentinel (Azure Monitor Agent), Splunk and other collectors pick them up. The MSI registers the source (`HKLM\SYSTEM\CurrentControlSet\Services\EventLog\Application\VFS365`, message file `%SystemRoot%\System32\EventCreate.exe`, whose message for each ID is the event's own text) and removes it at uninstall; without it, as in a development build, nothing is written. Tokens and secrets are removed from the text. The same message is written at most once an hour, and one ID at most 10 times an hour; the next event of that ID says how many were left out.
+
+| ID | Type | Event |
+|---|---|---|
+| 100 | Information | The drive is mounted (letter, UNC path, Windows user) |
+| 101 | Information | The drive stopped and unmounted |
+| 102 | Information | The agent restarts (Restart in the tray, another account signed in) |
+| 103 | Error | The drive didn't start, for a cause that needs a fix; tried again hourly and at Retry |
+| 110 | Error | The agent stopped unexpectedly and is started again (`agent.log` has what Windows recorded) |
+| 111 | Error | The agent stopped unexpectedly too often and is not started again |
+| 200 | Warning | A sign-in is needed, with the cause in plain words and the AADSTS code |
+| 300 | Error | Another account on the PC holds `\\VFS365\<user>`; the drive isn't started |
+| 301 | Warning | The name VFS365 resolves on the network |
+| 400 | Warning | A file was changed or locked in Microsoft 365; the user's version is saved as a conflict copy |
+| 401 | Warning | A file is waiting to upload, with the cause; it stays on the PC and is tried again |
+| 402 | Warning | Microsoft 365 refused a delete; the file is back |
+| 403 | Error | Changed files were not saved to Microsoft 365 when the drive stopped; they stay on the PC (`Not saved:` in `agent.log`) |
+| 404 | Information | Unsaved changes from an earlier run are being uploaded |
+| 500 | Warning | A setting can't be used as set: out of range or unreadable, a refused `MonitoringUrl`, a `FolderRedirection` or `DriveMappings` line |
+| 501 | Information | Settings changed since the start; they apply after Restart |
+| 502 | Warning | A drive letter problem: taken, not valid, or shown as disconnected |
+| 503 | Warning | A folder redirection or drive mapping problem |
+| 504 | Warning | `VFS365.Np` is missing from the network provider order |
+| 600 | Warning | A throttling episode ended: how long, how many responses |
+| 700 | Warning | Discovery failed; the libraries of the last run stay |
+
+Read them with `Get-WinEvent -FilterHashtable @{ LogName = 'Application'; ProviderName = 'VFS365' }`, or in Event Viewer (Windows Logs, Application, Filter Current Log, source VFS365).
+
 ## Troubleshooting
 
+- Support bundle: Collect diagnostics in the tray menu, or `vfs365.exe support-bundle [--out <folder>]`, writes one zip to `%LOCALAPPDATA%\VFS365\support` (never onto the drive) and opens Explorer with it selected; nothing is uploaded. It holds `agent.log` and the two logs before it, the settings with their sources and warnings, how the tenant was chosen and the account last signed in, the last discovery (libraries shown, skipped with the reason, errors, hidden), drive letters and `DriveMappings`, `redirection.json`, the provider order, WinFsp, waiting and unsaved changes with their cause, the health check, and the Windows and VFS365 versions. Tokens, Authorization values, SAS signatures, download links, passwords and keys are removed; copies of files, folder listings (`metadata.bin`), the cache key, the content of unsaved changes and token caches are never in it. User, tenant, site and file names stay: send it to your helpdesk, don't publish it.
+- `vfs365.exe why <link or name>` says why a site or library shows on the drive or not: where it shows; the `ExcludedSites`, `IncludedSites` or site template rule that hides it, with the pattern and where the setting comes from; why discovery skipped it (a system or catalog library, a hidden library, one the site owner excluded from offline clients, not a standard document library, a site that failed); a library hidden because search missed it two runs in a row; a pinned location and what it found; or that the last discovery never saw it (sites excluded from search, Restricted Content Discovery: pin it). Give a browser link of a site, library, folder or file (sharing links too) or part of a name. `--check` adds a few calls: whether the user can open it, which of its libraries would show, and whether search returns it. Exit code 0 when it shows, 1 when not.
 - Log: `%LOCALAPPDATA%\VFS365\agent.log` (per user, this sign-in; Show log in the tray opens it). It starts with the settings that differ from the defaults and where each comes from (computer or user policy, marked Intune when Intune set it, or the config file); `vfs365.exe settings` shows them all. Earlier sign-ins are in `logs\`, 7 days back.
-- `C:\Program Files\VFS365\vfs365.exe settings` shows the effective settings and where each comes from; `vfs365.exe discover` lists the libraries found for the signed-in user (`--audit` also checks what it might miss); `vfs365.exe about` shows the version and notices.
+- `C:\Program Files\VFS365\vfs365.exe settings` shows the effective settings and where each comes from; `vfs365.exe discover` lists the libraries found for the signed-in user (`--audit` also checks what it might miss); `vfs365.exe health` checks the drive (see [Health and Intune remediation](#health-and-intune-remediation)); `vfs365.exe about` shows the version and notices.
 - `vfs365.exe whoami` shows the signed-in account, tenant and OneDrive; `whoami --sign-in` shows Windows' sign-in window even when the Windows account would sign in silently, to test the prompt (Conditional Access, MFA).
 - `vfs365.exe inspect <path>` shows what Graph has at a path on the volume (`--versions` counts versions); `vfs365.exe watch <folder>` shows push notifications for its library.
 - `vfs365.exe machine-report install` sends an install row to the `devices` table, or says why it can't; `vfs365.exe settings` shows the monitoring account (never the SAS) and the API use settings.

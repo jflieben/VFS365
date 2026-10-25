@@ -4,6 +4,9 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    # New versions wait a week, so a bad or hijacked release is usually pulled before it reaches a pull request
+    cooldown:
+      default-days: 7
     ignore:
       # Must match the bundled WinFsp driver; moved by hand together with the pin in build.ps1
       - dependency-name: winfsp.net
@@ -18,6 +21,8 @@ updates:
     directory: /
     schedule:
       interval: monthly
+    cooldown:
+      default-days: 7
     groups:
       actions:
         patterns: ["*"]

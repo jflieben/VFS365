@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.7.0
+
+Result of a performance review, and new tools for users, helpdesks and admins.
+
+New
+- Right-click a file or folder on the drive for a VFS365 menu (Windows 11: Show more options): Open in browser, Open in desktop app (Word, Excel and PowerPoint edit the copy in Microsoft 365, so co-authoring works), Copy link (for people who already have access; no sharing link is made), Version history and Share in browser.
+- Conflict copies name who saved the other version and when. On a conflict copy the menu offers Keep this version (it becomes a new version of the original; the colleague's save stays in its history) and Compare.
+- `vfs365 support-bundle` and Collect diagnostics in the tray: one zip with logs, settings, discovery and drive state for the helpdesk, kept on the PC. Tokens, keys and SAS signatures are removed; cached content never goes in.
+- `vfs365 health [--json] [--all-users]` with exit codes, and Intune Remediations scripts in `deploy/intune`.
+- `vfs365 why <link or name> [--check]` explains why a site or library shows on the drive or not.
+- Events in the Windows Application log (source VFS365) for sign-in problems, security warnings, conflicts, waiting changes, setting problems, crashes and throttling, for Defender, Sentinel or Splunk. The installer registers the source.
+- Monitoring: a Headroom tab shows how close the tenant runs to SharePoint's per-app limits and how many more users fit; statistics rows carry RU per hour and the busiest minute.
+
+Faster
+- Opening, creating and deleting files no longer waits while another file's slow operation runs, and reads of files still downloading no longer hold up the rest of the drive.
+- A download's final rename and a folder rename over files still uploading return at once; the uploads go on. Word and Excel saves still wait for their upload, on purpose.
+- Uploads use larger parts on fast connections; folders with many items list, refresh and delete with far fewer requests; push notifications for libraries nobody looks at cost no reads.
+- The monitoring dashboard loads and refreshes with fewer requests and much less memory, and draws nothing in a hidden tab.
+
+Saving and data safety
+- An upload whose answer got lost is found by its hash and never becomes a conflict copy or a second upload.
+- A delete never takes a colleague's newer version along.
+- A file several programs write at once uploads when the last one closes it.
+- Sites and libraries with the same title keep their folder names whatever order discovery finds them in.
+- Uninstalling, or a crash before the drive mounted, puts redirected Windows folders back.
+
+Reliability
+- Sign-in calls that Windows doesn't answer give up after 30 seconds; problems no sign-in window solves are shown once and retried later.
+- Offline, files and folders opened before answer at once instead of after a timeout.
+- Empty new files upload at their close, not at unmount.
+
 ## 0.6.1
 
 - Monitoring in one step: a Deploy to Azure button (README, Setting up monitoring) creates the storage account and tables, hosts the dashboard on the account's static website with CORS for that address only, and hands out the devices' `MonitoringUrl` and a ready dashboard link. Deploying again renews both.

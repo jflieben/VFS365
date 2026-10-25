@@ -301,6 +301,7 @@ public sealed class WalkTests : IDisposable
         var engine = Create(api, walkThreshold: 0);
         engine.SetPush("b!me", true);
         await engine.PollAsync("b!me");
+        await Names(engine, "\\docs"); // in use: notifications are read at once
         var calls = api.DeltaCalls;
 
         now += TimeSpan.FromSeconds(5);
@@ -316,6 +317,84 @@ public sealed class WalkTests : IDisposable
         now += TimeSpan.FromSeconds(30);
         await engine.NotifiedAsync("b!me");
         Assert.Equal(calls + 2, api.DeltaCalls);
+    }
+
+    [Fact]
+    public async Task A_notification_for_a_drive_nobody_looks_at_is_read_on_its_next_use()
+    {
+        var api = new FakeDriveApi();
+        api.Add("docs", folder: true);
+        api.Add("docs/a.txt", content: "one");
+        var engine = Create(api, walkThreshold: 0);
+        engine.SetPush("b!me", true);
+        await engine.PollAsync("b!me");
+        await Names(engine, "\\docs");
+        now += TimeSpan.FromMinutes(3); // no longer hot, still active
+        var calls = api.DeltaCalls;
+
+        api.RemoteEdit("docs/a.txt", "two two");
+        await engine.NotifiedAsync("b!me");
+        now += TimeSpan.FromMinutes(1);
+        await engine.PollActiveAsync();
+        Assert.Equal(calls, api.DeltaCalls);
+
+        // The next use reads first: the file opened is the version now in Microsoft 365
+        Assert.Equal(7, (await engine.GetEntryAsync("\\docs\\a.txt", default))!.Size);
+        Assert.Equal(calls + 1, api.DeltaCalls);
+    }
+
+    [Fact]
+    public async Task A_notification_left_for_later_is_read_within_minutes_while_the_drive_is_in_use()
+    {
+        var api = new FakeDriveApi();
+        api.Add("docs", folder: true);
+        var engine = Create(api, walkThreshold: 0);
+        engine.SetPush("b!me", true);
+        await engine.PollAsync("b!me");
+        await Names(engine, "\\docs");
+        now += TimeSpan.FromMinutes(3);
+        var calls = api.DeltaCalls;
+
+        await engine.NotifiedAsync("b!me");
+        now += TimeSpan.FromMinutes(4);
+        await engine.PollActiveAsync();
+        Assert.Equal(calls, api.DeltaCalls);
+        now += TimeSpan.FromMinutes(1);
+        await engine.PollActiveAsync();
+        Assert.Equal(calls + 1, api.DeltaCalls);
+
+        // Once the drive is idle (past the active window) a notification reads nothing
+        now += TimeSpan.FromMinutes(10);
+        await engine.NotifiedAsync("b!me");
+        now += TimeSpan.FromMinutes(6);
+        await engine.PollActiveAsync();
+        Assert.Equal(calls + 1, api.DeltaCalls);
+    }
+
+    [Fact]
+    public async Task A_library_colleagues_co_author_in_costs_reads_only_while_it_is_looked_at()
+    {
+        // Notifications every 30 s (the debounce's minimum) for the 10 minutes a drive stays active after one look
+        var api = new FakeDriveApi();
+        api.Add("docs", folder: true);
+        var engine = Create(api, walkThreshold: 0);
+        engine.SetPush("b!me", true);
+        await engine.PollAsync("b!me");
+        await Names(engine, "\\docs");
+        var calls = api.DeltaCalls;
+        for (var t = 5; t <= 600; t += 5)
+        {
+            now += TimeSpan.FromSeconds(5);
+            if (t % 30 == 0)
+            {
+                api.Add($"docs/f{t}.txt");
+                await engine.NotifiedAsync("b!me");
+            }
+            await engine.PollActiveAsync();
+        }
+
+        // 21 reads before (a read per notification); now the 2 hot minutes plus one lazy read
+        Assert.InRange(api.DeltaCalls - calls, 1, 7);
     }
 
     [Fact]

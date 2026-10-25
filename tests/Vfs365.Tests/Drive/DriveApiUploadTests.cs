@@ -30,10 +30,20 @@ public sealed class DriveApiUploadTests : IDisposable
         public List<string?> IfMatches { get; } = [];
         public byte[] Received { get; private set; } = [];
         long next;
-        bool expired;
+        bool expired, completed;
 
         /// <summary>Per fragment PUT (1-based): fail it before or after taking the bytes (a lost answer), or end the session.</summary>
         public Func<int, (HttpStatusCode Status, bool Stored)?>? Fail { get; set; }
+
+        /// <summary>Per simple upload (PUT .../content, 1-based): fail it before or after taking the bytes.</summary>
+        public Func<int, (HttpStatusCode Status, bool Stored)?>? FailContent { get; set; }
+        public int ContentPuts;
+
+        /// <summary>Item reads answer 503: Microsoft 365 can't be asked either.</summary>
+        public bool FailItemReads { get; set; }
+
+        /// <summary>Requests to Graph: method, path and If-Match.</summary>
+        public List<(string Method, string Path, string? IfMatch)> Requests { get; } = [];
 
         /// <summary>Called after each PUT the session takes, with the bytes it has.</summary>
         public Action<long>? Stored { get; set; }
@@ -51,7 +61,7 @@ public sealed class DriveApiUploadTests : IDisposable
                     Interlocked.Increment(ref Cancelled);
                     return new HttpResponseMessage(HttpStatusCode.NoContent);
                 }
-                if (expired)
+                if (expired || completed)
                 {
                     return new HttpResponseMessage(HttpStatusCode.NotFound) { Content = new StringContent("{\"error\":{\"code\":\"itemNotFound\"}}") };
                 }
@@ -84,6 +94,11 @@ public sealed class DriveApiUploadTests : IDisposable
                 bytes.CopyTo(Received, range.From!.Value);
                 FragmentLengths.Add(bytes.Length);
                 next = range.To!.Value + 1;
+                completed = next == range.Length; // the session ends with the item, a new version
+                if (completed)
+                {
+                    NewVersion();
+                }
                 Stored?.Invoke(next);
                 if (failure is { } late)
                 {
@@ -93,19 +108,47 @@ public sealed class DriveApiUploadTests : IDisposable
                     ? Json(HttpStatusCode.Created, Item(range.Length.Value))
                     : Json(HttpStatusCode.Accepted, $$"""{"nextExpectedRanges":["{{next}}-"]}""");
             }
+            var ifMatch = request.Headers.TryGetValues("If-Match", out var values) ? values.Single() : null;
+            Requests.Add((request.Method.Method, uri.AbsolutePath, ifMatch));
             if (uri.AbsolutePath.EndsWith("/createUploadSession", StringComparison.Ordinal))
             {
                 Sessions++;
-                expired = false;
+                expired = completed = false;
                 next = 0;
-                IfMatches.Add(request.Headers.TryGetValues("If-Match", out var values) ? values.Single() : null);
+                IfMatches.Add(ifMatch);
                 return Json(HttpStatusCode.OK, $$"""{"uploadUrl":"https://upload.test/session/{{Sessions}}"}""");
             }
-            return Json(HttpStatusCode.OK, Item(Received.Length));
+            if (request.Method == HttpMethod.Put && uri.AbsolutePath.EndsWith("/content", StringComparison.Ordinal))
+            {
+                var bytes = await request.Content!.ReadAsByteArrayAsync(ct);
+                var failure = FailContent?.Invoke(++ContentPuts);
+                if (failure is { Stored: false } early)
+                {
+                    return new HttpResponseMessage(early.Status) { Content = new StringContent("{}") };
+                }
+                Received = bytes;
+                NewVersion();
+                return failure is { } late ? new HttpResponseMessage(late.Status) { Content = new StringContent("{}") } : Json(HttpStatusCode.Created, Item(bytes.Length));
+            }
+            if (request.Method == HttpMethod.Get && FailItemReads)
+            {
+                return new HttpResponseMessage(HttpStatusCode.InternalServerError) { Content = new StringContent("{}") };
+            }
+            return request.Method == HttpMethod.Delete ? new HttpResponseMessage(HttpStatusCode.NoContent) : Json(HttpStatusCode.OK, Item(Received.Length));
         }
 
+        int version = 1;
+
+        /// <summary>Content uploaded: the item's eTag and cTag change.</summary>
+        void NewVersion()
+        {
+            version++;
+            (ETag, CTag) = ($"\"{{AB12}},{version}\"", $"\"c:{{AB12}},{version}\"");
+        }
+
+        /// <summary>The item with what it holds, and its quickXorHash as Graph lists it.</summary>
         string Item(long size) =>
-            $$"""{"id":"item1","name":"big.bin","size":{{size}},"file":{},"eTag":{{Quote(ETag)}},"cTag":{{Quote(CTag)}}}""";
+            $$"""{"id":"item1","name":"big.bin","size":{{size}},"file":{"hashes":{"quickXorHash":{{Quote(QuickXorHash.Of(Received))}} } },"eTag":{{Quote(ETag)}},"cTag":{{Quote(CTag)}}}""";
 
         static string Quote(string text) => System.Text.Json.JsonSerializer.Serialize(text);
 
@@ -114,7 +157,7 @@ public sealed class DriveApiUploadTests : IDisposable
     }
 
     DriveApi Api(Server server) =>
-        new(new M365Client(new HttpClient(server), new Tokens()) { Clock = () => now, Delay = (_, _) => Task.CompletedTask });
+        new(new M365Client(new HttpClient(server), new Tokens()) { Clock = () => now, Monotonic = () => TimeSpan.FromTicks(now.UtcTicks), Delay = (_, _) => Task.CompletedTask });
 
     byte[] Write(int length)
     {
@@ -220,6 +263,93 @@ public sealed class DriveApiUploadTests : IDisposable
         Assert.Equal(data, server.Received);
         Assert.Equal(new long[] { 5 * MiB, 5 * MiB / 2, 5 * MiB / 4, 5 * MiB / 8 }, server.FragmentLengths.Take(4));
         Assert.All(server.FragmentLengths.SkipLast(1), length => Assert.Equal(0, length % UploadSession.FragmentUnit));
+    }
+
+    [Fact]
+    public async Task Fragments_grow_while_the_uplink_is_fast()
+    {
+        var data = Write(36 * MiB);
+        var server = new Server(this);
+
+        await Api(server).UploadAsync("drive1", UploadTarget.New("", "big.bin"), file, default);
+
+        Assert.Equal(data, server.Received);
+        Assert.Equal(new long[] { 5 * MiB, 5 * MiB, 5 * MiB, 5 * MiB, 10 * MiB, 6 * MiB }, server.FragmentLengths);
+        Assert.Equal(20 * MiB, UploadSession.NextFragmentSize(10 * MiB, TimeSpan.FromSeconds(1), 5));
+        Assert.Equal(UploadSession.MaxFragmentSize, UploadSession.NextFragmentSize(UploadSession.MaxFragmentSize, TimeSpan.Zero, 10));
+        Assert.True(UploadSession.MaxFragmentSize < 60 * MiB && UploadSession.MaxFragmentSize % UploadSession.FragmentUnit == 0);
+    }
+
+    [Fact]
+    public async Task The_lost_answer_to_the_last_fragment_finds_the_item_and_sends_nothing_again()
+    {
+        var data = Write(12 * MiB);
+        var server = new Server(this) { Fail = put => put == 3 ? (HttpStatusCode.BadGateway, true) : null };
+
+        var item = await Api(server).UploadAsync("drive1", Existing(server.ETag, server.CTag), file, default);
+
+        // The session ended with the upload (404 when asked); a new one with the old eTag would have ended in a conflict copy
+        Assert.Equal("item1", item.Id);
+        Assert.Equal(data, server.Received);
+        Assert.Equal(3, server.Puts);
+        Assert.Equal(1, server.Sessions);
+    }
+
+    [Fact]
+    public async Task A_simple_upload_that_went_through_without_an_answer_is_not_sent_again()
+    {
+        var data = Write(MiB);
+        var server = new Server(this) { FailContent = _ => (HttpStatusCode.GatewayTimeout, true) };
+
+        var item = await Api(server).UploadAsync("drive1", Existing(server.ETag, server.CTag), file, default);
+
+        Assert.Equal("item1", item.Id);
+        Assert.Equal(data, server.Received);
+        Assert.Equal(1, server.ContentPuts);
+    }
+
+    [Fact]
+    public async Task A_simple_upload_that_failed_on_the_way_is_not_taken_for_one_that_went_through()
+    {
+        Write(MiB);
+        var server = new Server(this) { FailContent = _ => (HttpStatusCode.GatewayTimeout, false) };
+
+        var failure = await Assert.ThrowsAsync<M365RequestException>(() => Api(server).UploadAsync("drive1", Existing(server.ETag, server.CTag), file, default));
+
+        Assert.Equal(HttpStatusCode.GatewayTimeout, failure.Status);
+    }
+
+    [Fact]
+    public async Task An_upload_whose_end_got_no_answer_and_cannot_be_looked_up_is_not_started_over()
+    {
+        Write(12 * MiB);
+        var server = new Server(this) { Fail = put => put >= 3 ? (HttpStatusCode.BadGateway, false) : null };
+        server.Stored = next => server.FailItemReads = next >= 10 * MiB;
+
+        await Assert.ThrowsAsync<UploadUnconfirmedException>(() => Api(server).UploadAsync("drive1", UploadTarget.New("", "big.bin"), file, default));
+
+        Assert.Equal(1, server.Sessions);
+    }
+
+    [Fact]
+    public async Task Deletes_name_the_version_they_delete()
+    {
+        var server = new Server(this);
+
+        await Api(server).DeleteAsync("drive1", "item1", "\"{AB12},1\"", default);
+
+        Assert.Contains(("DELETE", "/v1.0/drives/drive1/items/item1", "\"{AB12},1\""), server.Requests);
+    }
+
+    [Fact]
+    public async Task A_new_file_goes_into_its_folder_by_the_folder_s_id()
+    {
+        Write(1000);
+        var server = new Server(this);
+
+        await Api(server).UploadAsync("drive1", UploadTarget.New("docs", "a b.txt") with { ParentId = "folder1" }, file, default);
+
+        Assert.Contains(server.Requests, r => r is { Method: "PUT", Path: "/v1.0/drives/drive1/items/folder1:/a%20b.txt:/content" });
     }
 
     public void Dispose()

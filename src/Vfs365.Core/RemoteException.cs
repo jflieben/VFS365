@@ -10,4 +10,7 @@ public enum RemoteError { NotFound, AccessDenied, Throttled, Locked, Conflict, U
 public class RemoteException(RemoteError error, string message) : Exception(message)
 {
     public RemoteError Error { get; } = error;
+
+    /// <summary>For a Conflict: the item as it is now, when it was read.</summary>
+    public Drive.DriveItemInfo? Current { get; init; }
 }

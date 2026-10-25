@@ -24,6 +24,63 @@ internal sealed class FileContent(string path) : IContentSource
     public void Dispose() => file.Dispose();
 }
 
+/// <summary>No content: an empty file the cache couldn't keep.</summary>
+internal sealed class EmptyContent : IContentSource
+{
+    public static readonly EmptyContent Instance = new();
+
+    public long Length => 0;
+
+    public ValueTask<int> ReadAsync(long offset, Memory<byte> buffer, CancellationToken ct) => ValueTask.FromResult(0);
+
+    public void Dispose()
+    {
+    }
+}
+
+internal static class CacheFileHandle
+{
+    const uint GenericRead = 0x80000000, FileWriteAttributes = 0x100;
+
+    /// <summary>
+    /// Opens a complete cache file for reading. With <paramref name="touch"/> its last access time becomes that, on Windows through a
+    /// handle that may also write attributes (no second open by path).
+    /// </summary>
+    public static SafeFileHandle OpenRead(string path, DateTime? touch)
+    {
+        if (touch is { } at && OperatingSystem.IsWindows())
+        {
+            var handle = CreateFileW(path, GenericRead | FileWriteAttributes, FileShare.ReadWrite | FileShare.Delete, IntPtr.Zero, FileMode.Open, 0, IntPtr.Zero);
+            if (!handle.IsInvalid)
+            {
+                Touch(() => File.SetLastAccessTimeUtc(handle, at));
+                return handle;
+            }
+            handle.Dispose(); // opened the usual way below, which throws what fits (gone, access denied)
+        }
+        var file = File.OpenHandle(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+        if (touch is { } then && !OperatingSystem.IsWindows())
+        {
+            Touch(() => File.SetLastAccessTimeUtc(path, then));
+        }
+        return file;
+    }
+
+    static void Touch(Action set)
+    {
+        try
+        {
+            set();
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+        {
+        }
+    }
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true, ExactSpelling = true)]
+    static extern SafeFileHandle CreateFileW(string name, uint access, FileShare share, IntPtr security, FileMode mode, uint flags, IntPtr template);
+}
+
 internal static class SparseFile
 {
     /// <summary>Unwritten ranges take no disk space and writing far into the file needs no zero-filling.</summary>

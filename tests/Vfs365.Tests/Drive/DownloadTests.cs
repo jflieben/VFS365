@@ -135,6 +135,28 @@ public sealed class DownloadTests : IDisposable
     }
 
     [Fact]
+    public async Task A_file_opened_again_soon_after_continues_its_download()
+    {
+        // The thumbnailer, the property handler and the player each open a video and read its start
+        const int MiB = 1024 * 1024;
+        var data = Data(20 * MiB);
+        api.Add("clip.mp4", data);
+        var file = (await engine.GetEntryAsync("\\OneDrive\\clip.mp4", default))!;
+
+        for (var open = 0; open < 3; open++)
+        {
+            using var source = await engine.OpenContentAsync(file, default);
+            var page = new byte[4096];
+            await source.ReadAsync(0, page, default);
+            await source.ReadAsync(MiB, page, default);
+            Assert.Equal(data.AsSpan(MiB, 4096).ToArray(), page);
+        }
+
+        Assert.Equal(1, api.Downloads);
+        Assert.True(api.BytesStreamed <= 4 * MiB, $"pulled {api.BytesStreamed / (double)MiB:0.0} MiB");
+    }
+
+    [Fact]
     public async Task After_a_restart_a_cached_file_has_the_length_it_was_served_with()
     {
         // SharePoint writes properties into Office files as it serves them: the served length isn't the listed size

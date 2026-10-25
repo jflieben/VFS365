@@ -22,6 +22,7 @@ public sealed record TrayActions(string HelpUrl)
     public Action? SignIn { get; init; }
     public Func<bool>? SignInNeeded { get; init; }
     public Action? SessionEnded { get; init; }
+    public Action? CollectDiagnostics { get; init; }
 }
 
 /// <summary>
@@ -37,7 +38,7 @@ sealed class Tray : IDisposable
     const uint NinSelect = 0x0400, NinKeySelect = 0x0401, NinBalloonUserClick = 0x0405, WmLButtonDblClk = 0x0203;
     const uint NimAdd = 0, NimModify = 1, NimDelete = 2, NimSetVersion = 4, NifMessage = 1, NifIcon = 2, NifTip = 4, NifInfo = 0x10, NifShowTip = 0x80;
     const uint NiifUser = 4, NiifLargeIcon = 0x20, MfString = 0, MfGrayed = 1, MfSeparator = 0x800, TpmReturnCmd = 0x100, TpmRightButton = 2;
-    const int ShowFiles = 1, ShowLog = 2, Restart = 3, Help = 4, Website = 5, Refresh = 6, SignIn = 7, Retry = 8;
+    const int ShowFiles = 1, ShowLog = 2, Restart = 3, Help = 4, Website = 5, Refresh = 6, SignIn = 7, Retry = 8, Diagnostics = 9;
     public const string JSolveUrl = "https://jsolve.nl";
 
     readonly string label;
@@ -72,7 +73,13 @@ sealed class Tray : IDisposable
         ready.Wait(TimeSpan.FromSeconds(5));
     }
 
-    /// <summary>The status (for example "up to date"): the icon's tooltip says "VFS365: up to date", the menu "Status: up to date"; and the badge.</summary>
+    /// <summary>The tray's own window, as the owner of a sign-in window; zero when the tray didn't start.</summary>
+    public IntPtr Handle => window;
+
+    /// <summary>
+    /// The status (for example "up to date"): the icon's tooltip says "VFS365: up to date", the menu "Status: up to date"; and the badge.
+    /// This and the other calls only post to the tray's thread, which talks to Explorer: a busy Explorer never holds up the caller.
+    /// </summary>
     public void SetStatus(string text, TrayState newState)
     {
         if (text == status && newState == state)
@@ -83,10 +90,9 @@ sealed class Tray : IDisposable
         if (newState != state)
         {
             state = newState;
-            PostMessage(window, ReloadIconMessage, IntPtr.Zero, IntPtr.Zero);
+            Post(ReloadIconMessage);
         }
-        var data = Data(NifTip | NifShowTip);
-        Shell_NotifyIcon(NimModify, ref data);
+        Post(UpdateTipMessage);
     }
 
     /// <summary>What the menu offers from now on (a start that waits offers Retry, a mounted drive Show files and Refresh).</summary>
@@ -102,13 +108,24 @@ sealed class Tray : IDisposable
     /// </summary>
     public void Notify(string title, string text, Action? clicked = null)
     {
-        notificationClicked = clicked ?? (actions.SignInNeeded?.Invoke() == true ? notificationClicked : null);
-        var data = Data(NifInfo);
-        data.szInfoTitle = Trim(title, 63);
-        data.szInfo = Trim(text, 255);
-        data.dwInfoFlags = NiifUser | NiifLargeIcon;
-        data.hBalloonIcon = balloonIcon;
-        Shell_NotifyIcon(NimModify, ref data);
+        toasts.Enqueue((title, text, clicked));
+        Post(NotifyMessage);
+    }
+
+    readonly System.Collections.Concurrent.ConcurrentQueue<(string Title, string Text, Action? Clicked)> toasts = new();
+
+    void ShowToasts()
+    {
+        while (toasts.TryDequeue(out var toast))
+        {
+            notificationClicked = toast.Clicked ?? (actions.SignInNeeded?.Invoke() == true ? notificationClicked : null);
+            var data = Data(NifInfo);
+            data.szInfoTitle = Trim(toast.Title, 63);
+            data.szInfo = Trim(toast.Text, 255);
+            data.dwInfoFlags = NiifUser | NiifLargeIcon;
+            data.hBalloonIcon = balloonIcon;
+            Shell_NotifyIcon(NimModify, ref data);
+        }
     }
 
     /// <summary>
@@ -122,12 +139,24 @@ sealed class Tray : IDisposable
             return;
         }
         blockReason = reason;
-        PostMessage(window, BlockShutdownMessage, IntPtr.Zero, IntPtr.Zero);
+        Post(BlockShutdownMessage);
     }
 
     volatile string? blockReason;
 
-    const uint ReloadIconMessage = 0x0400 + 2, BlockShutdownMessage = 0x0400 + 3, WmMenuSelect = 0x011F, WmExitMenuLoop = 0x0212;
+    /// <summary>Set while the tray's thread waits in WM_ENDSESSION for the drive to stop: Dispose then doesn't wait for that thread.</summary>
+    volatile bool endingSession;
+
+    void Post(uint message)
+    {
+        if (window != IntPtr.Zero)
+        {
+            PostMessage(window, message, IntPtr.Zero, IntPtr.Zero);
+        }
+    }
+
+    const uint ReloadIconMessage = 0x0400 + 2, BlockShutdownMessage = 0x0400 + 3, UpdateTipMessage = 0x0400 + 4, NotifyMessage = 0x0400 + 5;
+    const uint WmMenuSelect = 0x011F, WmExitMenuLoop = 0x0212;
 
     void Run()
     {
@@ -242,6 +271,17 @@ sealed class Tray : IDisposable
                 LoadIcon();
                 return IntPtr.Zero;
             }
+            if (message == UpdateTipMessage)
+            {
+                var data = Data(NifTip | NifShowTip);
+                Shell_NotifyIcon(NimModify, ref data);
+                return IntPtr.Zero;
+            }
+            if (message == NotifyMessage)
+            {
+                ShowToasts();
+                return IntPtr.Zero;
+            }
             if (message == BlockShutdownMessage)
             {
                 if (blockReason is { } reason)
@@ -257,6 +297,7 @@ sealed class Tray : IDisposable
             if (message == WmEndSession && wParam != IntPtr.Zero)
             {
                 // The session ends (not a cancelled shutdown): this window waits with the block reason while pending changes upload
+                endingSession = true;
                 actions.SessionEnded?.Invoke();
                 return IntPtr.Zero;
             }
@@ -347,6 +388,10 @@ sealed class Tray : IDisposable
             Item(MfString, ShowFiles, UiText.Get("Menu.ShowFiles"));
         }
         Item(MfString, ShowLog, UiText.Get("Menu.ShowLog"));
+        if (current.CollectDiagnostics is not null)
+        {
+            Item(MfString, Diagnostics, UiText.Get("Menu.Diagnostics"));
+        }
         refreshPosition = -1;
         if (current.Refresh is not null)
         {
@@ -379,6 +424,9 @@ sealed class Tray : IDisposable
                 break;
             case ShowLog:
                 Start("notepad.exe", $"\"{AgentLog.FilePath}\"");
+                break;
+            case Diagnostics:
+                current.CollectDiagnostics?.Invoke();
                 break;
             case Refresh:
                 current.Refresh?.Invoke();
@@ -543,7 +591,10 @@ sealed class Tray : IDisposable
         if (window != IntPtr.Zero)
         {
             PostMessage(window, WmClose, IntPtr.Zero, IntPtr.Zero);
-            thread.Join(TimeSpan.FromSeconds(2));
+            if (!endingSession)
+            {
+                thread.Join(TimeSpan.FromSeconds(2)); // at logoff that thread waits for the stop itself: no time spent waiting for it
+            }
         }
         foreach (var handle in new[] { icon, balloonIcon })
         {

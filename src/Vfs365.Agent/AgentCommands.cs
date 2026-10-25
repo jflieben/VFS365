@@ -37,6 +37,12 @@ public static class AgentCommands
           vfs365 signout                                  stop the drive in this session and remove its local data: cached content,
                                                           folder listings and discovery state (unsaved changes stay); the next start
                                                           signs in again with the Windows account
+          vfs365 why <link or name> [--check]             why a site or library shows on the drive or not (--check tests access and
+                                                          search with a few calls)
+          vfs365 health [--json] [--all-users]            exit 0 when the drive works, 1 with the reasons (--all-users: every signed-in
+                                                          session, as SYSTEM or administrator)
+          vfs365 support-bundle [--out <folder>]          one zip for the helpdesk (logs, settings, discovery, drive state), tokens and
+                                                          secrets removed; nothing is uploaded
           vfs365 machine-setup [--dry-run]                put the VFS365 network provider in Windows' provider order
           vfs365 machine-stop [--cleanup] [--dry-run]     stop every user's agent; --cleanup also removes their cached data,
                                                           Explorer entries and the provider order entry (the installer runs both
@@ -80,7 +86,8 @@ public static class AgentCommands
         bool Flag(string name) => args.Contains(name, StringComparer.OrdinalIgnoreCase);
 
         var command = args.FirstOrDefault()?.ToLowerInvariant();
-        if (command is not ("settings" or "whoami" or "discover" or "mount" or "unmount" or "inspect" or "put" or "watch" or "pin" or "unpin" or "pins" or "signout" or "machine-setup" or "machine-stop" or "machine-start" or "machine-report" or "about"))
+        if (command is not ("settings" or "whoami" or "discover" or "mount" or "unmount" or "inspect" or "put" or "watch" or "pin" or "unpin" or "pins" or "signout" or "machine-setup" or "machine-stop" or "machine-start" or "machine-report" or "about"
+            or "why" or "health" or "support-bundle"))
         {
             error.WriteLine(Usage);
             return 2;
@@ -142,10 +149,13 @@ public static class AgentCommands
             MachineCleanup.StopAgents(TimeSpan.FromSeconds(60), dryRun, Say);
             if (Flag("--cleanup"))
             {
-                // Machine-wide steps first: a profile that can't be cleaned must not leave them behind
+                // Machine-wide steps first: a profile that can't be cleaned must not leave them behind. Folders still in VFS365 go
+                // back before the data goes, which holds where they came from.
                 MachineCleanup.RemoveExplorerEntries(dryRun, Say);
                 NetworkProviderOrder.Remove(dryRun, Say);
-                MachineCleanup.RemoveUserData(MachineCleanup.ProfileDataFolders(), dryRun, Say);
+                var profiles = MachineCleanup.ProfileDataFolders().ToList();
+                MachineCleanup.RestoreKnownFolders(profiles, dryRun, Say);
+                MachineCleanup.RemoveUserData(profiles, dryRun, Say);
             }
             return 0;
         }
@@ -184,6 +194,11 @@ public static class AgentCommands
             return 0;
         }
 
+        if (command is "why" or "health" or "support-bundle")
+        {
+            return await SupportCommands.RunAsync(command, args, Say, error);
+        }
+
         string? clientId = null;
         Monitoring? monitoring = null;
         try
@@ -194,17 +209,10 @@ public static class AgentCommands
 
             if (command == "settings")
             {
-                Say($"{"Tenant",-21} {tenant.Tenant} ({tenant.Source})");
-                foreach (var (name, value, source) in settings.Effective())
+                foreach (var line in SettingsReport.Lines(settings, tenant, UserPins.Load()))
                 {
-                    Say($"{name,-21} {value} ({source})");
+                    Say(line);
                 }
-                foreach (var adjusted in settings.Adjusted())
-                {
-                    Say($"{"Warning",-21} {adjusted}");
-                }
-                var userPins = UserPins.Load();
-                Say($"{"User pins",-21} {(userPins.Count == 0 ? "none" : string.Join("; ", userPins))} (vfs365 pin)");
                 return 0;
             }
 
@@ -253,7 +261,7 @@ public static class AgentCommands
                     "The next start signs in again with the Windows account.");
                 return 0;
             }
-            using var http = new HttpClient { Timeout = Timeout.InfiniteTimeSpan }; // M365Client sets the deadlines
+            using var http = new HttpClient(M365Client.CreateHandler()) { Timeout = Timeout.InfiniteTimeSpan }; // M365Client sets the deadlines
             var client = new M365Client(http, tokens, settings.ApiBudgetPerMinute > 0 ? new RequestBudget(settings.ApiBudgetPerMinute) : null)
             {
                 ThrottlePause = TimeSpan.FromMinutes(settings.ThrottlePauseMinutes),
@@ -312,20 +320,7 @@ public static class AgentCommands
                 return await PutAsync(settings, api, client, args[1], args[2], Say);
             }
 
-            var discoveryOptions = new DiscoveryOptions
-            {
-                PinnedLocations = [.. settings.PinnedLocations, .. UserPins.Load()],
-                IncludedSiteTemplates = settings.IncludedSiteTemplates,
-                ExcludedSiteTemplates = settings.ExcludedSiteTemplates,
-            };
-            if (settings.IncludedSites is { } included)
-            {
-                discoveryOptions = discoveryOptions with { IncludedSites = included };
-            }
-            if (settings.ExcludedSites is { } excluded)
-            {
-                discoveryOptions = discoveryOptions with { ExcludedSites = excluded };
-            }
+            var discoveryOptions = DiscoveryOptionsOf(settings);
 
             if (command == "mount")
             {
@@ -359,6 +354,7 @@ public static class AgentCommands
                 }
             }
             DiscoveryStore.Save(DiscoverySchedule.Keep(result, previous) with { Libraries = libraries, TenantHint = tenant.Tenant });
+            DiscoveryReport.Record(result, previous);
 
             if (Flag("--json"))
             {
@@ -428,6 +424,26 @@ public static class AgentCommands
         }
     }
 
+    /// <summary>Discovery's options from the settings: site patterns and templates from policy, pins from policy and the user.</summary>
+    internal static DiscoveryOptions DiscoveryOptionsOf(AgentSettings settings)
+    {
+        var options = new DiscoveryOptions
+        {
+            PinnedLocations = [.. settings.PinnedLocations, .. UserPins.Load()],
+            IncludedSiteTemplates = settings.IncludedSiteTemplates,
+            ExcludedSiteTemplates = settings.ExcludedSiteTemplates,
+        };
+        if (settings.IncludedSites is { } included)
+        {
+            options = options with { IncludedSites = included };
+        }
+        if (settings.ExcludedSites is { } excluded)
+        {
+            options = options with { ExcludedSites = excluded };
+        }
+        return options;
+    }
+
     /// <summary>
     /// \VFS365\&lt;Windows user name&gt;. UNC prefixes are machine-wide, so each user on a multi-session host needs their own;
     /// characters not allowed in a share name become '_'.
@@ -473,6 +489,7 @@ public static class AgentCommands
         }
         MetadataStore.Delete();
         File.Delete(DiscoveryStore.FilePath);
+        File.Delete(DiscoveryReport.FilePath);
         File.Delete(CacheKey.FilePath);
     }
 
@@ -585,6 +602,7 @@ public static class AgentCommands
         }
         var networkUp = NetworkInterface.GetIsNetworkAvailable();
         var networkFailedAt = DateTimeOffset.MinValue;
+        StatusFile? status = null; // status.json for 'vfs365 health', once this agent owns the session
         // Throttled responses, grouped into episodes for the log and monitoring (who, when, how much)
         var throttling = new ThrottleEpisodes();
         client.Throttled = throttling.Add;
@@ -594,9 +612,11 @@ public static class AgentCommands
             {
                 say($"Throttled:  {episode.Describe()}");
                 monitoring?.Throttling(episode);
+                AgentEvents.Write(AgentEvent.Throttled, episode.Describe());
             }
         }
         DriveEngine? restoredEngine = null; // set once mounted: change feeds that failed meanwhile are read again soon
+        Action? layoutSoon = null; // set once mounted: folder redirection and drive letters again (network back, a first sign-in)
         void NetworkChanged(object? sender, NetworkAvailabilityEventArgs e)
         {
             networkUp = e.IsAvailable;
@@ -605,30 +625,110 @@ public static class AgentCommands
             {
                 networkFailedAt = DateTimeOffset.MinValue;
                 restoredEngine?.NetworkRestored();
+                layoutSoon?.Invoke(); // targets in libraries that couldn't be read offline
                 WakeUp();
             }
         }
+        var prefix = UncPrefix(Environment.UserName);
+        var unc = $@"\{prefix}";
+        var restarting = false; // a new agent takes over: redirected folders stay where they are
+        var ownsSession = false; // this agent created the session's stop event (not a second start that ends at once)
+        var layoutRestored = false;
+        FolderRedirection? redirection = null;
+        SessionDriveLetters? letters = null;
+        using var layoutCancel = new CancellationTokenSource(); // layout work (folders, letters, moving content) stops at unmount
+
+        // Redirected folders back (unless a new agent takes them over) and the letters for folders gone, each on its own; also after a
+        // stop before the mount, for what a crashed run left. Never throws.
+        void RestoreLayout(bool restoreFolders, string? driveLetter)
+        {
+            layoutRestored = true;
+            if (restoreFolders)
+            {
+                try
+                {
+                    redirection ??= new FolderRedirection(new ShellKnownFolders(), Path.Combine(DiscoveryStore.DataDirectory, FolderRedirection.StateFileName),
+                        path => VolumePaths.OnVolume(path, unc, null));
+                    var (back, failed) = redirection.RestoreAll();
+                    foreach (var line in back)
+                    {
+                        say($"Redirected: {line}");
+                    }
+                    foreach (var line in failed)
+                    {
+                        say($"Warning:    {line}");
+                        monitoring?.Error("redirection", line);
+                        AgentEvents.Write(AgentEvent.RedirectionProblem, line);
+                    }
+                }
+                catch (Exception e) when (e is not OutOfMemoryException)
+                {
+                    say($"Warning:    could not put redirected folders back: {e.Message}");
+                }
+            }
+            try
+            {
+                letters ??= new SessionDriveLetters(unc);
+                foreach (var left in letters.RemoveLeftovers([], driveLetter))
+                {
+                    say($"Drive:      {left} removed, left by an earlier run");
+                }
+                foreach (var problem in letters.RemoveAll())
+                {
+                    say($"Warning:    could not remove drive letter {problem}");
+                }
+            }
+            catch (Exception e) when (e is not OutOfMemoryException)
+            {
+                say($"Warning:    could not remove drive letters: {e.Message}");
+            }
+        }
+
         NetworkChange.NetworkAvailabilityChanged += NetworkChanged;
         try
         {
             var letter = DriveLetterOption.Parse(driveOption ?? settings.DriveLetter);
-            var prefix = UncPrefix(Environment.UserName);
-            var unc = $@"\{prefix}";
 
             var signInNotice = DateTimeOffset.MinValue;
             void SignInFromTray() => _ = Task.Run(async () =>
             {
-                if (await tokens.SignInAsync(userAsked: true, default))
+                try
                 {
-                    say("Sign-in:    done from the tray");
-                    WakeUp();
+                    if (await tokens.SignInAsync(userAsked: true, default))
+                    {
+                        say("Sign-in:    done from the tray");
+                        WakeUp();
+                    }
+                    else
+                    {
+                        say("Sign-in:    from the tray not done (cancelled, failed as logged, or a sign-in window was open already)");
+                    }
+                }
+                catch (Exception e) when (e is not OutOfMemoryException)
+                {
+                    say($"Sign-in:    from the tray failed: {e.Message}");
                 }
             });
-            tokens.SignedIn = result => say($"Signed in:  {result.Username} (tenant {result.TenantId})");
+            Action? accountSwitchedNow = null; // set once mounted
+            var accountSwitched = false;
+            tokens.SignedIn = result =>
+            {
+                say($"Signed in:  {result.Username} (tenant {result.TenantId})");
+                layoutSoon?.Invoke(); // %UPN% in targets: a start without a token couldn't resolve them
+            };
+            tokens.AccountSwitched = (from, to) =>
+            {
+                say($"Sign-in:    {to.Username} signed in instead of {from.Username}; the tokens of {from.Username} are forgotten");
+                accountSwitched = true;
+                accountSwitchedNow?.Invoke();
+            };
+            tokens.OwnerWindow = () => tray?.Handle ?? IntPtr.Zero;
             tokens.SignInFailed = e =>
             {
                 say($"Sign-in:    needed, {SignInText.Of(e, CultureInfo.InvariantCulture)} ({e.Code}: {e.Message.Split('\n')[0].Trim()})");
                 monitoring?.Error("sign-in", e.Message);
+                AgentEvents.Write(AgentEvent.SignInNeeded, $"Sign-in needed: {SignInText.Of(e, CultureInfo.InvariantCulture)} ({e.Code}: {e.Message.Split('\n')[0].Trim()})");
+                status?.Update(s => s with { SignInProblem = e.Code });
                 if (tray is { } shown && DateTimeOffset.UtcNow - signInNotice > TimeSpan.FromMinutes(10))
                 {
                     signInNotice = DateTimeOffset.UtcNow;
@@ -641,6 +741,7 @@ public static class AgentCommands
                 SignIn = SignInFromTray,
                 SignInNeeded = () => tokens.SignInProblem,
                 SessionEnded = StopForSessionEnd,
+                CollectDiagnostics = () => SupportBundle.CollectFromTray(configPath, say, (title, text) => tray?.Notify(title, text)),
             };
             if (showTray)
             {
@@ -658,6 +759,7 @@ public static class AgentCommands
                 stop = AgentControl.CreateStopEvent(out var createdNew);
                 if (createdNew)
                 {
+                    ownsSession = true;
                     break;
                 }
                 stop.Dispose();
@@ -669,6 +771,8 @@ public static class AgentCommands
                 await Task.Delay(1000);
             }
             using var stopEvent = stop;
+            var agentStatus = status = new StatusFile(StatusFile.DefaultPath, AgentStatus.ForThisProcess(DateTimeOffset.UtcNow));
+            log = agentStatus.Tap(log); // "error: " lines become the status's last error
             Console.CancelKeyPress += (_, e) =>
             {
                 e.Cancel = true;
@@ -705,6 +809,7 @@ public static class AgentCommands
                     if (problem.Wait == StartWait.Retry)
                     {
                         monitoring?.Error("start", e.Message);
+                        AgentEvents.Write(AgentEvent.NotStarted, $"VFS365 didn't start, {what}: {englishReason} ({e.Message.Split('\n')[0].Trim()}); it tries again in an hour or at Retry in the tray");
                         tray?.Notify(UiText.Get("Failed.Title"), UiText.Get("Failed.Text", Sentence(reason)));
                     }
                 }
@@ -712,6 +817,12 @@ public static class AgentCommands
                 {
                     log($"start: {what} failed again: {e.Message}");
                 }
+                status?.Update(s => s with
+                {
+                    State = problem.Wait == StartWait.Retry ? AgentStatus.NotStarted : AgentStatus.Waiting,
+                    Problem = $"{what}: {englishReason}",
+                    SignInProblem = tokens.SignInProblem ? s.SignInProblem : null,
+                });
                 tray?.SetStatus(problem.Wait switch
                 {
                     StartWait.Network => UiText.Get("Status.WaitingNetwork"),
@@ -744,6 +855,7 @@ public static class AgentCommands
                         cache.Clear();
                         MetadataStore.Delete();
                         File.Delete(DiscoveryStore.FilePath);
+                        File.Delete(DiscoveryReport.FilePath);
                         say("Wiped:      cached content and folder listings (the device is no longer managed)");
                         wipe = false;
                         saved = null;
@@ -765,6 +877,8 @@ public static class AgentCommands
                     }
                 }
             }
+            // The last run's folder listings are read and decrypted meanwhile (about a second for a large one), imported before the mount
+            var snapshots = usable ? Task.Run(() => MetadataStore.Load(key)) : null;
             MyDrive oneDrive;
             MyDrive? justRead = null; // this start's /me/drive answer, which the first discovery then needn't ask for again
             if (usable)
@@ -825,6 +939,10 @@ public static class AgentCommands
                         {
                             networkFailedAt = DateTimeOffset.UtcNow;
                         }
+                        if (notice.Kind is NoticeKind.UploadWaiting or NoticeKind.UploadDone)
+                        {
+                            status?.FileWaiting(notice.Path ?? notice.Name, notice.Kind == NoticeKind.UploadWaiting ? notice.Detail ?? "unknown cause" : null);
+                        }
                         if (showTray)
                         {
                             notices.Add(notice, PlainCause.Of(notice.Detail, !networkUp, tokens.SignInProblem), DateTimeOffset.UtcNow);
@@ -833,22 +951,21 @@ public static class AgentCommands
                         {
                             monitoring?.Error("conflict copy", $"{notice.Path ?? notice.Name} was changed or locked in Microsoft 365; saved as {notice.Detail}",
                                 notice.Path, notice.Name, notice.Detail);
+                            AgentEvents.Write(AgentEvent.ConflictCopy, $"{notice.Path ?? notice.Name} was changed or locked in Microsoft 365; the user's version is saved as {notice.Detail}");
                         }
                         else if (notice.Kind == NoticeKind.UploadWaiting)
                         {
                             monitoring?.Error("upload", $"{notice.Path ?? notice.Name}: {notice.Detail}", notice.Path, notice.Name);
+                            AgentEvents.Write(AgentEvent.UploadWaiting, $"{notice.Path ?? notice.Name} is waiting to upload, kept on this PC: {notice.Detail}");
                         }
                         else if (notice.Kind == NoticeKind.NotDeleted)
                         {
                             monitoring?.Error("delete", $"{notice.Path ?? notice.Name} could not be deleted: {notice.Detail}", notice.Path, notice.Name);
+                            AgentEvents.Write(AgentEvent.DeleteRefused, $"{notice.Path ?? notice.Name} could not be deleted in Microsoft 365 and is back: {notice.Detail}");
                         }
                     },
                 });
             restoredEngine = engine;
-            if (usable)
-            {
-                engine.ImportSnapshots(MetadataStore.Load(key));
-            }
 
             say(AgentControl.Publisher);
             say(AgentControl.Banner);
@@ -862,13 +979,33 @@ public static class AgentCommands
             foreach (var adjusted in settings.Adjusted())
             {
                 say($"Warning:    {adjusted}");
+                AgentEvents.Write(AgentEvent.SettingWarning, adjusted);
             }
             _ = MonitoringTarget.Parse(settings.MonitoringUrl, out var monitoringProblem);
             say(monitoring?.Started ?? (monitoringProblem is null ? Monitoring.OffHint : $"Monitoring: off, {monitoringProblem}"));
+            if (monitoringProblem is not null)
+            {
+                AgentEvents.Write(AgentEvent.SettingWarning, $"Monitoring: off, {monitoringProblem}");
+            }
             var recovered = engine.Recover();
             if (recovered > 0)
             {
                 say($"Recovered:  {recovered} unsaved file(s) from an earlier run, uploading");
+                AgentEvents.Write(AgentEvent.Recovered, $"{recovered} unsaved file(s) from an earlier run are being uploaded");
+            }
+            if (snapshots is not null)
+            {
+                engine.ImportSnapshots(await snapshots);
+            }
+            var savedVersion = engine.MetadataVersion; // folder listings are saved again only once they changed
+
+            // Letters for folders (policy DriveMappings) are known before the mount, so DriveLetter * doesn't take one of them
+            var layoutProblems = new List<string>();
+            var redirectRules = RedirectRule.Parse(settings.FolderRedirection, layoutProblems);
+            var mappings = DriveMapping.Parse(settings.DriveMappings, letter.KeepLetter ? letter.MountPoint : null, layoutProblems);
+            if (letter is { KeepLetter: true, MountPoint: null } && mappings.Count > 0)
+            {
+                letter = letter with { MountPoint = DriveMapping.FreeLetter(mappings, l => DosDevices.Target(l) is not null) };
             }
 
             // File system errors ("error: ..." lines) also go to monitoring
@@ -885,6 +1022,7 @@ public static class AgentCommands
             {
                 say($"Warning:    {problem}; the drive is mounted without a letter, at {unc}{(navigationPane ? " and in the navigation pane" : "")}");
                 monitoring?.Error("drive letter", problem);
+                AgentEvents.Write(AgentEvent.DriveLetterProblem, $"{problem}; the drive is mounted without a letter, at {unc}");
                 tray?.Notify(UiText.Get("Letter.Title"), UiText.Get(navigationPane ? "Letter.Text" : "Letter.TextNoPane", shown, unc));
             }
             // The letter from policy; when it is taken (or not valid) the drive still mounts, by UNC path and in the navigation pane. A held
@@ -929,6 +1067,8 @@ public static class AgentCommands
                         lastProblem = message;
                         say($"Security:   {message} The drive is not started; Retry in the tray tries again.");
                         monitoring?.Error("security", message);
+                        AgentEvents.Write(AgentEvent.UncPathTaken, $"{message} The drive is not started.");
+                        status?.Update(s => s with { State = AgentStatus.NotStarted, Problem = $"{unc} is held by another account" });
                         tray?.Notify(UiText.Get("Security.Title"), sameName is null ? UiText.Get("Security.Text", unc) : UiText.Get("Security.SameName", unc, sameName));
                     }
                     tray?.SetStatus(UiText.Get("Status.Taken", unc), TrayState.Error);
@@ -990,12 +1130,12 @@ public static class AgentCommands
                 }
             }
 
-            // A new agent with the same arguments waits for this one to upload what is pending and unmount, then mounts
-            var restarting = false;
-            void RestartAgent(string why)
+            // A new agent with the same arguments waits for this one to upload what is pending and unmount, then mounts. False when it
+            // couldn't be started: this one goes on.
+            bool RestartAgent(string why)
             {
                 say($"Restarting: {why}");
-                restarting = true; // redirected folders stay where they are: the new agent takes them over
+                AgentEvents.Write(AgentEvent.Restarting, $"VFS365 restarts {why}");
                 // Without --child (and the last crash's --restarted) the new process is a supervisor of its own; this one's ends with it
                 var arguments = Environment.GetCommandLineArgs().Skip(1)
                     .Where(a => !a.Equals(AgentSupervisor.ChildFlag, StringComparison.OrdinalIgnoreCase)).ToList();
@@ -1011,74 +1151,107 @@ public static class AgentCommands
                 {
                     start.ArgumentList.Add(argument);
                 }
-                Process.Start(start)?.Dispose();
+                try
+                {
+                    Process.Start(start)?.Dispose();
+                }
+                catch (Exception e) when (e is System.ComponentModel.Win32Exception or InvalidOperationException or IOException)
+                {
+                    say($"Warning:    the new agent could not be started ({e.Message}); this one goes on");
+                    return false;
+                }
+                restarting = true; // only now: redirected folders stay where they are for the new agent to take over
                 stop.Set();
+                return true;
             }
 
             // Folder redirection and drive letters for folders (policies FolderRedirection, DriveMappings): after the mount, after each
-            // discovery (targets in libraries known only then), hourly and after resume (a letter taken, a folder moved back). One run at a time.
-            var layoutProblems = new List<string>();
-            var redirectRules = RedirectRule.Parse(settings.FolderRedirection, layoutProblems);
-            var mappings = DriveMapping.Parse(settings.DriveMappings, letter.KeepLetter ? letter.MountPoint : null, layoutProblems);
+            // discovery (targets in libraries known only then), hourly, after resume and when the network returns (a letter taken, a
+            // folder moved back), and at the first sign-in. One run at a time; one asked for meanwhile runs after it. Moving content
+            // (|move) runs on its own afterwards, so it never holds up the next run. All of it stops at unmount.
             foreach (var problem in layoutProblems)
             {
                 say($"Warning:    {problem}");
+                AgentEvents.Write(AgentEvent.SettingWarning, problem);
             }
-            var redirection = new FolderRedirection(new ShellKnownFolders(), Path.Combine(DiscoveryStore.DataDirectory, "redirection.json"),
+            redirection = new FolderRedirection(new ShellKnownFolders(), Path.Combine(DiscoveryStore.DataDirectory, FolderRedirection.StateFileName),
                 path => VolumePaths.OnVolume(path, unc, drive?.DriveLetter));
-            var letters = new SessionDriveLetters();
-            var layoutGate = new SemaphoreSlim(1, 1);
+            var driveLetters = letters = new SessionDriveLetters(unc);
+            var folderRedirection = redirection;
+            var leftoversChecked = false;
+            var moving = 0; // content moving (StartMoves) runs
             var layoutReported = new HashSet<string>(StringComparer.Ordinal);
             void LayoutProblem(string problem)
             {
-                if (layoutReported.Add(problem))
+                lock (layoutReported)
                 {
-                    say($"Warning:    {problem}");
-                    monitoring?.Error("redirection", problem);
+                    if (!layoutReported.Add(problem))
+                    {
+                        return;
+                    }
                 }
+                say($"Warning:    {problem}");
+                monitoring?.Error("redirection", problem);
+                AgentEvents.Write(AgentEvent.RedirectionProblem, problem);
             }
-            async Task ApplyLayoutAsync()
+            var layout = new SingleRun(async ct =>
             {
-                if (redirectRules.Count == 0 && mappings.Count == 0 || drive is not { } mounted || !await layoutGate.WaitAsync(0))
-                {
-                    return;
-                }
-                try
+                if (drive is { } mounted)
                 {
                     RequestPriority.MarkBackground();
-                    // The signed-in account names folders too (%UPN%, %UPNNAME%); a warm start has no token yet
-                    if (tokens.LastResult is null && redirectRules.Select(r => r.Target).Concat(mappings.Select(m => m.Target)).Any(t => t.Contains("%UPN", StringComparison.OrdinalIgnoreCase)))
+                    await ApplyLayoutOnceAsync(mounted, ct);
+                    StartMoves();
+                }
+            }, e => LayoutProblem($"folder redirection and drive mappings: {e.Message}"));
+            Task ApplyLayoutAsync() => redirectRules.Count == 0 && mappings.Count == 0 ? Task.CompletedTask : layout.RunAsync(layoutCancel.Token);
+            async Task ApplyLayoutOnceAsync(DriveHost mounted, CancellationToken ct)
+            {
+                // The signed-in account names folders too (%UPN%, %UPNNAME%); a warm start has no token yet
+                if (tokens.LastResult is null && redirectRules.Select(r => r.Target).Concat(mappings.Select(m => m.Target)).Any(t => t.Contains("%UPN", StringComparison.OrdinalIgnoreCase)))
+                {
+                    try
                     {
-                        try
-                        {
-                            await tokens.GetAccessTokenAsync(M365Client.GraphResource, default);
-                        }
-                        catch (Exception e) when (e is not OutOfMemoryException)
-                        {
-                        }
+                        await tokens.GetAccessTokenAsync(M365Client.GraphResource, ct);
                     }
-                    var upn = tokens.LastResult?.Username;
-                    var values = new Dictionary<string, string?> { ["UPN"] = upn, ["UPNNAME"] = upn?.Split('@')[0] };
-                    async Task<(string? Path, string? Problem)> Resolve(string what, string template)
+                    catch (Exception e) when (e is not OutOfMemoryException)
                     {
-                        var expanded = FolderTargets.Expand(template, values);
-                        var relative = expanded is null ? null : VolumePaths.Relative(expanded, unc, mounted.DriveLetter);
-                        if (relative is null)
-                        {
-                            return (null, expanded is null ? $"{what}: '{template}' names a value that isn't known (yet)"
-                                : $"{what}: '{expanded}' is not in VFS365; give a path in it, like OneDrive\\Documents");
-                        }
-                        var (path, problem) = await FolderTargets.ResolveAsync(engine, relative, create: true, default);
-                        return (path, problem is null ? null : $"{what}: {problem}");
                     }
+                }
+                var upn = tokens.LastResult?.Username;
+                var values = new Dictionary<string, string?> { ["UPN"] = upn, ["UPNNAME"] = upn?.Split('@')[0] };
+                async Task<(string? Path, string? Problem)> Resolve(string what, string template)
+                {
+                    var expanded = FolderTargets.Expand(template, values);
+                    var relative = expanded is null ? null : VolumePaths.Relative(expanded, unc, mounted.DriveLetter);
+                    if (relative is null)
+                    {
+                        return (null, expanded is null ? $"{what}: '{template}' names a value that isn't known (yet)"
+                            : $"{what}: '{expanded}' is not in VFS365; give a path in it, like OneDrive\\Documents");
+                    }
+                    var (path, problem) = await FolderTargets.ResolveAsync(engine, relative, create: true, ct);
+                    return (path, problem is null ? null : $"{what}: {problem}");
+                }
 
-                    foreach (var mapping in mappings)
+                if (!leftoversChecked)
+                {
+                    leftoversChecked = true;
+                    foreach (var leftover in driveLetters.RemoveLeftovers(mappings.Select(m => m.Letter), mounted.DriveLetter))
+                    {
+                        say($"Drive:      {leftover} removed, left by an earlier run and no longer in policy DriveMappings");
+                    }
+                }
+                // Each mapping on its own: one that fails never keeps the others or the folders from their place
+                foreach (var mapping in mappings)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    try
                     {
                         var (path, problem) = await Resolve($"DriveMappings {mapping.Letter}", mapping.Target);
+                        ct.ThrowIfCancellationRequested();
                         if (path is not null)
                         {
                             var folder = VolumePaths.Windows(path, unc, null);
-                            problem = letters.Define(mapping.Letter, folder, mapping.Label, out var replaced);
+                            problem = driveLetters.Define(mapping.Letter, folder, mapping.Label, out var replaced);
                             if (replaced is not null)
                             {
                                 say($"Drive:      {mapping.Letter} was a SharePoint WebDAV mapping to {replaced}; it is now {folder}");
@@ -1089,9 +1262,21 @@ public static class AgentCommands
                             LayoutProblem(problem);
                         }
                     }
+                    catch (Exception e) when (e is not (OperationCanceledException or OutOfMemoryException))
+                    {
+                        LayoutProblem($"DriveMappings {mapping.Letter}: {e.Message}");
+                    }
+                }
+                if (driveLetters.TakeLabelsChanged())
+                {
+                    ExplorerLocation.Refresh(); // once for all names written
+                }
 
-                    var targets = new List<(RedirectRule, string)>();
-                    foreach (var rule in redirectRules)
+                var targets = new List<(RedirectRule, string)>();
+                foreach (var rule in redirectRules)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    try
                     {
                         var (path, problem) = await Resolve($"FolderRedirection {rule.Folder}", rule.Target);
                         if (path is null)
@@ -1103,33 +1288,58 @@ public static class AgentCommands
                             targets.Add((rule, VolumePaths.Windows(path, unc, mounted.DriveLetter)));
                         }
                     }
-                    var (done, left, moves) = redirection.Apply(targets, redirectRules);
-                    foreach (var line in done)
+                    catch (Exception e) when (e is not (OperationCanceledException or OutOfMemoryException))
                     {
-                        say($"Redirected: {line}");
+                        LayoutProblem($"FolderRedirection {rule.Folder}: {e.Message}");
                     }
-                    foreach (var line in left)
+                }
+                ct.ThrowIfCancellationRequested();
+                var (done, left, _) = folderRedirection.Apply(targets, redirectRules, ct);
+                foreach (var line in done)
+                {
+                    say($"Redirected: {line}");
+                }
+                foreach (var line in left)
+                {
+                    LayoutProblem(line);
+                }
+            }
+
+            // What local folders still hold for their redirected place (|move), one folder at a time, also what a stop left halfway
+            void StartMoves()
+            {
+                if (layoutCancel.IsCancellationRequested || Interlocked.Exchange(ref moving, 1) == 1)
+                {
+                    return;
+                }
+                _ = Task.Run(() =>
+                {
+                    try
                     {
-                        LayoutProblem(line);
-                    }
-                    foreach (var (from, to) in moves)
-                    {
-                        var stayed = FolderRedirection.MoveContents(from, to);
-                        say($"Redirected: moved what {from} held into {to}{(stayed.Count == 0 ? "" : $", except {stayed.Count} item(s) (see the log)")}");
-                        foreach (var item in stayed.Take(20))
+                        foreach (var move in folderRedirection.PendingMoves())
                         {
-                            log($"redirection: {item}");
+                            var stayed = FolderRedirection.MoveContents(move.From, move.To, layoutCancel.Token);
+                            folderRedirection.MoveFinished(move);
+                            say($"Redirected: moved what {move.From} held into {move.To}{(stayed.Count == 0 ? "" : $", except {stayed.Count} item(s) (see the log)")}");
+                            foreach (var item in stayed.Take(20))
+                            {
+                                log($"redirection: {item}");
+                            }
                         }
                     }
-                }
-                catch (Exception e) when (e is not OutOfMemoryException)
-                {
-                    LayoutProblem($"folder redirection and drive mappings: {e.Message}");
-                }
-                finally
-                {
-                    layoutGate.Release();
-                }
+                    catch (OperationCanceledException)
+                    {
+                        say("Redirected: moving folder content stopped for the unmount; the rest moves at the next start");
+                    }
+                    catch (Exception e) when (e is not OutOfMemoryException)
+                    {
+                        LayoutProblem($"moving folder content: {e.Message}");
+                    }
+                    finally
+                    {
+                        Volatile.Write(ref moving, 0);
+                    }
+                });
             }
 
             // Another account signed in than the one whose OneDrive this engine shows: start again cleanly; its cache goes at unmount
@@ -1141,7 +1351,15 @@ public static class AgentCommands
                 }
                 accountChanged = true;
                 say("OneDrive:   the signed-in account changed; cached content is wiped and the drive starts again for the new account");
-                RestartAgent("for the new account");
+                if (!RestartAgent("for the new account"))
+                {
+                    stop.Set(); // never the old account's drive with the new account's tokens
+                }
+            }
+            accountSwitchedNow = AccountChanged; // Sign in with another account: at once, not only at the next discovery
+            if (accountSwitched)
+            {
+                AccountChanged();
             }
 
             // A failed run (an error, or a search that failed even partly): logged and reported, tried again in 15 to 60 minutes, sooner
@@ -1152,6 +1370,7 @@ public static class AgentCommands
                 say($"Discovery:  failed, showing {(settings.Scope == DriveScope.OneDrive ? "the OneDrive" : $"{keeper.Current.Libraries.Count} libraries")} " +
                     $"from the last run{(searchFailed ? " and what this one found" : "")}; trying again in {delay.TotalMinutes:0} min: {message}");
                 monitoring?.Error("discovery", message);
+                AgentEvents.Write(AgentEvent.DiscoveryFailed, $"Discovery failed; the libraries of the last run stay and it tries again in {delay.TotalMinutes:0} min: {message}");
                 var plain = PlainCause.Of(cause, !networkUp || network, tokens.SignInProblem);
                 if (plain == Cause.Offline)
                 {
@@ -1187,6 +1406,7 @@ public static class AgentCommands
                         justRead = null;
                         // A failed search keeps the libraries (nothing is hidden) but not the time: the next start and Refresh don't take it as recent
                         keeper.Replace(DiscoverySchedule.Keep(result, before) with { TenantHint = tenantHint });
+                        SaveQuietly("the discovery report", () => DiscoveryReport.Record(result, before)); // for 'vfs365 why' and support bundles
                         if (result.OneDrive.DriveId != oneDrive.DriveId)
                         {
                             AccountChanged();
@@ -1282,7 +1502,24 @@ public static class AgentCommands
             Task<int>? statisticsSending = null;
             using var push = new PushChannels(engine, new DriveNotifications(client) { Problem = log }, log);
             using var due = new CancellationTokenSource();
-            Task scheduler;
+            Task scheduler = Task.CompletedTask;
+            // Folder listings: saved off the scheduler's tick and only once they changed, also at the stop (one save at a time)
+            var snapshotGate = new Lock();
+            void SaveSnapshotsIfChanged()
+            {
+                lock (snapshotGate)
+                {
+                    var version = engine.MetadataVersion;
+                    if (accountChanged || version == Interlocked.Read(ref savedVersion))
+                    {
+                        return;
+                    }
+                    if (SaveQuietly("the folder listings", () => MetadataStore.Save(engine.ExportSnapshots(MetadataStore.MaxFoldersPerDrive), key)))
+                    {
+                        Interlocked.Exchange(ref savedVersion, version);
+                    }
+                }
+            }
             // Explorer's entries are a convenience: a registry that refuses them never ends the mounted drive
             bool Explorer(string what, Action change)
             {
@@ -1302,6 +1539,25 @@ public static class AgentCommands
                 Explorer("name the drive in Explorer", () => ExplorerLocation.SetDriveLabel(prefix, settings.Label));
                 say($"Mounted:    {(drive.DriveLetter is { } assigned ? $"{assigned} and " : "")}{unc} ({settings.Scope}) after {stopwatch.Elapsed.TotalSeconds:N1} s, " +
                     $"{(usable ? $"{keeper.Current.Libraries.Count} libraries from the last run" : "first run")}. Ctrl+C or 'vfs365 unmount' to stop.");
+                var mountedLetter = drive.DriveLetter;
+                AgentEvents.Write(AgentEvent.Started, $"VFS365 {agentStatus.Current.Version} mounted {(mountedLetter is null ? "" : $"{mountedLetter} and ")}{unc} for " +
+                    $@"{Environment.UserDomainName}\{Environment.UserName}");
+                agentStatus.Update(s => s with { State = AgentStatus.Mounted, Problem = null, DriveLetter = mountedLetter, Unc = unc });
+                var throttledSpan = TimeSpan.FromMinutes(Math.Max(2, settings.ThrottlePauseMinutes));
+                agentStatus.Live = s =>
+                {
+                    var waiting = engine.WaitingToUpload();
+                    return s with
+                    {
+                        User = tokens.LastResult?.Username ?? s.User,
+                        TenantId = tokens.LastResult?.TenantId ?? s.TenantId,
+                        SignInProblem = tokens.SignInProblem ? s.SignInProblem ?? "unknown" : null,
+                        Online = networkUp && DateTimeOffset.UtcNow - networkFailedAt >= TimeSpan.FromMinutes(2),
+                        Throttled = client.ThrottledWithin(throttledSpan),
+                        WaitingUploads = waiting,
+                        HeldChanges = Math.Max(0, engine.Unsaved().Count - waiting),
+                    };
+                };
                 if (navigationPane)
                 {
                     if (Explorer("add the navigation pane entry", () =>
@@ -1314,11 +1570,15 @@ public static class AgentCommands
                 {
                     Explorer("remove the navigation pane entry", ExplorerLocation.Unregister); // an entry left by a run with the navigation pane on, or one that was ended
                 }
+                // The VFS365 menu on the drive's files and folders (ExplorerMenu.cs); removed when this block ends at the stop
+                using var explorerMenu = ExplorerMenu.Start(engine, driveApi, unc, drive.DriveLetter, driveLetters,
+                    (title, text, problem) => VerbPipe.Tell(tray, title, text, problem), say, log);
 
                 // What Windows tells Explorer about the drive: checked now and every 5 minutes, logged when it changes
                 if (NetworkProviderOrder.Problem(NetworkProviderOrder.Current()) is { } providerProblem)
                 {
                     say($"Warning:    {providerProblem}");
+                    AgentEvents.Write(AgentEvent.ProviderOrder, providerProblem);
                 }
                 string? driveProblems = null;
                 void CheckDriveLetter()
@@ -1344,6 +1604,7 @@ public static class AgentCommands
                         {
                             say($"Warning:    {problem}");
                             monitoring?.Error("drive letter", problem);
+                            AgentEvents.Write(AgentEvent.DriveLetterProblem, problem);
                         }
                         driveProblems = key;
                     }
@@ -1353,7 +1614,8 @@ public static class AgentCommands
                     }
                 }
                 _ = Task.Run(CheckDriveLetter);
-                _ = Task.Run(ApplyLayoutAsync);
+                layoutSoon = () => _ = Task.Run(ApplyLayoutAsync);
+                layoutSoon();
 
                 // \\VFS365 must not resolve on the network: whoever answers gets the paths apps kept, while the drive isn't mounted
                 _ = Task.Run(async () =>
@@ -1362,6 +1624,7 @@ public static class AgentCommands
                     {
                         say($"Warning:    {resolves}");
                         monitoring?.Error("security", resolves);
+                        AgentEvents.Write(AgentEvent.NameResolves, resolves);
                     }
                 });
 
@@ -1407,6 +1670,7 @@ public static class AgentCommands
                     if (differences.Count > 0)
                     {
                         say($"Settings:   changed since the start ({names}); they apply after Restart in the tray or at the next sign-in");
+                        AgentEvents.Write(AgentEvent.SettingsChanged, $"VFS365's settings changed since the start ({names}); they apply after Restart in the tray or at the next sign-in");
                         tray?.Notify(UiText.Get("Policy.Title"), UiText.Get("Policy.Text", names));
                     }
                 }
@@ -1470,136 +1734,197 @@ public static class AgentCommands
 
                 var throttleShown = TimeSpan.FromMinutes(Math.Max(2, settings.ThrottlePauseMinutes));
                 var promptedWithoutTray = false;
+                // Due uploads and deletes run on their own, one run at a time: they wait for the engine's write gate, which a large file's
+                // download for writing can hold for minutes, and the tick (tray, notices, push, saves) never waits for them
+                async Task ProcessDueQuietlyAsync()
+                {
+                    try
+                    {
+                        await engine.ProcessDueAsync(false, due.Token);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                    }
+                    catch (Exception e)
+                    {
+                        log($"error: {e.Message}");
+                        monitoring?.Error("agent", e.Message);
+                    }
+                }
+                Action saveDiscoveryState = keeper.SaveIfChanged; // made once: the tick allocates as little as it can
+                Func<Task> applyLayout = ApplyLayoutAsync, discover = () => DiscoverAsync(everything: false);
+                Action checkDriveLetter = CheckDriveLetter, saveSnapshots = SaveSnapshotsIfChanged;
                 scheduler = Task.Run(async () =>
                 {
                     using var timer = new PeriodicTimer(TimeSpan.FromSeconds(1));
                     var nextSnapshot = DateTimeOffset.UtcNow + SnapshotInterval;
-                    var savedVersion = engine.MetadataVersion; // saved only when listings changed since
+                    Task processing = Task.CompletedTask, snapshotting = Task.CompletedTask;
+                    string? lastError = null;
+                    // Each part of the tick on its own: one that fails is logged (once per message) and the others still run
+                    bool Failed(Exception e)
+                    {
+                        if (e is OperationCanceledException && due.IsCancellationRequested)
+                        {
+                            return false; // the stop
+                        }
+                        if (e.Message != lastError)
+                        {
+                            lastError = e.Message;
+                            log($"error: {e.Message}");
+                            monitoring?.Error("agent", e.Message);
+                        }
+                        return true;
+                    }
 
                     var tick = 0;
                     while (await timer.WaitForNextTickAsync(due.Token))
                     {
+                        var now = DateTimeOffset.UtcNow;
+                        var at = tick++;
+                        if (processing.IsCompleted)
+                        {
+                            processing = ProcessDueQuietlyAsync();
+                        }
                         try
                         {
-                            await engine.ProcessDueAsync(false, due.Token);
                             engine.HotPollingPaused = engine.PrefetchPaused = client.BackgroundPaused;
-                            ReportThrottling(DateTimeOffset.UtcNow);
+                            ReportThrottling(now);
                             _ = engine.PollActiveAsync();
-                            if (statistics is not null && tick % 60 == 0)
+                        }
+                        catch (Exception e) when (Failed(e))
+                        {
+                        }
+                        if (statistics is not null && at % 60 == 0)
+                        {
+                            try
                             {
                                 ReportStatistics(statistics, monitoring!, client, tokens.LastResult?.Username, ref statisticsDue, ref statisticsSending);
                             }
-                            if (tick++ % 5 == 0)
+                            catch (Exception e) when (Failed(e))
+                            {
+                            }
+                        }
+                        if (at % 5 == 0)
+                        {
+                            try
                             {
                                 push.Sync();
                             }
-                            SaveQuietly("the discovery state", keeper.SaveIfChanged);
+                            catch (Exception e) when (Failed(e))
+                            {
+                            }
+                        }
+                        try
+                        {
+                            SaveQuietly("the discovery state", saveDiscoveryState);
                             if (tray is not null)
                             {
-                                foreach (var (title, text) in notices.Due(DateTimeOffset.UtcNow))
+                                foreach (var (title, text) in notices.Due(now))
                                 {
                                     tray.Notify(title, text);
                                 }
                             }
-                            // Without a tray icon nothing offers Sign in: a sign-in that is needed opens the window by itself, once per problem
-                            // (not within 15 minutes of a cancel)
-                            if (background && !showTray && tick % 5 == 1)
+                        }
+                        catch (Exception e) when (Failed(e))
+                        {
+                        }
+                        // Without a tray icon nothing offers Sign in: a sign-in that only a window solves opens the window by itself, once
+                        // per problem (not within 15 minutes of a cancel); other problems (Conditional Access, WAM errors) never prompt
+                        if (background && !showTray && at % 5 == 0)
+                        {
+                            if (!tokens.SignInNeedsUser)
                             {
-                                if (!tokens.SignInProblem)
-                                {
-                                    promptedWithoutTray = false;
-                                }
-                                else if (!promptedWithoutTray)
-                                {
-                                    promptedWithoutTray = true;
-                                    say("Sign-in:    needed, and there is no tray icon (policy TrayIcon) to offer Sign in: the sign-in window opens");
-                                    _ = Task.Run(async () =>
-                                    {
-                                        try
-                                        {
-                                            if (await tokens.SignInAsync(userAsked: false, default))
-                                            {
-                                                say("Sign-in:    done");
-                                                WakeUp();
-                                            }
-                                        }
-                                        catch (Exception e) when (e is not OutOfMemoryException)
-                                        {
-                                            log($"sign-in: {e.Message}");
-                                        }
-                                    });
-                                }
+                                promptedWithoutTray = false;
                             }
-                            if (tick % 5 == 1)
+                            else if (!promptedWithoutTray)
+                            {
+                                promptedWithoutTray = true;
+                                say("Sign-in:    needed, and there is no tray icon (policy TrayIcon) to offer Sign in: the sign-in window opens");
+                                _ = Task.Run(async () =>
+                                {
+                                    try
+                                    {
+                                        if (await tokens.SignInAsync(userAsked: false, default))
+                                        {
+                                            say("Sign-in:    done");
+                                            WakeUp();
+                                        }
+                                    }
+                                    catch (Exception e) when (e is not OutOfMemoryException)
+                                    {
+                                        log($"sign-in: {e.Message}");
+                                    }
+                                });
+                            }
+                        }
+                        if (at % 5 == 0 && tray is not null)
+                        {
+                            try
                             {
                                 var waiting = engine.WaitingToUpload();
-                                if (tray is not null)
-                                {
-                                    var offline = !networkUp || DateTimeOffset.UtcNow - networkFailedAt < TimeSpan.FromMinutes(2);
-                                    var throttled = DateTimeOffset.UtcNow - client.LastThrottled < throttleShown;
-                                    tray.BlockShutdown(waiting > 0 ? UiText.Get("Shutdown.Uploading", waiting) : null);
-                                    tray.SetStatus(
-                                        tokens.SignInProblem ? UiText.Get("Status.SignIn")
-                                            : offline ? waiting == 0 ? UiText.Get("Status.Offline") : UiText.Get("Status.OfflineWaiting", waiting)
-                                            : refreshing ? UiText.Get("Status.Refreshing")
-                                            : waiting > 0 ? UiText.Get("Status.Waiting", waiting)
-                                            : throttled ? UiText.Get("Status.Throttled")
-                                            : UiText.Get("Status.UpToDate"),
-                                        tokens.SignInProblem ? TrayState.Error : waiting > 0 || offline ? TrayState.Waiting : TrayState.Normal);
-                                }
+                                var offline = !networkUp || now - networkFailedAt < TimeSpan.FromMinutes(2);
+                                var throttled = client.ThrottledWithin(throttleShown);
+                                var signIn = tokens.SignInProblem;
+                                tray.BlockShutdown(waiting > 0 ? UiText.Get("Shutdown.Uploading", waiting) : null);
+                                tray.SetStatus(
+                                    signIn ? UiText.Get("Status.SignIn")
+                                        : offline ? waiting == 0 ? UiText.Get("Status.Offline") : UiText.Get("Status.OfflineWaiting", waiting)
+                                        : refreshing ? UiText.Get("Status.Refreshing")
+                                        : waiting > 0 ? UiText.Get("Status.Waiting", waiting)
+                                        : throttled ? UiText.Get("Status.Throttled")
+                                        : UiText.Get("Status.UpToDate"),
+                                    signIn ? TrayState.Error : waiting > 0 || offline ? TrayState.Waiting : TrayState.Normal);
                             }
-                            if (tick % 300 == 150)
+                            catch (Exception e) when (Failed(e))
                             {
-                                _ = Task.Run(CheckDriveLetter);
                             }
-                            if (tick % 300 == 250)
+                        }
+                        try
+                        {
+                            if (at % 300 == 150)
+                            {
+                                _ = Task.Run(checkDriveLetter);
+                            }
+                            if (at % 300 == 250)
                             {
                                 CheckSettings();
                             }
-                            if (tick % 3600 == 1800)
+                            if (at % 3600 == 1800)
                             {
-                                _ = Task.Run(ApplyLayoutAsync);
+                                _ = Task.Run(applyLayout);
                             }
-                            if (DateTimeOffset.UtcNow >= nextDiscovery && !refreshing)
+                            if (now >= nextDiscovery && !refreshing)
                             {
                                 // Daily, so a PC that sleeps instead of signing out still sees new and removed libraries
                                 nextDiscovery = DateTimeOffset.MaxValue;
-                                _ = Task.Run(() => DiscoverAsync(everything: false));
+                                _ = Task.Run(discover);
                             }
-                            if (DateTimeOffset.UtcNow >= nextSnapshot && !accountChanged && engine.MetadataVersion != savedVersion)
+                            if (now >= nextSnapshot && snapshotting.IsCompleted && !accountChanged && engine.MetadataVersion != Interlocked.Read(ref savedVersion))
                             {
-                                var version = engine.MetadataVersion;
-                                if (SaveQuietly("the folder listings", () => MetadataStore.Save(engine.ExportSnapshots(MetadataStore.MaxFoldersPerDrive), key)))
-                                {
-                                    savedVersion = version;
-                                }
-                                nextSnapshot = DateTimeOffset.UtcNow + SnapshotInterval;
+                                nextSnapshot = now + SnapshotInterval;
+                                snapshotting = Task.Run(saveSnapshots); // a large one takes about a second
                             }
                         }
-                        catch (Exception e) when (e is not OperationCanceledException)
+                        catch (Exception e) when (Failed(e))
                         {
-                            log($"error: {e.Message}");
-                            monitoring?.Error("agent", e.Message);
                         }
                     }
                 });
 
                 stop.WaitOne();
                 powerChanged = null;
+                layoutSoon = null;
+                accountSwitchedNow = null;
+                // Layout work and the scheduler stop first: a run going on stops at its next step, and nothing redirects a folder or
+                // defines a letter after the teardown below (FolderRedirection and SessionDriveLetters refuse it once restored)
+                layoutCancel.Cancel();
+                due.Cancel();
+                if (!layout.WaitIdle(TimeSpan.FromSeconds(5)))
+                {
+                    log("layout: a run is still going on; it changes nothing after the teardown");
+                }
                 // Before the unmount: redirected folders go back (not on a restart: the new agent takes them over), the extra letters go
-                layoutGate.Wait(TimeSpan.FromSeconds(5));
-                try
-                {
-                    foreach (var line in restarting ? Array.Empty<string>() : redirection.RestoreAll())
-                    {
-                        say($"Redirected: {line}");
-                    }
-                    letters.RemoveAll();
-                }
-                catch (Exception e) when (e is System.Runtime.InteropServices.COMException or IOException or UnauthorizedAccessException)
-                {
-                    say($"Warning:    could not put redirected folders back or remove drive letters: {e.Message}");
-                }
+                RestoreLayout(restoreFolders: !restarting, drive.DriveLetter);
                 if (navigationPane)
                 {
                     Explorer("remove the navigation pane entry", ExplorerLocation.Unregister);
@@ -1607,12 +1932,12 @@ public static class AgentCommands
             }
             finally
             {
+                due.Cancel();
                 tray?.Dispose();
                 tray = null;
                 drive.Dispose();
             }
 
-            due.Cancel();
             try
             {
                 await scheduler;
@@ -1626,10 +1951,7 @@ public static class AgentCommands
             {
                 ReportThrottling(DateTimeOffset.MaxValue); // an episode still going on
                 SaveQuietly("the discovery state", keeper.SaveIfChanged);
-                if (!accountChanged)
-                {
-                    SaveQuietly("the folder listings", () => MetadataStore.Save(engine.ExportSnapshots(MetadataStore.MaxFoldersPerDrive), key));
-                }
+                SaveSnapshotsIfChanged(); // the second time only when the last uploads changed listings
                 if (statistics is not null)
                 {
                     statistics.Fold(client.Usage, monitoring!.Errors, DateTime.Now, tokens.LastResult?.Username, Monitoring.Version, monitoring.Device);
@@ -1652,15 +1974,17 @@ public static class AgentCommands
                     say($"Warning:    could not wipe the previous account's cached content: {e.Message}");
                 }
             }
-            foreach (var unsaved in engine.Unsaved())
+            var notSaved = engine.Unsaved();
+            foreach (var unsaved in notSaved)
             {
                 say($"Not saved:  {unsaved}");
             }
-            if (monitoring is not null)
+            if (notSaved.Count > 0)
             {
-                await monitoring.FlushAsync(TimeSpan.FromSeconds(3));
+                AgentEvents.Write(AgentEvent.NotSaved, $"{notSaved.Count} changed file(s) are not saved to Microsoft 365 yet and stay on this PC: " + string.Join("; ", notSaved.Take(20)));
             }
-            var usage = client.Usage;
+            AgentEvents.Write(AgentEvent.Stopped, $"VFS365 stopped and unmounted {unc}");
+            var usage = client.Usage; // monitoring flushes once, below
             say($"Unmounted.  Requests: Graph {usage.GraphRequests}, SharePoint {usage.SharePointRequests}, about {usage.ResourceUnits} resource units " +
                 $"in {stopwatch.Elapsed.TotalMinutes:N1} min; throttled {usage.Throttled} time(s), waited for the budget {usage.BudgetWaitForegroundSeconds} s (user actions), " +
                 $"{usage.BudgetWaitBackgroundSeconds} s (background), added up over requests");
@@ -1670,8 +1994,15 @@ public static class AgentCommands
         {
             NetworkChange.NetworkAvailabilityChanged -= NetworkChanged;
             powerChanged = null;
+            layoutSoon = null;
+            layoutCancel.Cancel();
             tray?.Dispose();
+            if (ownsSession && !restarting && !layoutRestored)
+            {
+                RestoreLayout(restoreFolders: true, null); // a stop before the mount: what a crashed run left goes back
+            }
             ReportThrottling(DateTimeOffset.MaxValue); // a stop before the drive was mounted: the first start's episode
+            status?.Close();
             if (monitoring is not null)
             {
                 await monitoring.FlushAsync(TimeSpan.FromSeconds(3));
@@ -1718,7 +2049,7 @@ public static class AgentCommands
     {
         var now = DateTime.Now;
         statistics.Fold(client.Usage, monitoring.Errors, now, user, Monitoring.Version, monitoring.Device);
-        statistics.Save();
+        statistics.SaveIfChanged(now); // a minute of running time alone isn't worth a write
         if (monitoring.Target is null)
         {
             return; // monitoring was turned off meanwhile

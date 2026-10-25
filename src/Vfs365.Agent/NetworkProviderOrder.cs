@@ -71,6 +71,10 @@ public static class NetworkProviderOrder
             {
                 say($"{list}\\ProviderOrder: no access ({e.Message}); run as administrator");
             }
+            catch (IOException e)
+            {
+                say($"{list}\\ProviderOrder: could not be changed ({e.Message})"); // a key marked for deletion, a registry that is full
+            }
         }
     }
 }

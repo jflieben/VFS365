@@ -2,13 +2,17 @@
   <!--
     One setup per architecture. WinFsp is installed unmodified (permitted by its FLOSS exception, VFS365 being GPLv3) and is permanent:
     uninstalling VFS365 leaves it, as other software may use it. Burn skips WinFsp when the same or a newer version is installed.
-    Silent: VFS365-<version>-<arch>-setup.exe /quiet, removal with /uninstall /quiet.
+    Silent: VFS365-<version>-<arch>-setup.exe /quiet /norestart, removal with /uninstall /quiet /norestart (3010: restart pending).
   -->
   <Bundle Name="VFS365" Manufacturer="JSolve B.V." Version="$(Version)" UpgradeCode="{1CE1F16D-DE38-4295-AE8A-7C3C52171A4F}"
           IconSourceFile="$(AssetsDir)\vfs365.ico" AboutUrl="https://www.jsolve.nl">
     <BootstrapperApplication>
       <bal:WixStandardBootstrapperApplication Theme="rtfLicense" LicenseFile="license.rtf" ShowVersion="yes" SuppressOptionsUI="yes" />
     </BootstrapperApplication>
+<?if $(sys.BUILDARCH) = x64 ?>
+    <!-- The x64 MSI refuses ARM64 devices; checked here too, so WinFsp isn't installed first. NativeMachine 43620 is ARM64 (0xAA64). -->
+    <bal:Condition Condition="NOT NativeMachine OR NativeMachine &lt;&gt; 43620" Message="This is the x64 setup of VFS365. On ARM64 devices, use VFS365-$(Version)-arm64-setup.exe." />
+<?endif?>
     <Chain>
       <MsiPackage SourceFile="$(WinFspMsi)" Permanent="yes" Visible="yes" />
       <MsiPackage SourceFile="$(VfsMsi)" />

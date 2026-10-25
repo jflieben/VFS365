@@ -127,6 +127,22 @@ public sealed class DiscoveryService(ISharePointDiscoveryApi api, DiscoveryOptio
                 .Select(p => p.WebUrl));
         }
 
+        // ReadOnly and WriteLocked belong to the site collection: one _api/site per collection, shared by its webs (a failed one isn't kept)
+        var siteReads = new ConcurrentDictionary<string, Lazy<Task<SiteMetadata>>>(StringComparer.OrdinalIgnoreCase);
+        async Task<SiteMetadata> SiteAsync(string siteCollectionUrl, string webUrl, CancellationToken token)
+        {
+            var read = siteReads.GetOrAdd(siteCollectionUrl, _ => new(() => api.GetSiteAsync(webUrl, token)));
+            try
+            {
+                return await read.Value;
+            }
+            catch (Exception)
+            {
+                siteReads.TryRemove(KeyValuePair.Create(siteCollectionUrl, read));
+                throw;
+            }
+        }
+
         // A site that fails, a timeout included, is that site's error: its libraries keep their last entries and the other sites go on.
         // Failures are told from cancellation by the caller's token, not by the exception's type.
         await Parallel.ForEachAsync(plans, new ParallelOptions { MaxDegreeOfParallelism = options.MaxParallelSites, CancellationToken = ct }, async (plan, token) =>
@@ -163,7 +179,7 @@ public sealed class DiscoveryService(ISharePointDiscoveryApi api, DiscoveryOptio
             SiteMetadata siteMetadata;
             try
             {
-                siteMetadata = await api.GetSiteAsync(plan.WebUrl, token);
+                siteMetadata = await SiteAsync(due[0].SiteCollectionUrl, plan.WebUrl, token);
             }
             catch (Exception e) when (!ct.IsCancellationRequested)
             {

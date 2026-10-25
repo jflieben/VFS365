@@ -22,7 +22,9 @@ public sealed partial class DriveEngine
 
     /// <summary>
     /// Writes, rewrites (call it when Base, the path or Flushed changes) or, for names that never upload, removes the pending file's
-    /// journal record. The record is on disk when this returns.
+    /// journal record. The record is on disk when this returns; only a first record that says nothing was flushed isn't forced there
+    /// (nothing was acknowledged yet), since a rewrite replaces one that may stand for a save. With the write gate held, use
+    /// <see cref="JournalLater"/>.
     /// </summary>
     void Journal(PendingFile pending)
     {
@@ -31,34 +33,87 @@ public sealed partial class DriveEngine
         {
             if (StaysLocal(pending))
             {
-                TryDelete(path);
-                pending.Journaled = false;
+                if (pending.Journaled)
+                {
+                    TryDelete(path);
+                    pending.Journaled = false;
+                }
                 return;
             }
             if (!pending.IsLive)
             {
                 return;
             }
+            var durable = pending.Journaled || pending.Flushed;
             using (var file = new FileStream(path + ".tmp", FileMode.Create, FileAccess.Write, FileShare.None))
             {
                 JsonSerializer.Serialize(file, new JournalRecord(pending.DriveId, pending.DrivePath, pending.Base, pending.Modified, pending.Flushed, pending.Alias?.OriginalPath));
-                file.Flush(flushToDisk: true);
+                if (durable)
+                {
+                    file.Flush(flushToDisk: true);
+                }
             }
             File.Move(path + ".tmp", path, overwrite: true);
             pending.Journaled = true;
         }
     }
 
+    /// <summary>Removes the journal of content that was uploaded or discarded, so a write of it still running can't put it back.</summary>
+    static void Unjournal(PendingFile pending)
+    {
+        lock (pending)
+        {
+            TryDelete(JournalOf(pending.StagingPath));
+        }
+    }
+
+    /// <summary>With the write gate held: the journal is written when the gate is let go (<see cref="ReleaseGate"/>), before the operation returns.</summary>
+    void JournalLater(PendingFile pending) => unjournaled.Add(pending);
+
+    /// <summary>
+    /// Lets the write gate go, then writes the journals that changed under it, several at a time when many did (a folder move): disk
+    /// flushes never hold the gate. Every operation lets it go before it returns, so its journals are on disk by then.
+    /// </summary>
+    void ReleaseGate()
+    {
+        PendingFile[]? due = null;
+        if (unjournaled.Count > 0)
+        {
+            due = [.. unjournaled];
+            unjournaled.Clear();
+        }
+        writeGate.Release();
+        if (due is not null)
+        {
+            Parallel.ForEach(due, new ParallelOptions { MaxDegreeOfParallelism = due.Length < 8 ? 1 : 8 }, pending =>
+            {
+                try
+                {
+                    Journal(pending);
+                }
+                catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+                {
+                    Log($"error: writing the journal of {pending.DrivePath}: {e.Message}");
+                }
+            });
+        }
+    }
+
     /// <summary>
     /// Forces the staged content to disk and the journal to say so (at a close, or before an upload is retried), so a restart after a
-    /// power loss uploads it into its item. Not while the calling thread holds a write lease.
+    /// power loss uploads it into its item. Nothing to do when nothing was written since the last time. Not with the write gate held,
+    /// nor while the calling thread holds a write lease.
     /// </summary>
     void MarkFlushed(PendingFile pending)
     {
+        if (pending.Flushed)
+        {
+            return; // a write clears it before it reaches the file
+        }
         pending.Writing.EnterWriteLock();
         try
         {
-            if (pending.IsLive && FlushToDisk(pending.StagingPath))
+            if (pending.IsLive && !pending.Flushed && FlushToDisk(pending.StagingPath))
             {
                 pending.Flushed = true;
                 Journal(pending);

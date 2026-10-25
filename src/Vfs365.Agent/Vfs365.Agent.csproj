@@ -9,6 +9,10 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <InternalsVisibleTo Include="Vfs365.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
     <PackageReference Include="System.Security.Cryptography.ProtectedData" />
     <ProjectReference Include="..\Vfs365.Core\Vfs365.Core.csproj" />
     <ProjectReference Include="..\Vfs365.Graph\Vfs365.Graph.csproj" />

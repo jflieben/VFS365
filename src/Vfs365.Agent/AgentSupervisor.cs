@@ -20,8 +20,15 @@ public static class AgentSupervisor
 
     public static int Run(string[] args, Func<bool> sessionEnding)
     {
-        // Starts this sign-in's log, which the child appends to; not while an agent runs in this session (a second start, a restart)
-        using (AgentLog.Open(newSession: !args.Contains("--after", StringComparer.OrdinalIgnoreCase) && !AgentControl.IsMounted()))
+        // Starts this sign-in's log, which the child appends to; not while an agent runs in this session (a second start, a restart).
+        // A profile that can't be written yet is the child's to report (its log falls back to %TEMP%).
+        try
+        {
+            using (AgentLog.Open(newSession: !args.Contains("--after", StringComparer.OrdinalIgnoreCase) && !AgentControl.IsMounted()))
+            {
+            }
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
         {
         }
 
@@ -61,6 +68,7 @@ public static class AgentSupervisor
                 var gaveUp = $"The agent stopped unexpectedly (exit code 0x{code:X8}) {MaxRestarts + 1} times within {RestartWindow.TotalMinutes:0} minutes " +
                     "and was not started again; it starts at the next sign-in, or at Retry in the tray";
                 Write([$"Agent:      {gaveUp}."]);
+                AgentEvents.Write(AgentEvent.NotRestarted, gaveUp);
                 var settings = Settings(args);
                 ReportGivingUp(settings, gaveUp);
                 details.Wait(TimeSpan.FromSeconds(30));
@@ -74,6 +82,7 @@ public static class AgentSupervisor
             }
             restarts.Enqueue(now);
             Write([$"Agent:      stopped unexpectedly (exit code 0x{code:X8}); starting again"]);
+            AgentEvents.Write(AgentEvent.Crashed, $"The agent stopped unexpectedly (exit code 0x{code:X8}) and is started again; agent.log has what Windows recorded");
             Thread.Sleep(RestartDelay);
             if (sessionEnding())
             {
@@ -116,10 +125,20 @@ public static class AgentSupervisor
         }
         using var retry = new ManualResetEventSlim(false);
         var ended = false;
-        using var tray = new Tray(settings?.Label ?? AgentSettings.DefaultLabel, new TrayActions(settings?.HelpUrl ?? AgentSettings.DefaultHelpUrl)
+        // What 'vfs365 health' reads meanwhile: no drive, and why
+        using var status = new StatusFile(StatusFile.DefaultPath, (StatusFile.Read(StatusFile.DefaultPath) ?? AgentStatus.ForThisProcess(DateTimeOffset.UtcNow)) with
+        {
+            ProcessId = Environment.ProcessId,
+            State = AgentStatus.NotStarted,
+            Problem = "stopped unexpectedly several times; Retry in the tray starts it again",
+            DriveLetter = null,
+        });
+        Tray? shown = null;
+        using var tray = shown = new Tray(settings?.Label ?? AgentSettings.DefaultLabel, new TrayActions(settings?.HelpUrl ?? AgentSettings.DefaultHelpUrl)
         {
             Retry = retry.Set,
             SessionEnded = () => ended = true,
+            CollectDiagnostics = () => SupportBundle.CollectFromTray(null, line => Write([$"Agent:      {line}"]), (title, text) => shown?.Notify(title, text)),
         }, line => Write([$"Agent:      {line}"]));
         tray.SetStatus(UiText.Get("Status.Stopped"), TrayState.Error);
         tray.Notify(UiText.Get("Stopped.Title"), UiText.Get("Stopped.Text"));

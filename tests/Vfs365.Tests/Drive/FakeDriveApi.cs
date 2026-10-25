@@ -173,13 +173,19 @@ sealed class FakeDriveApi : IDriveApi
     /// <summary>A change made elsewhere: new content for an existing file.</summary>
     public void RemoteEdit(string path, string content) => RemoteEdit(path, Encoding.UTF8.GetBytes(content));
 
-    public void RemoteEdit(string path, byte[] content)
+    /// <summary>A colleague's save: new content, saved by <paramref name="by"/> at <paramref name="at"/>.</summary>
+    public void RemoteEdit(string path, string content, string by, DateTimeOffset at) => RemoteEdit(path, Encoding.UTF8.GetBytes(content), by, at);
+
+    public void RemoteEdit(string path, byte[] content, string? by = null, DateTimeOffset? at = null)
     {
         lock (nodes)
         {
             var node = Find(path)!;
             node.Content = content;
-            node.Item = node.Item with { Size = node.Content.Length, ETag = $"e{++version}", CTag = $"c{version}" };
+            node.Item = node.Item with
+            {
+                Size = node.Content.Length, ETag = $"e{++version}", CTag = $"c{version}", ModifiedBy = by ?? node.Item.ModifiedBy, Modified = at ?? node.Item.Modified,
+            };
             Changed(node);
         }
     }
@@ -304,7 +310,8 @@ sealed class FakeDriveApi : IDriveApi
                 await hold();
             }
             var bytes = await File.ReadAllBytesAsync(sourceFile, ct);
-            return Commit(target, bytes, whole: true);
+            var item = Commit(target, bytes, whole: true);
+            return LoseAnswer?.Invoke(target) is { } lost ? throw lost : item;
         }
         finally
         {
@@ -323,6 +330,9 @@ sealed class FakeDriveApi : IDriveApi
         return Task.FromResult(session);
     }
 
+    /// <summary>Held at the start of each fragment, by its offset, to test what happens while one is in flight.</summary>
+    public Func<long, Task>? BeforeFragment { get; set; }
+
     /// <summary>Fails fragments by their offset (a timeout, a dropped connection).</summary>
     public Func<long, Exception?>? FailFragment { get; set; }
 
@@ -330,9 +340,17 @@ sealed class FakeDriveApi : IDriveApi
     {
         Interlocked.Increment(ref Fragments);
         await Task.Delay(5, ct);
+        if (BeforeFragment is { } hold)
+        {
+            await hold(offset);
+        }
         if (FailFragment?.Invoke(offset) is { } failure)
         {
             throw failure;
+        }
+        if (offset + length >= totalSize && FailFinalFragment?.Invoke() is { } final)
+        {
+            throw final;
         }
         var bytes = new byte[length];
         using (var file = File.OpenHandle(sourceFile, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
@@ -353,9 +371,60 @@ sealed class FakeDriveApi : IDriveApi
                 return null;
             }
             sessions.Remove(session.UploadUrl);
-            return Commit(target, buffer, whole: false);
+            var item = Commit(target, buffer, whole: false);
+            return LoseAnswer?.Invoke(target) is { } lost ? throw lost : item;
         }
     }
+
+    /// <summary>Fails the fragment that completes the file, before it is stored.</summary>
+    public Func<Exception?>? FailFinalFragment { get; set; }
+
+    /// <summary>An upload that goes through but whose answer is lost (a timeout, a dropped connection after the server committed it).</summary>
+    public Func<UploadTarget, Exception?>? LoseAnswer { get; set; }
+
+    /// <summary>The item at an upload's target with the quickXorHash of what it holds, as Graph lists it in file.hashes.</summary>
+    /// <summary>Looking an upload up fails (still offline).</summary>
+    public Func<Exception?>? FailUploadedLookup { get; set; }
+
+    public Task<UploadedItem?> GetUploadedAsync(string driveId, UploadTarget target, CancellationToken ct)
+    {
+        Interlocked.Increment(ref GetCalls);
+        if (FailUploadedLookup?.Invoke() is { } failure)
+        {
+            throw failure;
+        }
+        lock (nodes)
+        {
+            var node = target.ItemId is { } id ? nodes.GetValueOrDefault(id)
+                : ParentPathOf(target) is { } parent ? Find(Join(parent, target.Name!)) : null;
+            return Task.FromResult(node is null ? null : new UploadedItem(node.Item, QuickXorHash.Of(node.Content)));
+        }
+    }
+
+    /// <summary>The ETags deletes named (If-Match), in order.</summary>
+    public List<string?> DeleteIfMatches { get; } = [];
+
+    public async Task DeleteAsync(string driveId, string itemId, string? ifMatch, CancellationToken ct)
+    {
+        lock (DeleteIfMatches)
+        {
+            DeleteIfMatches.Add(ifMatch);
+        }
+        if (ifMatch is not null)
+        {
+            lock (nodes)
+            {
+                if (nodes.GetValueOrDefault(itemId) is { } node && node.Item.ETag != ifMatch)
+                {
+                    throw new RemoteException(RemoteError.Conflict, "412 eTag mismatch");
+                }
+            }
+        }
+        await DeleteAsync(driveId, itemId, ct);
+    }
+
+    /// <summary>A new file's folder: by ID when the target names one (as the engine does), else by path.</summary>
+    string? ParentPathOf(UploadTarget target) => target.ParentId is { } id ? nodes.GetValueOrDefault(id)?.Path : target.ParentPath;
 
     public Task CancelUploadSessionAsync(UploadSession session, CancellationToken ct)
     {
@@ -395,7 +464,7 @@ sealed class FakeDriveApi : IDriveApi
             return node.Item;
         }
 
-        var path = Join(target.ParentPath!, target.Name!);
+        var path = Join(ParentPathOf(target) ?? throw new RemoteException(RemoteError.NotFound, "404 parent itemNotFound"), target.Name!);
         if (Find(path) is not null)
         {
             throw new RemoteException(RemoteError.Conflict, "409 nameAlreadyExists");
@@ -413,7 +482,22 @@ sealed class FakeDriveApi : IDriveApi
         return Find(path) is not null ? throw new RemoteException(RemoteError.Conflict, "409 nameAlreadyExists") : Task.FromResult(Add(path, folder: true));
     }
 
-    public Task<DriveItemInfo> MoveAsync(string driveId, string itemId, string newParentId, string newName, CancellationToken ct)
+    /// <summary>Held at the start of each move or rename, to test what happens meanwhile.</summary>
+    public Func<Task>? BeforeMove { get; set; }
+
+    /// <summary>Every move or rename fails (503), as on a flaky network.</summary>
+    public bool FailMove { get; set; }
+
+    public async Task<DriveItemInfo> MoveAsync(string driveId, string itemId, string newParentId, string newName, CancellationToken ct)
+    {
+        if (BeforeMove is { } hold)
+        {
+            await hold();
+        }
+        return FailMove ? throw new RemoteException(RemoteError.Unavailable, "503") : MoveNow(itemId, newParentId, newName);
+    }
+
+    DriveItemInfo MoveNow(string itemId, string newParentId, string newName)
     {
         Interlocked.Increment(ref Moves);
         lock (nodes)
@@ -431,7 +515,7 @@ sealed class FakeDriveApi : IDriveApi
             node.Path = newPath;
             node.Item = node.Item with { Name = newName, ETag = $"e{++version}" };
             Changed(node);
-            return Task.FromResult(node.Item);
+            return node.Item;
         }
     }
 

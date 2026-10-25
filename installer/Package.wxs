@@ -50,6 +50,15 @@
       <RemoveRegistryKey Root="HKLM" Key="SOFTWARE\Microsoft\Active Setup\Installed Components\{76103053-0966-49F3-9EE8-923401C976B1}" Action="removeOnInstall" />
     </Component>
 
+    <!-- Event source VFS365 in the Application log (AgentEvents, IDs in docs/DEPLOYMENT.md): EventCreate.exe's message table has "%1"
+         for IDs 1 to 1000, so each event shows its own text. Removed at uninstall. -->
+    <Component Id="EventSource" Directory="INSTALLFOLDER" Guid="{3BBAAC83-E75F-4785-B0CF-BBE497856165}" Bitness="always64">
+      <RegistryKey Root="HKLM" Key="SYSTEM\CurrentControlSet\Services\EventLog\Application\VFS365" ForceDeleteOnUninstall="yes">
+        <RegistryValue Name="EventMessageFile" Type="expandable" Value="%SystemRoot%\System32\EventCreate.exe" KeyPath="yes" />
+        <RegistryValue Name="TypesSupported" Type="integer" Value="7" />
+      </RegistryKey>
+    </Component>
+
     <!-- Start menu: starts the agent again after it was stopped (it runs once per session) -->
     <StandardDirectory Id="ProgramMenuFolder">
       <Component Id="StartMenuShortcut" Guid="{1A021878-FCF8-4899-B01F-1FBEE5AA4288}">
@@ -112,6 +121,7 @@
     <Feature Id="Main">
       <ComponentGroupRef Id="AppFiles" />
       <ComponentRef Id="AutoStart" />
+      <ComponentRef Id="EventSource" />
       <ComponentRef Id="StartMenuShortcut" />
       <ComponentRef Id="NetworkProvider" />
       <ComponentRef Id="NetworkProvider32" />

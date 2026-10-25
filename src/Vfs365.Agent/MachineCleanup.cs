@@ -30,19 +30,32 @@ public static class MachineCleanup
 
     /// <summary>
     /// Signals every running agent, waits up to <paramref name="timeout"/> for them to finish uploading and unmount, then ends the rest.
-    /// A session's stop event counts only when the user its agent runs as owns it (<see cref="AgentControl.RequestStop(int, SecurityIdentifier, bool)"/>).
+    /// Only processes of the programs in this program's folder (the install folder) count: another program under the same name is left
+    /// alone. A session's stop event counts only when the user its agent runs as owns it (<see cref="AgentControl.RequestStop(int, SecurityIdentifier, bool)"/>).
     /// </summary>
     public static void StopAgents(TimeSpan timeout, bool dryRun, Action<string> say)
     {
-        var agents = AgentNames.SelectMany(Process.GetProcessesByName).Where(p => p.Id != Environment.ProcessId).ToList();
-        foreach (var session in agents.GroupBy(p => p.SessionId))
+        var installFolder = AppContext.BaseDirectory;
+        var agents = new List<(Process Process, (SecurityIdentifier User, Version Version)? Found)>();
+        foreach (var process in AgentNames.SelectMany(Process.GetProcessesByName).Where(p => p.Id != Environment.ProcessId))
+        {
+            if (Describe(process, installFolder) is { } described)
+            {
+                agents.Add((process, described.User is null ? null : (described.User, described.Version)));
+            }
+            else
+            {
+                say($"Leaving {process.ProcessName} ({process.Id}) in session {process.SessionId}: not VFS365's program in {installFolder}");
+            }
+        }
+        foreach (var session in agents.GroupBy(a => a.Process.SessionId))
         {
             if (dryRun)
             {
                 say($"Would stop the agent in session {session.Key}");
                 continue;
             }
-            var found = session.Select(Describe).OfType<(SecurityIdentifier User, Version Version)>().ToList();
+            var found = session.Select(a => a.Found).OfType<(SecurityIdentifier User, Version Version)>().ToList();
             var legacy = found.Any(a => a.Version < AgentControl.FirstSessionEvent);
             say(found.Select(a => a.User).Distinct().Any(user => AgentControl.RequestStop(session.Key, user, legacy))
                 ? $"Asked the agent in session {session.Key} to stop"
@@ -54,7 +67,7 @@ public static class MachineCleanup
         }
 
         var deadline = DateTime.UtcNow + timeout;
-        foreach (var agent in agents)
+        foreach (var agent in agents.Select(a => a.Process))
         {
             var left = deadline - DateTime.UtcNow;
             if (left > TimeSpan.Zero && agent.WaitForExit(left))
@@ -72,8 +85,12 @@ public static class MachineCleanup
         }
     }
 
-    /// <summary>The user an agent process runs as and the version of its program; null when they can't be read.</summary>
-    static (SecurityIdentifier User, Version Version)? Describe(Process agent)
+    /// <summary>
+    /// An agent process whose program is in <paramref name="installFolder"/>: the user it runs as (null when it can't be read) and the
+    /// version of that program, read from the install folder (never from a path a user chose: this runs as SYSTEM). Null for a process
+    /// of another program, or one whose program can't be read.
+    /// </summary>
+    internal static (SecurityIdentifier? User, Version Version)? Describe(Process agent, string installFolder)
     {
         var process = OpenProcess(0x1000, false, agent.Id); // query limited information
         if (process == IntPtr.Zero)
@@ -82,30 +99,29 @@ public static class MachineCleanup
         }
         try
         {
-            if (!OpenProcessToken(process, 0x8, out var token)) // query
-            {
-                return null;
-            }
-            SecurityIdentifier? user;
-            try
-            {
-                using var identity = new WindowsIdentity(token);
-                user = identity.User;
-            }
-            finally
-            {
-                CloseHandle(token);
-            }
             var path = new StringBuilder(1024);
             var length = path.Capacity;
-            if (user is null || !QueryFullProcessImageNameW(process, 0, path, ref length))
+            if (!QueryFullProcessImageNameW(process, 0, path, ref length) || !InFolder(path.ToString(), installFolder))
             {
                 return null;
             }
-            var file = FileVersionInfo.GetVersionInfo(path.ToString());
+            SecurityIdentifier? user = null;
+            if (OpenProcessToken(process, 0x8, out var token)) // query
+            {
+                try
+                {
+                    using var identity = new WindowsIdentity(token);
+                    user = identity.User;
+                }
+                finally
+                {
+                    CloseHandle(token);
+                }
+            }
+            var file = FileVersionInfo.GetVersionInfo(Path.Combine(installFolder, Path.GetFileName(path.ToString())));
             return (user, new Version(file.FileMajorPart, file.FileMinorPart, file.FileBuildPart));
         }
-        catch (Exception e) when (e is ArgumentException or System.Security.SecurityException or UnauthorizedAccessException or FileNotFoundException)
+        catch (Exception e) when (e is ArgumentException or System.Security.SecurityException or UnauthorizedAccessException or IOException)
         {
             return null;
         }
@@ -114,6 +130,10 @@ public static class MachineCleanup
             CloseHandle(process);
         }
     }
+
+    /// <summary>True when <paramref name="program"/> is a file right in <paramref name="folder"/>.</summary>
+    internal static bool InFolder(string program, string folder) =>
+        string.Equals(Path.GetDirectoryName(Path.GetFullPath(program)), Path.GetFullPath(folder).TrimEnd('\\'), StringComparison.OrdinalIgnoreCase);
 
     [DllImport("kernel32.dll", SetLastError = true)]
     static extern IntPtr OpenProcess(uint access, bool inherit, int processId);
@@ -217,10 +237,194 @@ public static class MachineCleanup
         }
     }
 
+    const string ExplorerKey = @"Software\Microsoft\Windows\CurrentVersion\Explorer";
+    const string PolicyKey = @"SOFTWARE\Policies\JSolve\VFS365";
+
+    /// <summary>
+    /// Puts back known folders VFS365 left in the volume (an agent ended after 60 s, a crash, a stop before the mount, a restore that
+    /// failed) for every signed-in user (hive loaded under HKEY_USERS): each User Shell Folders value on \\VFS365\ or on the user's
+    /// VFS365 drive letter goes back to where VFS365 found it (the profile's redirection.json), else to Windows' default. Shell Folders
+    /// follows. Runs as SYSTEM in keys the user controls: they are opened one at a time without following registry links, values are
+    /// compared as text and never expanded or opened (a path on \\VFS365 would send the computer's credentials to whoever answers that
+    /// name), and redirection.json is read through the checked data folder. Users who are signed out get the same at their next sign-in
+    /// (<see cref="LogonCleanupCommand"/>). Run before <see cref="RemoveUserData"/>, which removes redirection.json.
+    /// </summary>
+    public static void RestoreKnownFolders(IEnumerable<UserProfile> profiles, bool dryRun, Action<string> say)
+    {
+        var machineLetter = PolicyLetter(Registry.LocalMachine, say);
+        foreach (var profile in profiles)
+        {
+            try
+            {
+                using var hive = Registry.Users.OpenSubKey(profile.User.Value);
+                if (hive is null)
+                {
+                    continue; // signed out: the logon cleanup does it
+                }
+                var state = ReadState(profile);
+                var letters = state.Select(m => m.Target).Where(t => t.Length >= 2 && t[1] == ':').Select(t => t[..2].ToUpperInvariant())
+                    .Append(machineLetter ?? PolicyLetter(hive, say) ?? "").Where(l => l.Length > 0).ToHashSet(StringComparer.OrdinalIgnoreCase);
+                RestoreKnownFolders(hive, profile.Folder, state, letters, dryRun, line => say($"{profile.User}: {line}"));
+            }
+            catch (Exception e)
+            {
+                // Whatever happens in one user's registry, the others are put back
+                say($"Could not check the folders of {profile.User}: {e.Message}");
+            }
+        }
+    }
+
+    /// <summary>The folders of one user's <paramref name="hive"/>. Returns how many values were reset.</summary>
+    internal static int RestoreKnownFolders(RegistryKey hive, string profileFolder, IReadOnlyList<FolderRedirection.Moved> state, IReadOnlySet<string> letters,
+        bool dryRun, Action<string> say)
+    {
+        var reset = 0;
+        foreach (var (keyName, expanded) in new[] { ("User Shell Folders", false), ("Shell Folders", true) })
+        {
+            using var key = NoFollowRegistry.Open(hive, $@"{ExplorerKey}\{keyName}", writable: !dryRun, say);
+            if (key is null)
+            {
+                continue;
+            }
+            foreach (var name in key.GetValueNames())
+            {
+                if (key.GetValue(name, null, RegistryValueOptions.DoNotExpandEnvironmentNames) is not string value || !InVfs365(value, letters))
+                {
+                    continue;
+                }
+                var replacement = Replacement(name, value, state, profileFolder, letters);
+                if (expanded && replacement is not null)
+                {
+                    replacement = replacement.Replace("%USERPROFILE%", profileFolder, StringComparison.OrdinalIgnoreCase);
+                }
+                say($"{(dryRun ? "Would set" : "Setting")} {keyName}\\{name} from {value} to {replacement ?? "Windows' default (value removed)"}");
+                reset++;
+                if (dryRun)
+                {
+                    continue;
+                }
+                if (replacement is null)
+                {
+                    key.DeleteValue(name, false);
+                }
+                else
+                {
+                    key.SetValue(name, replacement, expanded ? RegistryValueKind.String : RegistryValueKind.ExpandString);
+                }
+            }
+        }
+        return reset;
+    }
+
+    /// <summary>A folder path on \\VFS365\ or on one of <paramref name="letters"/> ("M:").</summary>
+    internal static bool InVfs365(string path, IReadOnlySet<string> letters) =>
+        path.StartsWith(@"\\VFS365\", StringComparison.OrdinalIgnoreCase)
+        || (path.Length >= 2 && path[1] == ':' && letters.Contains(path[..2]) && (path.Length == 2 || path[2] == '\\'));
+
+    /// <summary>
+    /// What a value in VFS365 goes back to: the original of the redirection.json record for that folder and target (with
+    /// %USERPROFILE% for the profile), else Windows' default for the folder; null (remove the value: Windows' default) for other folders.
+    /// </summary>
+    static string? Replacement(string name, string value, IReadOnlyList<FolderRedirection.Moved> state, string profileFolder, IReadOnlySet<string> letters)
+    {
+        var known = KnownFolders.ShellFolderValues.FirstOrDefault(v => v.Value.Equals(name, StringComparison.OrdinalIgnoreCase));
+        Guid? id = known.Value is not null ? known.Id : Guid.TryParse(name, out var parsed) ? parsed : null;
+        var records = state.Where(m => m.Target.TrimEnd('\\').Equals(value.TrimEnd('\\'), StringComparison.OrdinalIgnoreCase) && !InVfs365(m.Original, letters)).ToList();
+        if ((records.FirstOrDefault(m => id is { } folder && m.Ids.Contains(folder)) ?? (records.Count == 1 ? records[0] : null)) is { } moved)
+        {
+            var original = moved.Original.TrimEnd('\\');
+            return original.StartsWith(profileFolder.TrimEnd('\\') + @"\", StringComparison.OrdinalIgnoreCase)
+                ? "%USERPROFILE%" + original[profileFolder.TrimEnd('\\').Length..]
+                : original;
+        }
+        return known.Value is not null ? $@"%USERPROFILE%\{known.Default}" : null;
+    }
+
+    /// <summary>The profile's redirection.json, read through the checked data folder; empty when there is none or it can't be read.</summary>
+    internal static IReadOnlyList<FolderRedirection.Moved> ReadState(UserProfile profile) =>
+        ReadDataFile(profile, FolderRedirection.StateFileName) is { } json ? FolderRedirection.ParseState(json) : [];
+
+    /// <summary>A small file of the profile's VFS365 folder, read through the checked data folder; null when it is missing, a link or can't be read.</summary>
+    internal static string? ReadDataFile(UserProfile profile, string name)
+    {
+        try
+        {
+            using var data = NoFollow.OpenDataFolder(profile, _ => { }); // RemoveUserData reports a folder it skips
+            return data is null ? null : NoFollow.ReadText(data, name, 1 << 20);
+        }
+        catch (Exception e) when (e is Win32Exception or IOException or UnauthorizedAccessException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>The drive letter ("M:") a DriveLetter policy in <paramref name="root"/> (HKLM, or a user's hive) gives; null for none, * or no policy.</summary>
+    static string? PolicyLetter(RegistryKey root, Action<string> say)
+    {
+        try
+        {
+            using var policy = NoFollowRegistry.Open(root, PolicyKey, writable: false, say);
+            return DriveLetterOption.Parse(policy?.GetValue("DriveLetter", null, RegistryValueOptions.DoNotExpandEnvironmentNames) as string).MountPoint;
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException or System.Security.SecurityException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>Registry keys opened one at a time, never through a registry link (REG_OPTION_OPEN_LINK, then refused when it is one).</summary>
+    static class NoFollowRegistry
+    {
+        const uint OpenLink = 0x8;
+        const int QueryValue = 0x1, SetValue = 0x2, EnumerateSubKeys = 0x8, RegLink = 6;
+
+        /// <summary><paramref name="path"/> below <paramref name="root"/>; null when a key is missing or a link (said why).</summary>
+        public static RegistryKey? Open(RegistryKey root, string path, bool writable, Action<string> say)
+        {
+            SafeRegistryHandle? held = null;
+            try
+            {
+                var names = path.Split('\\');
+                for (var i = 0; i < names.Length; i++)
+                {
+                    var access = QueryValue | EnumerateSubKeys | (writable && i == names.Length - 1 ? SetValue : 0);
+                    var error = RegOpenKeyExW(held ?? root.Handle, names[i], OpenLink, access, out var next);
+                    if (error != 0)
+                    {
+                        next.Dispose();
+                        return null;
+                    }
+                    held?.Dispose();
+                    held = next;
+                    var size = 0u;
+                    if (RegQueryValueExW(held, "SymbolicLinkValue", IntPtr.Zero, out var type, IntPtr.Zero, ref size) == 0 && type == RegLink)
+                    {
+                        say($"Skipping {root.Name}\\{string.Join('\\', names[..(i + 1)])}: it is a registry link");
+                        return null;
+                    }
+                }
+                var key = RegistryKey.FromHandle(held!);
+                held = null;
+                return key;
+            }
+            finally
+            {
+                held?.Dispose();
+            }
+        }
+
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode)]
+        static extern int RegOpenKeyExW(SafeRegistryHandle key, string subKey, uint options, int access, out SafeRegistryHandle result);
+
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode)]
+        static extern int RegQueryValueExW(SafeRegistryHandle key, string name, IntPtr reserved, out int type, IntPtr data, ref uint size);
+    }
+
     /// <summary>
     /// Removes the Explorer entries from the registry of every signed-in user (their hives are loaded under HKEY_USERS), and registers
-    /// an Active Setup component that removes them for everyone else at their next logon, in their own context. That reaches roaming
-    /// and FSLogix profiles too and never loads a hive a user controls as SYSTEM.
+    /// an Active Setup component that removes them for everyone else at their next logon, in their own context, and resets their known
+    /// folders left in VFS365 (<see cref="LogonCleanupCommand"/>). That reaches roaming and FSLogix profiles too and never loads a hive a
+    /// user controls as SYSTEM.
     /// </summary>
     public static void RemoveExplorerEntries(bool dryRun, Action<string> say)
     {
@@ -244,14 +448,16 @@ public static class MachineCleanup
             }
         }
 
-        say($"{(dryRun ? "Would register" : "Registering")} the removal of Explorer entries at each user's next logon (Active Setup)");
+        say($"{(dryRun ? "Would register" : "Registering")} the removal of Explorer entries and folders left in VFS365 at each user's next logon (Active Setup)");
         if (!dryRun)
         {
             try
             {
+                var letter = PolicyLetter(Registry.LocalMachine, say);
                 using var component = Registry.LocalMachine.CreateSubKey(ActiveSetupKey);
                 component.SetValue("", "VFS365 removal");
-                component.SetValue("StubPath", LogonCleanupCommand(), RegistryValueKind.ExpandString);
+                // Not expandable: Windows would expand %...% pairs in the command, which uses % for itself
+                component.SetValue("StubPath", LogonCleanupCommand(letter is null ? [] : [letter]), RegistryValueKind.String);
                 component.SetValue("Version", ActiveSetupVersion(DateTime.UtcNow));
                 component.SetValue("IsInstalled", 1, RegistryValueKind.DWord);
             }
@@ -265,28 +471,41 @@ public static class MachineCleanup
     /// <summary>Higher at every uninstall, so users who ran an earlier cleanup run it again.</summary>
     public static string ActiveSetupVersion(DateTime utc) => $"{utc.Year},{utc.Month * 100 + utc.Day},{utc.Hour * 100 + utc.Minute},{utc.Second}";
 
-    /// <summary>What ExplorerLocation.Unregister removes, with built-in tools only (VFS365 is gone by then); the drive name is per user name.</summary>
-    public static string LogonCleanupCommand()
+    /// <summary>
+    /// What ExplorerLocation.Unregister removes, every drive name (##VFS365#... in MountPoints2: the drive's and DriveMappings'), and each
+    /// User Shell Folders value left on \\VFS365\ or on <paramref name="letters"/> ("M:") reset to Windows' default; with built-in tools
+    /// only (VFS365 is gone by then). <paramref name="root"/>: the hive (HKCU; a key of their own for tests).
+    /// </summary>
+    public static string LogonCleanupCommand(IReadOnlyCollection<string> letters, string root = "HKCU")
     {
-        const string reg = @"%SystemRoot%\System32\reg.exe";
-        const string explorer = @"HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer";
+        var system = Environment.SystemDirectory;
+        var reg = Path.Combine(system, "reg.exe");
+        var findstr = Path.Combine(system, "findstr.exe");
+        var explorer = $@"{root}\{ExplorerKey}";
         var clsid = ExplorerLocation.Clsid;
-        var deletes = new[]
-        {
-            $@"""{reg}"" delete ""HKCU\Software\Classes\CLSID\{clsid}"" /f",
-            $@"""{reg}"" delete ""HKCU\Software\Classes\WOW6432Node\CLSID\{clsid}"" /f",
-            $@"""{reg}"" delete ""{explorer}\Desktop\NameSpace\{clsid}"" /f",
-            $@"""{reg}"" delete ""{explorer}\HideDesktopIcons\NewStartPanel"" /v ""{clsid}"" /f",
-            $@"""{reg}"" delete ""{explorer}\MountPoints2\##VFS365#%USERNAME%"" /f",
-        };
-        return $@"%SystemRoot%\System32\cmd.exe /d /q /s /c ""{string.Join(" & ", deletes.Select(d => d + " >nul 2>&1"))}""";
+        // findstr patterns for a value's data in reg's output ("    Personal    REG_EXPAND_SZ    \\VFS365\ann\..."); \\\\ is one \ there
+        var inVfs365 = string.Concat(letters.Select(l => $@"{l}\\\\").Prepend(@"\\\\VFS365\\\\").Select(p => $@" /c:""_SZ    {p}"""));
+        var defaults = string.Join(" ", KnownFolders.ShellFolderValues.Select(v => $@"""{v.Value}={v.Default}"""));
+        string[] steps =
+        [
+            .. ExplorerVerbs.RegPaths(root).Select(menu => $@"""{reg}"" delete ""{menu}"" /f >nul 2>&1"),
+            $@"""{reg}"" delete ""{root}\Software\Classes\CLSID\{clsid}"" /f >nul 2>&1",
+            $@"""{reg}"" delete ""{root}\Software\Classes\WOW6432Node\CLSID\{clsid}"" /f >nul 2>&1",
+            $@"""{reg}"" delete ""{explorer}\Desktop\NameSpace\{clsid}"" /f >nul 2>&1",
+            $@"""{reg}"" delete ""{explorer}\HideDesktopIcons\NewStartPanel"" /v ""{clsid}"" /f >nul 2>&1",
+            $@"(for /f ""delims="" %k in ('{reg} query ""{explorer}\MountPoints2"" /f ##VFS365# /k 2^>nul ^| {findstr} /i /c:""\##VFS365#""') do ""{reg}"" delete ""%k"" /f >nul 2>&1)",
+            // %^USERPROFILE% outside quotes: cmd removes the caret but doesn't expand it, so the value says %USERPROFILE% as Windows' own do
+            $@"(for %v in ({defaults}) do for /f ""tokens=1,2 delims=="" %a in (%v) do (""{reg}"" query ""{explorer}\User Shell Folders"" /v ""%a"" 2>nul | " +
+                $@"""{findstr}"" /i /r{inVfs365} >nul && ""{reg}"" add ""{explorer}\User Shell Folders"" /v ""%a"" /t REG_EXPAND_SZ /d %^USERPROFILE%""\%b"" /f >nul 2>&1))",
+        ];
+        return $@"""{Path.Combine(system, "cmd.exe")}"" /d /q /s /c ""{string.Join(" & ", steps)}""";
     }
 
     /// <summary>Opens and deletes through handles, never following reparse points (ntdll relative opens).</summary>
     static class NoFollow
     {
-        const uint ListDirectory = 0x1, ReadAttributes = 0x80, DeleteAccess = 0x10000, ReadControl = 0x20000, Synchronize = 0x100000;
-        const uint DirectoryFile = 0x1, SynchronousIo = 0x20, OpenForBackup = 0x4000, OpenReparsePoint = 0x200000;
+        const uint ListDirectory = 0x1, ReadData = 0x1, ReadAttributes = 0x80, DeleteAccess = 0x10000, ReadControl = 0x20000, Synchronize = 0x100000;
+        const uint DirectoryFile = 0x1, SynchronousIo = 0x20, NonDirectoryFile = 0x40, OpenForBackup = 0x4000, OpenReparsePoint = 0x200000;
         const uint ReparsePointAttribute = 0x400, DirectoryAttribute = 0x10;
 
         /// <summary>The profile's VFS365 folder, checked; null (and said why) when it is a link or someone else's.</summary>
@@ -334,6 +553,34 @@ public static class MachineCleanup
             catch (Win32Exception e) when (e.NativeErrorCode is 2 or 3 or 267) // not found, or not a folder
             {
                 return 0;
+            }
+        }
+
+        /// <summary>A small file's text in the folder <paramref name="parent"/> is open on; null when it is missing, a link or larger than <paramref name="maxBytes"/>.</summary>
+        public static string? ReadText(SafeFileHandle parent, string name, int maxBytes)
+        {
+            SafeFileHandle file;
+            try
+            {
+                file = Open(parent, name, ReadData | ReadAttributes, NonDirectoryFile);
+            }
+            catch (Win32Exception e) when (e.NativeErrorCode is 2 or 3)
+            {
+                return null;
+            }
+            using (file)
+            {
+                if ((Attributes(file) & ReparsePointAttribute) != 0)
+                {
+                    return null;
+                }
+                using var stream = new FileStream(file, FileAccess.Read, 1, isAsync: false);
+                if (stream.Length > maxBytes)
+                {
+                    return null;
+                }
+                using var reader = new StreamReader(stream);
+                return reader.ReadToEnd();
             }
         }
 

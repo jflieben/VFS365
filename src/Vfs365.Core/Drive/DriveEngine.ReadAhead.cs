@@ -52,7 +52,8 @@ public sealed partial class DriveEngine
             }
             walk.ActiveUntil = Now + options.WalkWindow;
         }
-        ReadNextAhead(driveId, file, walk);
+        // On the thread pool: the caller is a file system dispatcher thread, and starting downloads creates their cache files
+        _ = Task.Run(() => ReadNextAhead(driveId, file, walk));
     }
 
     /// <summary>Starts downloads of the files after <paramref name="file"/> in its folder's listing order, while there is room.</summary>
@@ -64,18 +65,21 @@ public sealed partial class DriveEngine
         }
         foreach (var item in FilesAfter(listing.SortedFiles(), file.Name).Where(i => i.Size > 0 && i.Size <= options.ReadAheadMaxSize).Take(options.ReadAheadFiles * 2))
         {
+            // In memory: cached, downloading or changed here
+            if (content.Has(driveId, item.Id, item.CTag ?? item.ETag) || overlay.ContainsKey(Key(driveId, JoinDrivePath(ParentOf(file.DrivePath), item.Name))))
+            {
+                continue;
+            }
             lock (walk)
             {
                 if (walk.Ahead.Count >= options.ReadAheadFiles)
                 {
                     return;
                 }
-                if (walk.Ahead.Contains(item.Id) || content.Has(driveId, item.Id, item.CTag ?? item.ETag)
-                    || overlay.ContainsKey(Key(driveId, JoinDrivePath(ParentOf(file.DrivePath), item.Name))))
+                if (!walk.Ahead.Add(item.Id))
                 {
                     continue;
                 }
-                walk.Ahead.Add(item.Id);
                 walk.Loaded++;
             }
             _ = ReadAheadAsync(driveId, item, walk);

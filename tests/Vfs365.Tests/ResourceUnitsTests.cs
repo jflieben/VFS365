@@ -48,7 +48,7 @@ public class ResourceUnitsTests
     [Fact]
     public void Budget_holds_a_minute_and_refills()
     {
-        var now = DateTimeOffset.UnixEpoch;
+        var now = TimeSpan.Zero;
         var budget = new RequestBudget(60, () => now);
         for (var i = 0; i < 30; i++)
         {
@@ -64,7 +64,7 @@ public class ResourceUnitsTests
     [Fact]
     public void Background_work_only_uses_the_upper_half()
     {
-        var now = DateTimeOffset.UnixEpoch;
+        var now = TimeSpan.Zero;
         var budget = new RequestBudget(60, () => now);
         Assert.True(budget.TryTake(28, background: true, out _));
         Assert.False(budget.TryTake(4, background: true, out var wait));
@@ -75,7 +75,7 @@ public class ResourceUnitsTests
     [Fact]
     public async Task Waits_are_counted_per_kind()
     {
-        var now = DateTimeOffset.UnixEpoch;
+        var now = TimeSpan.Zero;
         var budget = new RequestBudget(60, () => now);
         Assert.True(budget.TryTake(30, background: true, out _)); // the upper half is gone
         var waiting = budget.TakeAsync(2, background: true, CancellationToken.None);
@@ -88,7 +88,7 @@ public class ResourceUnitsTests
     [Fact]
     public async Task Promoted_work_takes_from_the_whole_budget()
     {
-        var now = DateTimeOffset.UnixEpoch;
+        var now = TimeSpan.Zero;
         var never = new TaskCompletionSource();
         var budget = new RequestBudget(60, () => now, (_, _) => never.Task);
         Assert.True(budget.TryTake(30, background: true, out _)); // the upper half is gone
@@ -105,13 +105,28 @@ public class ResourceUnitsTests
     [Fact]
     public void Adjust_takes_more_or_gives_back()
     {
-        var now = DateTimeOffset.UnixEpoch;
+        var now = TimeSpan.Zero;
         var budget = new RequestBudget(60, () => now);
         budget.Adjust(70);
         Assert.False(budget.TryTake(1, background: false, out var wait));
         Assert.Equal(11, wait.TotalSeconds, 3);
         budget.Adjust(-100);
         Assert.True(budget.TryTake(60, background: false, out _));
+    }
+
+    [Fact]
+    public void A_clock_that_goes_back_neither_drains_nor_stalls_the_budget()
+    {
+        var now = TimeSpan.FromHours(1);
+        var budget = new RequestBudget(60, () => now);
+        Assert.True(budget.TryTake(60, background: false, out _));
+
+        now -= TimeSpan.FromMinutes(10);
+        Assert.False(budget.TryTake(2, background: false, out var wait));
+        Assert.Equal(TimeSpan.FromSeconds(2), wait); // not 10 minutes more
+
+        now += TimeSpan.FromSeconds(2);
+        Assert.True(budget.TryTake(2, background: false, out _));
     }
 
     [Fact]

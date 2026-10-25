@@ -124,7 +124,7 @@ public sealed class Monitoring(MonitoringTarget target, DeviceInfo device, Actio
     public const string Instructions = "https://github.com/jflieben/VFS365/blob/main/docs/DEPLOYMENT.md#monitoring";
     const int MaxErrorsPerHour = 20;
 
-    static readonly HttpClient http = new() { Timeout = TimeSpan.FromSeconds(15) };
+    static readonly HttpClient http = new(Vfs365.Graph.M365Client.CreateHandler()) { Timeout = TimeSpan.FromSeconds(15) };
 
     readonly Lock gate = new();
     readonly List<Task> pending = [];

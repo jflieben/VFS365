@@ -76,7 +76,14 @@
       "signedProtocol": "https",
       "signedExpiry": "[dateTimeAdd(parameters('now'), format('P{0}D', max(parameters('dashboardSasDays'), 1)), 'yyyy-MM-ddTHH:mm:ssZ')]"
     },
-    "script": "set -e\npython3 -c 'import sys, urllib.request; urllib.request.urlretrieve(sys.argv[1], \"vfs365-monitoring.html\")' \"$SOURCE\"\ngrep -q 'VFS365 monitoring' vfs365-monitoring.html\naz storage blob service-properties update --account-name \"$ACCOUNT\" --account-key \"$KEY\" --static-website --index-document vfs365-monitoring.html --404-document vfs365-monitoring.html --output none\naz storage blob upload --account-name \"$ACCOUNT\" --account-key \"$KEY\" --container-name '$web' --name vfs365-monitoring.html --file vfs365-monitoring.html --content-type 'text/html; charset=utf-8' --overwrite --output none\n"
+    "uploadSas": {
+      "signedServices": "b",
+      "signedResourceTypes": "sco",
+      "signedPermission": "rcw",
+      "signedProtocol": "https",
+      "signedExpiry": "[dateTimeAdd(parameters('now'), 'PT1H', 'yyyy-MM-ddTHH:mm:ssZ')]"
+    },
+    "script": "set -e\npython3 -c 'import sys, urllib.request; urllib.request.urlretrieve(sys.argv[1], \"vfs365-monitoring.html\")' \"$SOURCE\"\ngrep -q 'VFS365 monitoring' vfs365-monitoring.html\naz storage blob service-properties update --account-name \"$ACCOUNT\" --sas-token \"$SAS\" --static-website --index-document vfs365-monitoring.html --404-document vfs365-monitoring.html --output none\naz storage blob upload --account-name \"$ACCOUNT\" --sas-token \"$SAS\" --container-name '$web' --name vfs365-monitoring.html --file vfs365-monitoring.html --content-type 'text/html; charset=utf-8' --content-cache-control 'no-cache' --overwrite --output none\n"
   },
   "resources": [
     {
@@ -101,7 +108,7 @@
       "dependsOn": [ "[variables('storageId')]" ],
       "properties": {
         "cors": {
-          "corsRules": "[if(and(not(parameters('hostDashboard')), empty(parameters('extraCorsOrigins'))), createArray(), createArray(createObject('allowedOrigins', union(if(parameters('hostDashboard'), createArray(replace(reference(variables('storageId'), '2023-05-01').primaryEndpoints.web, '.net/', '.net')), createArray()), parameters('extraCorsOrigins')), 'allowedMethods', createArray('GET', 'OPTIONS'), 'allowedHeaders', createArray('*'), 'exposedHeaders', createArray('*'), 'maxAgeInSeconds', 3600)))]"
+          "corsRules": "[if(and(not(parameters('hostDashboard')), empty(parameters('extraCorsOrigins'))), createArray(), createArray(createObject('allowedOrigins', union(if(parameters('hostDashboard'), createArray(if(endsWith(reference(variables('storageId'), '2023-05-01').primaryEndpoints.web, '/'), take(reference(variables('storageId'), '2023-05-01').primaryEndpoints.web, sub(length(reference(variables('storageId'), '2023-05-01').primaryEndpoints.web), 1)), reference(variables('storageId'), '2023-05-01').primaryEndpoints.web)), createArray()), parameters('extraCorsOrigins')), 'allowedMethods', createArray('GET', 'OPTIONS'), 'allowedHeaders', createArray('*'), 'exposedHeaders', createArray('*'), 'maxAgeInSeconds', 3600)))]"
         }
       }
     },
@@ -121,13 +128,14 @@
       "kind": "AzureCLI",
       "dependsOn": [ "[variables('storageId')]" ],
       "properties": {
-        "azCliVersion": "2.61.0",
+        "azCliVersion": "2.89.1",
+        "forceUpdateTag": "[parameters('now')]",
         "timeout": "PT15M",
         "retentionInterval": "PT1H",
         "cleanupPreference": "OnSuccess",
         "environmentVariables": [
           { "name": "ACCOUNT", "value": "[parameters('storageAccountName')]" },
-          { "name": "KEY", "secureValue": "[listKeys(variables('storageId'), '2023-05-01').keys[0].value]" },
+          { "name": "SAS", "secureValue": "[listAccountSas(variables('storageId'), '2023-05-01', variables('uploadSas')).accountSasToken]" },
           { "name": "SOURCE", "value": "[parameters('dashboardSource')]" }
         ],
         "scriptContent": "[variables('script')]"

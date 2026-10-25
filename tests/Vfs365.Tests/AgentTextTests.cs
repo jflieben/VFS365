@@ -67,6 +67,8 @@ public sealed class AgentTextTests
         Assert.Equal("multi-factor authentication is needed", SignInText.Of(new SignInException("AADSTS50076", "AADSTS50076: MFA", true), English));
         Assert.Equal("aanmelden is geannuleerd", SignInText.Of(new SignInException(SignInException.Cancelled, "cancelled", true), Dutch));
         Assert.Equal("sign-in failed", SignInText.Of(new SignInException("wam_CAA20004", "something"), English));
+        Assert.Equal("de aanmelding van Windows (Web Account Manager) werkt niet",
+            SignInText.Of(new SignInException(SignInException.Unavailable, "Windows' sign-in (WAM) failed: ..."), Dutch));
     }
 
     static EngineNotice Waiting(string name, string detail) => new(NoticeKind.UploadWaiting, name, $@"\OneDrive\{name}", detail);

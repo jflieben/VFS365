@@ -1,0 +1,282 @@
+using System.Diagnostics;
+using System.Security.Cryptography;
+using Vfs365.Core;
+using Vfs365.Core.Discovery;
+using Vfs365.Core.Drive;
+using Xunit.Abstractions;
+
+namespace Vfs365.Tests.Drive;
+
+/// <summary>Timings: run on their own, so they neither wait behind other tests nor slow down other tests' timings.</summary>
+[CollectionDefinition(nameof(WriteGateTests), DisableParallelization = true)]
+public sealed class WriteGateCollection;
+
+/// <summary>
+/// Long work on one file never holds the write gate, which every create, delete, rename and close of every other file waits for:
+/// probes create unrelated files while it runs, and their longest wait is the longest the gate was held meanwhile.
+/// </summary>
+[Collection(nameof(WriteGateTests))]
+public sealed class WriteGateTests(ITestOutputHelper output) : IDisposable
+{
+    readonly string directory = Path.Combine(Path.GetTempPath(), "vfs365-tests", Guid.NewGuid().ToString("N"));
+    readonly FakeDriveApi api = new();
+    DateTimeOffset now = new(2026, 10, 25, 12, 0, 0, TimeSpan.Zero);
+
+    const string Root = "\\OneDrive\\";
+    const int MiB = 1024 * 1024;
+
+    /// <summary>What a probe may wait at most: the gate held only for bookkeeping, on a busy build machine.</summary>
+    static readonly TimeSpan Brief = TimeSpan.FromMilliseconds(150);
+
+    DriveEngine Create(bool background = false, bool encrypted = false) =>
+        new(DriveNamespace.Build(new MyDrive("b!me", "https://x-my.sharepoint.com/personal/u"), [], (_, _) => Task.FromResult("unused")),
+            api,
+            new ContentCache(Path.Combine(directory, "cache"), api,
+                new ContentCacheOptions { MaxBytes = 4L << 30, Cipher = encrypted ? new CacheCipher(RandomNumberGenerator.GetBytes(32)) : null }),
+            new DriveEngineOptions
+            {
+                StagingDirectory = Path.Combine(directory, "staging"),
+                Clock = () => now,
+                UploadNewFilesInBackground = background,
+            });
+
+    /// <summary>Creates Office lock files (never uploaded) one after another until stopped; reports the longest create.</summary>
+    sealed class Probe
+    {
+        readonly CancellationTokenSource stop = new();
+        readonly Task<TimeSpan> run;
+
+        public Probe(DriveEngine engine)
+        {
+            run = Task.Run(async () =>
+            {
+                var longest = TimeSpan.Zero;
+                for (var i = 0; !stop.IsCancellationRequested; i++)
+                {
+                    var watch = Stopwatch.StartNew();
+                    await engine.CreateAsync($"{Root}~$probe{i}.docx", false, default);
+                    longest = watch.Elapsed > longest ? watch.Elapsed : longest;
+                    await Task.Delay(2);
+                }
+                return longest;
+            });
+        }
+
+        public async Task<TimeSpan> StopAsync()
+        {
+            stop.Cancel();
+            return await run;
+        }
+    }
+
+    async Task<DriveEngine> ReadyAsync(bool background = false, bool encrypted = false)
+    {
+        var engine = Create(background, encrypted);
+        await engine.ListAsync((await engine.GetEntryAsync("\\OneDrive", default))!, default);
+        return engine;
+    }
+
+    void Report(string what, TimeSpan time) => output.WriteLine($"{what}: {time.TotalMilliseconds:0} ms");
+
+    static Task Slow(int milliseconds) => Task.Delay(milliseconds);
+
+    [Fact]
+    public async Task Caching_an_uploaded_file_holds_up_no_other_file()
+    {
+        api.Add("big.bin", content: "v1");
+        var engine = await ReadyAsync(encrypted: true);
+        var entry = await engine.StageAsync((await engine.GetEntryAsync(Root + "big.bin", default))!, truncate: true, default);
+        var data = new byte[256 * MiB];
+        new Random(365).NextBytes(data);
+        await File.WriteAllBytesAsync(entry.StagingPath!, data);
+        engine.MarkDirty(entry);
+
+        var probe = new Probe(engine);
+        var watch = Stopwatch.StartNew();
+        await engine.CommitAsync(Root + "big.bin", default);
+        Report("close of a 256 MiB save", watch.Elapsed);
+        await engine.WaitForUploadsAsync();
+        var longest = await probe.StopAsync();
+        Report("longest create meanwhile (adopting into the encrypted cache)", longest);
+
+        Assert.Equal(data, api.BytesOf("big.bin"));
+        Assert.True(longest < Brief, $"a create waited {longest.TotalMilliseconds:0} ms");
+        using var source = await engine.OpenContentAsync((await engine.GetEntryAsync(Root + "big.bin", default))!, default);
+        Assert.Equal(data.Length, source.Length);
+        Assert.Equal(0, api.Downloads);
+    }
+
+    [Fact]
+    public async Task A_create_at_a_deleted_name_waits_only_for_that_delete()
+    {
+        for (var i = 0; i < 8; i++)
+        {
+            api.Add($"f{i}.txt", content: $"{i}");
+        }
+        var engine = await ReadyAsync();
+        for (var i = 0; i < 8; i++)
+        {
+            await engine.DeleteAsync(Root + $"f{i}.txt", default);
+        }
+        api.BeforeDelete = () => Slow(300);
+        now += TimeSpan.FromMinutes(1);
+        await engine.ProcessDueAsync(false, default);
+
+        var watch = Stopwatch.StartNew();
+        await engine.CreateAsync(Root + "f7.txt", false, default);
+        var waited = watch.Elapsed;
+        Report("create at the name of the last of 8 due deletes (300 ms each, 4 at a time)", waited);
+        await engine.WaitForUploadsAsync();
+
+        Assert.True(waited < TimeSpan.FromMilliseconds(550), $"the create waited {waited.TotalMilliseconds:0} ms");
+        Assert.Equal(8, api.Deletes);
+    }
+
+    [Fact]
+    public async Task New_file_closes_flush_without_holding_the_gate()
+    {
+        var engine = await ReadyAsync(background: true);
+        var network = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        api.BeforeUpload = () => network.Task;
+
+        var watch = Stopwatch.StartNew();
+        await Parallel.ForEachAsync(Enumerable.Range(0, 400), new ParallelOptions { MaxDegreeOfParallelism = 8 }, async (i, _) =>
+        {
+            var entry = await engine.CreateAsync(Root + $"n{i}.txt", false, default);
+            await File.WriteAllTextAsync(entry.StagingPath!, $"content {i}");
+            engine.MarkDirty(entry);
+            await engine.CommitAsync(Root + $"n{i}.txt", default);
+        });
+        var elapsed = watch.Elapsed;
+        output.WriteLine($"400 new files created and closed from 8 threads: {elapsed.TotalMilliseconds:0} ms, {400 / elapsed.TotalSeconds:0} closes/s");
+        network.SetResult();
+        await engine.WaitForUploadsAsync();
+
+        Assert.Equal(400, api.Uploads.Count);
+    }
+
+    [Fact]
+    public async Task A_folder_rename_does_not_wait_for_the_uploads_below_it()
+    {
+        var engine = await ReadyAsync(background: true);
+        await engine.CreateAsync(Root + "docs", true, default);
+        api.BeforeUpload = () => Slow(200);
+        for (var i = 0; i < 40; i++)
+        {
+            var entry = await engine.CreateAsync(Root + $"docs\\f{i}.txt", false, default);
+            await File.WriteAllTextAsync(entry.StagingPath!, $"content {i}");
+            engine.MarkDirty(entry);
+            await engine.CommitAsync(Root + $"docs\\f{i}.txt", default);
+        }
+
+        var watch = Stopwatch.StartNew();
+        await engine.RenameAsync(Root + "docs", Root + "archive", false, default);
+        Report("rename of a folder with 40 new files uploading (200 ms each, 4 at a time)", watch.Elapsed);
+        var renamed = watch.Elapsed;
+        await engine.WaitForUploadsAsync();
+
+        Assert.True(renamed < TimeSpan.FromMilliseconds(300), $"the rename took {renamed.TotalMilliseconds:0} ms");
+        Assert.Equal(["archive", .. Enumerable.Range(0, 40).Select(i => $"archive/f{i}.txt").Order()], api.Paths);
+        Assert.Equal("content 7", api.ContentOf("archive/f7.txt"));
+        Assert.Empty(engine.Unsaved());
+    }
+
+    [Fact]
+    public async Task A_folder_delete_holds_up_no_other_file()
+    {
+        api.Add("old", folder: true);
+        var engine = await ReadyAsync();
+        api.BeforeDelete = () => Slow(500);
+
+        var probe = new Probe(engine);
+        await Task.Delay(20);
+        await engine.DeleteAsync(Root + "old", default);
+        var longest = await probe.StopAsync();
+        Report("longest create during a folder delete (500 ms)", longest);
+
+        Assert.True(longest < Brief, $"a create waited {longest.TotalMilliseconds:0} ms");
+        Assert.Empty(api.Paths);
+    }
+
+    [Fact]
+    public async Task A_folder_rename_holds_up_no_other_file()
+    {
+        api.Add("a", folder: true);
+        api.Add("a/x.txt");
+        var engine = await ReadyAsync();
+        api.BeforeMove = () => Slow(500);
+
+        var probe = new Probe(engine);
+        await Task.Delay(20);
+        await engine.RenameAsync(Root + "a", Root + "b", false, default);
+        var longest = await probe.StopAsync();
+        Report("longest create during a folder rename (500 ms)", longest);
+
+        Assert.True(longest < Brief, $"a create waited {longest.TotalMilliseconds:0} ms");
+        Assert.Equal(["b", "b/x.txt"], api.Paths);
+    }
+
+    [Fact]
+    public async Task Stopping_a_streaming_upload_holds_up_no_other_file()
+    {
+        var engine = await ReadyAsync();
+        var entry = await engine.CreateAsync(Root + "copy.bin", false, default);
+        using (var staging = File.OpenHandle(entry.StagingPath!, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite | FileShare.Delete))
+        {
+            RandomAccess.SetLength(staging, 23 * MiB);
+            engine.SizeSet(entry, 23 * MiB);
+            RandomAccess.Write(staging, new byte[6 * MiB], 0);
+        }
+        engine.MarkDirty(entry);
+        api.BeforeFragment = _ => Slow(500);
+        await engine.WrittenAsync(entry, 0, 6 * MiB, default); // the first fragment is now in flight
+
+        var probe = new Probe(engine);
+        await Task.Delay(20);
+        await engine.StageAsync(entry, truncate: true, default); // overwritten: the streaming upload stops
+        var longest = await probe.StopAsync();
+        Report("longest create while a streaming upload with a fragment in flight (500 ms) stopped", longest);
+
+        Assert.True(longest < Brief, $"a create waited {longest.TotalMilliseconds:0} ms");
+    }
+
+    [Fact]
+    public async Task A_new_file_renamed_while_it_uploads_moves_at_once()
+    {
+        var engine = await ReadyAsync(background: true);
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        api.BeforeUpload = async () => { started.TrySetResult(); await Slow(1000); };
+        var entry = await engine.CreateAsync(Root + "report.pdf.crdownload", false, default);
+        await File.WriteAllTextAsync(entry.StagingPath!, "pdf");
+        engine.MarkDirty(entry);
+        await engine.CommitAsync(Root + "report.pdf.crdownload", default);
+        await started.Task;
+
+        var watch = Stopwatch.StartNew();
+        await engine.RenameAsync(Root + "report.pdf.crdownload", Root + "report.pdf", false, default);
+        Report("rename of a new file while it uploads (1 s)", watch.Elapsed);
+        var renamed = watch.Elapsed;
+        Assert.NotNull(await engine.GetEntryAsync(Root + "report.pdf", default));
+        Assert.Null(await engine.GetEntryAsync(Root + "report.pdf.crdownload", default));
+        await engine.WaitForUploadsAsync();
+
+        Assert.True(renamed < TimeSpan.FromMilliseconds(300), $"the rename took {renamed.TotalMilliseconds:0} ms");
+        Assert.Equal(["report.pdf"], api.Paths);
+        Assert.Equal("pdf", api.ContentOf("report.pdf"));
+        Assert.Single(api.Uploads);
+    }
+
+    public void Dispose()
+    {
+        try
+        {
+            if (Directory.Exists(directory))
+            {
+                Directory.Delete(directory, true);
+            }
+        }
+        catch (IOException)
+        {
+        }
+    }
+}

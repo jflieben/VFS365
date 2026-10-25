@@ -109,6 +109,31 @@ public sealed class AgentLogTests : IDisposable
     }
 
     [Fact]
+    public void A_log_that_can_not_be_opened_at_logon_falls_back_and_moves_on_once_it_opens()
+    {
+        Directory.CreateDirectory(Current); // agent.log can't be opened (a profile disk still attaching, antivirus)
+        var fallback = Path.Combine(folder, "temp");
+        var pauses = 0;
+
+        using (var log = AgentLog.OpenGuarded(folder, fallback, newSession: true, 1 << 20, () => now, _ => pauses++))
+        {
+            log.WriteLine("at logon");
+            Directory.Delete(Current);
+            log.WriteLine("still the fallback"); // tried again only after a while
+            now += AgentLog.RetryInterval;
+            log.WriteLine("later");
+        }
+
+        Assert.Equal(2, pauses); // three tries
+        var early = File.ReadAllLines(Path.Combine(fallback, "agent.log"));
+        Assert.Contains("can't be opened", early[0]);
+        Assert.Equal(["at logon", "still the fallback"], early[1..]);
+        var lines = File.ReadAllLines(Current);
+        Assert.Contains("the lines before this are in", lines[0]);
+        Assert.Equal("later", lines[1]);
+    }
+
+    [Fact]
     public void Logs_older_than_a_week_go()
     {
         var logs = Directory.CreateDirectory(Path.Combine(folder, "logs")).FullName;
