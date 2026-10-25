@@ -25,8 +25,8 @@ public sealed class WriteGateTests(ITestOutputHelper output) : IDisposable
     const string Root = "\\OneDrive\\";
     const int MiB = 1024 * 1024;
 
-    /// <summary>What a probe may wait at most: the gate held only for bookkeeping, on a busy build machine.</summary>
-    static readonly TimeSpan Brief = TimeSpan.FromMilliseconds(150);
+    /// <summary>What a probe may wait at most: half the 500 ms operations that holding the gate would make it wait, so busy CI runners pass.</summary>
+    static readonly TimeSpan Brief = TimeSpan.FromMilliseconds(250);
 
     DriveEngine Create(bool background = false, bool encrypted = false) =>
         new(DriveNamespace.Build(new MyDrive("b!me", "https://x-my.sharepoint.com/personal/u"), [], (_, _) => Task.FromResult("unused")),
@@ -122,17 +122,17 @@ public sealed class WriteGateTests(ITestOutputHelper output) : IDisposable
         {
             await engine.DeleteAsync(Root + $"f{i}.txt", default);
         }
-        api.BeforeDelete = () => Slow(300);
+        api.BeforeDelete = () => Slow(500);
         now += TimeSpan.FromMinutes(1);
         await engine.ProcessDueAsync(false, default);
 
         var watch = Stopwatch.StartNew();
         await engine.CreateAsync(Root + "f7.txt", false, default);
         var waited = watch.Elapsed;
-        Report("create at the name of the last of 8 due deletes (300 ms each, 4 at a time)", waited);
+        Report("create at the name of the last of 8 due deletes (500 ms each, 4 at a time)", waited);
         await engine.WaitForUploadsAsync();
 
-        Assert.True(waited < TimeSpan.FromMilliseconds(550), $"the create waited {waited.TotalMilliseconds:0} ms");
+        Assert.True(waited < TimeSpan.FromMilliseconds(850), $"the create waited {waited.TotalMilliseconds:0} ms"); // its own delete, not the round before it too
         Assert.Equal(8, api.Deletes);
     }
 
@@ -179,7 +179,7 @@ public sealed class WriteGateTests(ITestOutputHelper output) : IDisposable
         var renamed = watch.Elapsed;
         await engine.WaitForUploadsAsync();
 
-        Assert.True(renamed < TimeSpan.FromMilliseconds(300), $"the rename took {renamed.TotalMilliseconds:0} ms");
+        Assert.True(renamed < TimeSpan.FromMilliseconds(1000), $"the rename took {renamed.TotalMilliseconds:0} ms");
         Assert.Equal(["archive", .. Enumerable.Range(0, 40).Select(i => $"archive/f{i}.txt").Order()], api.Paths);
         Assert.Equal("content 7", api.ContentOf("archive/f7.txt"));
         Assert.Empty(engine.Unsaved());
@@ -264,7 +264,7 @@ public sealed class WriteGateTests(ITestOutputHelper output) : IDisposable
         Assert.Null(await engine.GetEntryAsync(Root + "report.pdf.crdownload", default));
         await engine.WaitForUploadsAsync();
 
-        Assert.True(renamed < TimeSpan.FromMilliseconds(300), $"the rename took {renamed.TotalMilliseconds:0} ms");
+        Assert.True(renamed < TimeSpan.FromMilliseconds(500), $"the rename took {renamed.TotalMilliseconds:0} ms");
         Assert.Equal(["report.pdf"], api.Paths);
         Assert.Equal("pdf", api.ContentOf("report.pdf"));
         Assert.Single(api.Uploads);

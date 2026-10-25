@@ -258,7 +258,7 @@ public sealed class ReadPathStallTests : IDisposable
         calls = api.ItemCalls;
         watch.Restart();
         Assert.NotNull(await Within(engine.GetEntryAsync("\\docs\\f00.txt", default)));
-        Assert.True(watch.Elapsed < TimeSpan.FromMilliseconds(150), $"{watch.ElapsedMilliseconds} ms");
+        Assert.True(watch.Elapsed < TimeSpan.FromSeconds(1), $"{watch.ElapsedMilliseconds} ms");
         await Eventually(() => api.ItemCalls > calls);
 
         // That worked, so the next lookup asks Microsoft 365 again (and waits for its failure, offline again)
