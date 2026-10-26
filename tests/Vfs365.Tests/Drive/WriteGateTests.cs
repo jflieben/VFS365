@@ -45,6 +45,14 @@ public sealed class WriteGateTests(ITestOutputHelper output) : IDisposable
     {
         readonly CancellationTokenSource stop = new();
         readonly Task<TimeSpan> run;
+        readonly Stopwatch clock = Stopwatch.StartNew();
+        readonly List<TimeSpan> finished = [];
+
+        /// <summary>The probe's clock, which <see cref="Finished"/> is on.</summary>
+        public TimeSpan Now => clock.Elapsed;
+
+        /// <summary>When each create finished; read after <see cref="StopAsync"/>.</summary>
+        public IReadOnlyList<TimeSpan> Finished => finished;
 
         public Probe(DriveEngine engine)
         {
@@ -56,6 +64,7 @@ public sealed class WriteGateTests(ITestOutputHelper output) : IDisposable
                     var watch = Stopwatch.StartNew();
                     await engine.CreateAsync($"{Root}~$probe{i}.docx", false, default);
                     longest = watch.Elapsed > longest ? watch.Elapsed : longest;
+                    finished.Add(clock.Elapsed);
                     await Task.Delay(2);
                 }
                 return longest;
@@ -92,6 +101,28 @@ public sealed class WriteGateTests(ITestOutputHelper output) : IDisposable
         engine.MarkDirty(entry);
 
         var probe = new Probe(engine);
+        // The adoption encrypts into a .part file in the cache: from its first to its last sight is when the cache adopted the file
+        var cache = Path.Combine(directory, "cache");
+        TimeSpan? adoptFrom = null, adoptTo = null;
+        using var watching = new CancellationTokenSource();
+        var watcher = Task.Run(async () =>
+        {
+            while (!watching.IsCancellationRequested)
+            {
+                try
+                {
+                    if (Directory.EnumerateFiles(cache, "*.part", SearchOption.AllDirectories).Any())
+                    {
+                        adoptFrom ??= probe.Now;
+                        adoptTo = probe.Now;
+                    }
+                }
+                catch (IOException)
+                {
+                }
+                await Task.Delay(1);
+            }
+        });
         var watch = Stopwatch.StartNew();
         await engine.CommitAsync(Root + "big.bin", default);
         Report("close of a 256 MiB save", watch.Elapsed);
@@ -99,12 +130,18 @@ public sealed class WriteGateTests(ITestOutputHelper output) : IDisposable
         await engine.WaitForUploadsAsync();
         Report("upload and adopting into the encrypted cache", background.Elapsed);
         var longest = await probe.StopAsync();
+        watching.Cancel();
+        await watcher;
         Report("longest create meanwhile", longest);
 
         Assert.Equal(data, api.BytesOf("big.bin"));
-        // Held under the gate, a create would wait out the whole adoption; a busy CPU (CI runners) slows everything, so relative to it
-        var bound = Brief > background.Elapsed / 4 ? Brief : background.Elapsed / 4;
-        Assert.True(longest < bound, $"a create waited {longest.TotalMilliseconds:0} ms of {background.Elapsed.TotalMilliseconds:0} ms");
+        Assert.True(adoptFrom is not null, "the cache's adoption (its .part file) was never seen");
+        var adoption = adoptTo!.Value - adoptFrom.Value;
+        var during = probe.Finished.Count(t => t > adoptFrom && t < adoptTo);
+        Report($"adoption ({during} creates finished during it)", adoption);
+        // Held under the gate, no create could finish while the cache adopted the file. A busy runner (CI) only makes each create slower,
+        // so this counts finished creates instead of comparing times (a create once took 673 ms of a 2,185 ms upload there)
+        Assert.True(during > 0, $"no create finished during the {adoption.TotalMilliseconds:0} ms adoption (longest create {longest.TotalMilliseconds:0} ms)");
         using var source = await engine.OpenContentAsync((await engine.GetEntryAsync(Root + "big.bin", default))!, default);
         Assert.Equal(data.Length, source.Length);
         Assert.Equal(0, api.Downloads);
