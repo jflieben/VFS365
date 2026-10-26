@@ -23,6 +23,7 @@ public sealed record TrayActions(string HelpUrl)
     public Func<bool>? SignInNeeded { get; init; }
     public Action? SessionEnded { get; init; }
     public Action? CollectDiagnostics { get; init; }
+    public Action? Search { get; init; }
 }
 
 /// <summary>
@@ -38,7 +39,7 @@ sealed class Tray : IDisposable
     const uint NinSelect = 0x0400, NinKeySelect = 0x0401, NinBalloonUserClick = 0x0405, WmLButtonDblClk = 0x0203;
     const uint NimAdd = 0, NimModify = 1, NimDelete = 2, NimSetVersion = 4, NifMessage = 1, NifIcon = 2, NifTip = 4, NifInfo = 0x10, NifShowTip = 0x80;
     const uint NiifUser = 4, NiifLargeIcon = 0x20, MfString = 0, MfGrayed = 1, MfSeparator = 0x800, TpmReturnCmd = 0x100, TpmRightButton = 2;
-    const int ShowFiles = 1, ShowLog = 2, Restart = 3, Help = 4, Website = 5, Refresh = 6, SignIn = 7, Retry = 8, Diagnostics = 9;
+    const int ShowFiles = 1, ShowLog = 2, Restart = 3, Help = 4, Website = 5, Refresh = 6, SignIn = 7, Retry = 8, Diagnostics = 9, Search = 10;
     public const string JSolveUrl = "https://jsolve.nl";
 
     readonly string label;
@@ -387,6 +388,10 @@ sealed class Tray : IDisposable
         {
             Item(MfString, ShowFiles, UiText.Get("Menu.ShowFiles"));
         }
+        if (current.Search is not null)
+        {
+            Item(MfString, Search, UiText.Get("Menu.Search"));
+        }
         Item(MfString, ShowLog, UiText.Get("Menu.ShowLog"));
         if (current.CollectDiagnostics is not null)
         {
@@ -427,6 +432,9 @@ sealed class Tray : IDisposable
                 break;
             case Diagnostics:
                 current.CollectDiagnostics?.Invoke();
+                break;
+            case Search:
+                current.Search?.Invoke();
                 break;
             case Refresh:
                 current.Refresh?.Invoke();

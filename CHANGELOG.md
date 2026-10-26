@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.7.2
+
+- Searching the drive uses Microsoft 365: a search in Explorer's search box on the drive no longer reads every folder from Microsoft 365 (which got whole tenants throttled). Once the words stop changing, VFS365 sends the window back to the folder and opens SharePoint search in the browser with the same words, limited to that folder, library or site; the browser comes to the front and a notification says the results are there. Filters SharePoint doesn't know (`kind:`, dates) are left out; `ext:` and `type:` become `filetype:`. Policy `ExplorerSearch`: `Browser` (default), `Stop` (only stop the search and say how to search instead) or `Allow` (Explorer reads the folders itself, as before).
+- "Search in Microsoft 365" in the VFS365 menu on folders (it asks for the words; it also works in programs' Open and Save dialogs), and "Search Microsoft 365..." in the tray menu for everything.
+
 ## 0.7.1
 
 - New default: `Scope` All, so the drive shows OneDrive and Sites (and Shared with me) at its root. Without a `Scope` policy, paths change from `M:\Finance\Documents` to `M:\Sites\Finance\Documents`, also in `DriveMappings`, `FolderRedirection` and paths apps remember. Set `Scope` to `SharePoint` to keep the earlier layout.

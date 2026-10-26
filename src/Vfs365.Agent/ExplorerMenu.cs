@@ -219,7 +219,8 @@ public sealed class ExplorerMenu : IDisposable
     readonly Lock gate = new();
     bool disposed;
 
-    ExplorerMenu(string exe, string unc, string? letter, SessionDriveLetters? folders, ShellPublisher? shell, VerbActions actions, Action<string> log)
+    ExplorerMenu(string exe, string unc, string? letter, SessionDriveLetters? folders, ShellPublisher? shell, VerbActions actions,
+        Func<string, CancellationToken, Task>? search, Action<string> log)
     {
         (this.exe, this.unc, this.letter, this.folders, this.shell, this.log) = (exe, unc, letter, folders, shell, log);
         Update();
@@ -234,7 +235,7 @@ public sealed class ExplorerMenu : IDisposable
                     {
                         return "unknown request";
                     }
-                    _ = Task.Run(() => actions.RunAsync(verb, path, stop.Token));
+                    _ = Task.Run(() => verb == "search" && search is not null ? search(path, stop.Token) : actions.RunAsync(verb, path, stop.Token));
                     return null;
                 }, log, stop.Token);
             }
@@ -254,7 +255,7 @@ public sealed class ExplorerMenu : IDisposable
     /// <paramref name="overlays"/> (policy OverlayIcons) it says there are none.
     /// </summary>
     public static ExplorerMenu? Start(DriveEngine engine, DriveApi api, string unc, string? letter, SessionDriveLetters? folders, bool overlays,
-        Action<string, string, bool> notify, Action<string> say, Action<string> log)
+        Func<string, CancellationToken, Task>? search, Action<string, string, bool> notify, Action<string> say, Action<string> log)
     {
         var exe = Path.Combine(AppContext.BaseDirectory, "vfs365-agent.exe");
         if (!File.Exists(exe))
@@ -268,7 +269,7 @@ public sealed class ExplorerMenu : IDisposable
         var shell = StartShell(engine, overlays, say, log);
         try
         {
-            return new ExplorerMenu(exe, unc, letter, folders, shell, actions, log);
+            return new ExplorerMenu(exe, unc, letter, folders, shell, actions, search, log);
         }
         catch (Exception e) when (e is IOException or UnauthorizedAccessException or System.Security.SecurityException)
         {
@@ -384,8 +385,18 @@ public sealed class ExplorerMenu : IDisposable
         serving.Wait(TimeSpan.FromSeconds(2)); // never faults; stop stays undisposed for verbs still running
     }
 
-    /// <summary>Opens an https or Office URL with the user's default handler.</summary>
-    static void Shell(string url) => Process.Start(new ProcessStartInfo(url) { UseShellExecute = true })?.Dispose();
+    /// <summary>
+    /// Opens an https or Office URL with the user's default handler. Right after the user acted on the agent (its search window, the tray
+    /// menu, a verb whose client passed the right on) the agent may bring a window to the front; it passes that on to the browser.
+    /// </summary>
+    internal static void Shell(string url)
+    {
+        AllowSetForegroundWindow(-1); // ASFW_ANY; does nothing when the agent has no such right
+        Process.Start(new ProcessStartInfo(url) { UseShellExecute = true })?.Dispose();
+    }
+
+    [DllImport("user32.dll")]
+    static extern bool AllowSetForegroundWindow(int processId);
 }
 
 /// <summary>Text to the clipboard from a short STA thread with a message-only window (the clipboard needs an owner window).</summary>

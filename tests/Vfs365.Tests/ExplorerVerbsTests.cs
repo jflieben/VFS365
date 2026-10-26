@@ -132,8 +132,14 @@ public sealed class ExplorerVerbsTests : IDisposable
         }
         using (var folders = hive.OpenSubKey(@"Software\Classes\Directory\shell\VFS365\shell")!)
         {
-            Assert.Equal(["01browser", "02link", "03share"], folders.GetSubKeyNames().Order());
+            Assert.Equal(["01browser", "02link", "03share", "04search"], folders.GetSubKeyNames().Order());
+            using var search = folders.OpenSubKey("04search")!;
+            Assert.Equal("Search in Microsoft 365", search.GetValue("MUIVerb"));
+            Assert.Equal(0x20, search.GetValue("CommandFlags"));
+            using var command = folders.OpenSubKey(@"04search\command")!;
+            Assert.Equal($@"""{Exe}"" verb search ""%1""", command.GetValue(""));
         }
+        Assert.Null(hive.OpenSubKey(@"Software\Classes\Directory\Background\shell\VFS365")); // Explorer hides it there with AppliesTo
         Assert.True(ExplorerLocation.IsRegistered(hive));
 
         Assert.False(ExplorerVerbs.Register(hive, Exe, [@"M:\", @"\\VFS365\ann\"], English)); // nothing changed
@@ -149,6 +155,14 @@ public sealed class ExplorerVerbsTests : IDisposable
         Assert.False(ExplorerLocation.IsRegistered(hive));
     }
 
+    [Theory]
+    [InlineData(@"M:""", @"M:\")]
+    [InlineData(@"M:\Sites\Sales", @"M:\Sites\Sales")]
+    [InlineData(@"\\VFS365\ann\OneDrive", @"\\VFS365\ann\OneDrive")]
+    [InlineData(@"Z:""", @"Z:\")]
+    public void A_drive_tops_quoted_path_comes_back_whole(string argument, string expected) =>
+        Assert.Equal(expected, VerbPipe.PathArgument(argument));
+
     [Fact]
     public void Uninstall_and_the_logon_cleanup_remove_the_menu()
     {
@@ -158,8 +172,7 @@ public sealed class ExplorerVerbsTests : IDisposable
 
         var command = MachineCleanup.LogonCleanupCommand(["M:"]);
         Assert.Contains(@"delete ""HKCU\Software\Classes\*\shell\VFS365"" /f", command, StringComparison.Ordinal);
-        Assert.Contains(@"delete ""HKCU\Software\Classes\Directory\shell\VFS365"" /f", command, StringComparison.Ordinal);
-    }
+        Assert.Contains(@"delete ""HKCU\Software\Classes\Directory\shell\VFS365"" /f", command, StringComparison.Ordinal);    }
 
     [Fact]
     public async Task Requests_reach_the_agent_over_the_pipe()

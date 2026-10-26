@@ -205,6 +205,17 @@
         </enum>
       </elements>
     </policy>
+    <policy name="ExplorerSearch" class="Both" displayName="$(string.ExplorerSearch)" explainText="$(string.ExplorerSearch_Help)" presentation="$(presentation.ExplorerSearch)" key="Software\Policies\JSolve\VFS365">
+      <parentCategory ref="VFS365" />
+      <supportedOn ref="SUPPORTED_Windows11" />
+      <elements>
+        <enum id="ExplorerSearch" valueName="ExplorerSearch" required="true">
+          <item displayName="$(string.ExplorerSearch_Browser)"><value><string>Browser</string></value></item>
+          <item displayName="$(string.ExplorerSearch_Stop)"><value><string>Stop</string></value></item>
+          <item displayName="$(string.ExplorerSearch_Allow)"><value><string>Allow</string></value></item>
+        </enum>
+      </elements>
+    </policy>
     <policy name="HelpUrl" class="Both" displayName="$(string.HelpUrl)" explainText="$(string.HelpUrl_Help)" presentation="$(presentation.HelpUrl)" key="Software\Policies\JSolve\VFS365">
       <parentCategory ref="VFS365" />
       <supportedOn ref="SUPPORTED_Windows11" />

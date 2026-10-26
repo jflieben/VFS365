@@ -124,11 +124,13 @@ public sealed class AgentSettingsTests : IDisposable
     [InlineData("Teams")]
     public void Choices_take_only_their_names(string value)
     {
-        var settings = Policy(("Scope", value), ("DatabaseFiles", value), ("MonitoringDetail", value));
-        Assert.Equal((DriveScope.All, DatabaseFilePolicy.Allow, MonitoringDetail.Full), (settings.Scope, settings.DatabaseFiles, settings.MonitoringDetail));
+        var settings = Policy(("Scope", value), ("DatabaseFiles", value), ("MonitoringDetail", value), ("ExplorerSearch", value));
+        Assert.Equal((DriveScope.All, DatabaseFilePolicy.Allow, MonitoringDetail.Full, ExplorerSearchMode.Browser),
+            (settings.Scope, settings.DatabaseFiles, settings.MonitoringDetail, settings.ExplorerSearch));
         Assert.Contains($"Scope '{value}' is not All, SharePoint or OneDrive; All is used", settings.Adjusted());
-        Assert.Equal(3, settings.Adjusted().Count);
+        Assert.Equal(4, settings.Adjusted().Count);
         Assert.Equal(DatabaseFilePolicy.ReadOnly, Policy(("DatabaseFiles", " readonly ")).DatabaseFiles);
+        Assert.Equal(ExplorerSearchMode.Stop, Policy(("ExplorerSearch", "stop")).ExplorerSearch);
     }
 
     [Fact]
@@ -207,7 +209,7 @@ public sealed class AgentSettingsTests : IDisposable
         Assert.Equal("0 (off)", effective["ReadAheadFiles"].Value);
         Assert.StartsWith("contoso.table.core.windows.net", effective["MonitoringUrl"].Value);
         Assert.DoesNotContain(settings.Effective(), s => s.Value.Contains("secret123") || s.Value.Contains("sig="));
-        Assert.Equal(29, effective.Count);
+        Assert.Equal(30, effective.Count);
         Assert.Equal(AgentSettings.Names.Order(), effective.Keys.Order());
     }
 

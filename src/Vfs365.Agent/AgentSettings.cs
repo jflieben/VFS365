@@ -29,7 +29,7 @@ public sealed class AgentSettings
         "ClientId", "TenantId", "DriveLetter", "Label", "Scope", "IncludedSites", "ExcludedSites", "IncludedSiteTemplates", "ExcludedSiteTemplates",
         "PinnedLocations", "NavigationPane", "OverlayIcons", "CacheSizeMB", "TrayIcon", "NotifyUploads", "HelpUrl", "ChangeCheckSeconds", "ApiBudgetPerMinute",
         "ThrottlePauseMinutes", "WalkPrefetchFolders", "ReadAheadFiles", "BackgroundUploads", "RepeatSaveSeconds", "DatabaseFiles", "MonitoringUrl",
-        "MonitoringDetail", "FolderRedirection", "DriveMappings", "SharedWithMe",
+        "MonitoringDetail", "FolderRedirection", "DriveMappings", "SharedWithMe", "ExplorerSearch",
     ];
 
     readonly List<(string Source, Func<string, object?> Read)> sources = [];
@@ -138,6 +138,9 @@ public sealed class AgentSettings
     /// <summary>Multi-user database files (Access, QuickBooks, SQLite): Allow, ReadOnly or Block.</summary>
     public DatabaseFilePolicy DatabaseFiles => Choice<DatabaseFilePolicy>("DatabaseFiles") ?? DatabaseFilePolicy.Allow;
 
+    /// <summary>A search in Explorer's search box on the drive: Browser (stopped and opened in Microsoft 365), Stop (only stopped) or Allow.</summary>
+    public ExplorerSearchMode ExplorerSearch => Choice<ExplorerSearchMode>("ExplorerSearch") ?? ExplorerSearchMode.Browser;
+
     public const string DefaultHelpUrl = "https://jsolve.nl";
 
     /// <summary>Where the tray's Help opens, for example the organisation's own instructions.</summary>
@@ -190,6 +193,7 @@ public sealed class AgentSettings
             ("BackgroundUploads", OnOff(BackgroundUploads), From("BackgroundUploads")),
             ("RepeatSaveSeconds", RepeatSaveSeconds == 0 ? "0 (every close uploads)" : RepeatSaveSeconds.ToString(), From("RepeatSaveSeconds")),
             ("DatabaseFiles", DatabaseFiles.ToString(), From("DatabaseFiles")),
+            ("ExplorerSearch", ExplorerSearch.ToString(), From("ExplorerSearch")),
             ("MonitoringUrl", monitoring is not null
                 ? $"{monitoring.Account}{(monitoring.Expires is { } expires ? $" (SAS valid until {expires.ToLocalTime():yyyy-MM-dd HH:mm})" : "")}"
                 : problem ?? "off", From("MonitoringUrl")),
@@ -233,6 +237,7 @@ public sealed class AgentSettings
         }
         Unreadable("Scope", Choice<DriveScope>("Scope") is not null, "All, SharePoint or OneDrive", Scope.ToString());
         Unreadable("DatabaseFiles", Choice<DatabaseFilePolicy>("DatabaseFiles") is not null, "Allow, ReadOnly or Block", DatabaseFiles.ToString());
+        Unreadable("ExplorerSearch", Choice<ExplorerSearchMode>("ExplorerSearch") is not null, "Browser, Stop or Allow", ExplorerSearch.ToString());
         Unreadable("MonitoringDetail", Choice<MonitoringDetail>("MonitoringDetail") is not null, "Full or NoPaths", MonitoringDetail.ToString());
         Unreadable("HelpUrl", ValidHelpUrl(Text("HelpUrl").Value) is not null, "an http or https address", DefaultHelpUrl);
         foreach (var name in new[] { "ClientId", "TenantId", "DriveLetter", "Label", "MonitoringUrl" })

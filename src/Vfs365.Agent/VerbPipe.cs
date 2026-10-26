@@ -126,13 +126,19 @@ public static class VerbPipe
         {
             return 2;
         }
-        if (Send(CurrentName(), args[1], args[2], RequestTimeout, out var answer))
+        if (Send(CurrentName(), args[1], PathArgument(args[2]), RequestTimeout, out var answer))
         {
             return 0;
         }
         MessageBoxW(IntPtr.Zero, answer is null ? UiText.Get("Verb.NotRunning") : answer, UiText.Get("Verb.Menu"), 0x40 | 0x10000); // MB_ICONINFORMATION | MB_SETFOREGROUND
         return 1;
     }
+
+    /// <summary>
+    /// A path argument as Explorer meant it: "%1" of a drive's top ("M:\") arrives as M:" (the backslash escapes the closing quote),
+    /// which is M:\ again. Quotes can't occur in Windows paths.
+    /// </summary>
+    internal static string PathArgument(string argument) => argument.EndsWith('"') ? argument[..^1].TrimEnd('\\') + @"\" : argument;
 
     /// <summary>A verb's result or problem as a notification; without a tray icon (policy TrayIcon 0) only problems show, as a message.</summary>
     internal static void Tell(Tray? tray, string title, string text, bool problem)

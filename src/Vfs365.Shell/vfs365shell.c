@@ -88,6 +88,7 @@ static const GUID Classes[1 + STATES] = {
 #define FILTER_NONE 0
 #define FILTER_OFFICE 1
 #define FILTER_CONFLICT 2
+#define FILTER_FOLDERS 3
 typedef struct
 {
     LPCWSTR Name, Key, English;
@@ -103,6 +104,7 @@ static const VERB Verbs[] = {
     { L"share", L"Verb.share", L"Share in browser", TRUE, FILTER_NONE, 0 },
     { L"keep", L"Verb.keep", L"Keep this version", FALSE, FILTER_CONFLICT, ECF_SEPARATORBEFORE },
     { L"compare", L"Verb.compare", L"Compare with the original", FALSE, FILTER_CONFLICT, 0 },
+    { L"search", L"Verb.search", L"Search in Microsoft 365", TRUE, FILTER_FOLDERS, ECF_SEPARATORBEFORE },
 };
 #define VERB_COUNT ((int)(sizeof(Verbs) / sizeof(Verbs[0])))
 
@@ -604,7 +606,7 @@ static BOOL Matches(LPCWSTR name, LPCWSTR pattern)
 static BOOL VerbApplies(int verb, LPCWSTR path, BOOL folder)
 {
     const VERB *v = &Verbs[verb];
-    if (folder && !v->Folders)
+    if (folder ? !v->Folders : v->Filter == FILTER_FOLDERS)
         return FALSE;
     LPCWSTR name = path;
     for (LPCWSTR c = path; *c; c++)
@@ -1006,9 +1008,11 @@ static const OVERLAY_VTBL OverlayVtbl = {
     OverlayGetPriority,
 };
 
+// One per verb plus the top-level item: a verb added to Verbs needs its entry here (an entry left out has no vtable)
 static COMMAND Commands[1 + VERB_COUNT] = {
     { &CommandVtbl, 0 }, { &CommandVtbl, 1 }, { &CommandVtbl, 2 }, { &CommandVtbl, 3 },
     { &CommandVtbl, 4 }, { &CommandVtbl, 5 }, { &CommandVtbl, 6 }, { &CommandVtbl, 7 },
+    { &CommandVtbl, 8 },
 };
 
 static OVERLAY Overlays[STATES] = {
@@ -1101,7 +1105,7 @@ EXPORT int WINAPI VfsShellIsOnVolume(LPCWSTR path)
     return MenuShows(path) ? 1 : 0;
 }
 
-// For tests: command index (0 the top-level item, 1 to 7 the verbs) for an item: its verb name and title (capacity characters each),
+// For tests: command index (0 the top-level item, 1 to VERB_COUNT the verbs) for an item: its verb name and title (capacity characters each),
 // 1 when shown, 0 when hidden, -1 past the last
 EXPORT int WINAPI VfsShellVerb(int index, LPCWSTR path, int folder, LPWSTR name, LPWSTR title, int capacity)
 {

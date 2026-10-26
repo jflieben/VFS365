@@ -225,7 +225,7 @@ sealed class Vfs365FileSystem(DriveEngine engine, string label, Action<string>? 
             return STATUS_ACCESS_DENIED;
         }
         var isDirectory = (createOptions & FILE_DIRECTORY_FILE) != 0;
-        trace?.Invoke($"create {fileName} dir={isDirectory} allocation={allocationSize} access=0x{grantedAccess:X} share=0x{Requester.ShareAccess():X}");
+        trace?.Invoke($"create {fileName} dir={isDirectory} allocation={allocationSize} access=0x{grantedAccess:X} share=0x{Requester.ShareAccess():X} pid={Requester.ProcessId()}");
         Handle handle;
         try
         {
@@ -297,7 +297,7 @@ sealed class Vfs365FileSystem(DriveEngine engine, string label, Action<string>? 
             fileInfo = default;
             return STATUS_SHARING_VIOLATION;
         }
-        trace?.Invoke($"open {fileName}");
+        trace?.Invoke($"open {fileName} pid={Requester.ProcessId()}");
         var handle = new Handle(entry);
         fileDesc = handle;
         fileInfo = Info(handle);
@@ -1156,6 +1156,17 @@ sealed class Vfs365FileSystem(DriveEngine engine, string label, Action<string>? 
                 return null;
             }
             return *(uint*)(*context + ShareAccessOffset);
+        }
+
+        /// <summary>The requesting process of the create request being served (high half of Req.Create.AccessToken); 0 outside one.</summary>
+        public static uint ProcessId()
+        {
+            var context = (byte**)OperationContext();
+            if (context is null || *context is null || *(uint*)(*context + KindOffset) != CreateKind)
+            {
+                return 0;
+            }
+            return (uint)(*(ulong*)(*context + AccessTokenOffset) >> 32);
         }
 
         /// <summary>

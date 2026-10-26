@@ -512,6 +512,7 @@ public sealed partial class DriveEngine(DriveNamespace ns, IDriveApi api, Conten
     /// </summary>
     public async IAsyncEnumerable<IReadOnlyList<FsEntry>> ListStreamAsync(FsEntry directory, [EnumeratorCancellation] CancellationToken ct)
     {
+        FolderListed?.Invoke();
         if (directory.Folder is { Drive: null } folder)
         {
             if (folder.SharedRoot)

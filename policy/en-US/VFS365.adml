@@ -126,6 +126,11 @@ No paths: every file and folder path becomes a short code ([path 1a2b3c4d], the 
       <string id="DatabaseFiles_Allow">Allow</string>
       <string id="DatabaseFiles_ReadOnly">Read-only</string>
       <string id="DatabaseFiles_Block">Block</string>
+      <string id="ExplorerSearch">Searching in Explorer</string>
+      <string id="ExplorerSearch_Help">What happens when someone searches the drive with Explorer's search box. Explorer reads every folder below the one searched from Microsoft 365, which is slow and can get the tenant throttled. Microsoft 365 search (default): VFS365 sends the window back to the folder and opens SharePoint search in the browser with the same words, limited to that folder, library or site. Stop: the search is stopped and the user is told to use "Search in Microsoft 365" in the VFS365 menu. Allow: Explorer searches the drive itself. Searches in programs' Open and Save dialogs are never seen; the VFS365 menu's "Search in Microsoft 365" works there.</string>
+      <string id="ExplorerSearch_Browser">Microsoft 365 search</string>
+      <string id="ExplorerSearch_Stop">Stop</string>
+      <string id="ExplorerSearch_Allow">Allow</string>
 
       <string id="HelpUrl">Help link</string>
       <string id="HelpUrl_Help">Web page the tray icon's Help opens, for example your organisation's own instructions. An http or https address. Default: https://jsolve.nl.</string>
@@ -167,6 +172,7 @@ Disabled: no such folder.</string>
       <presentation id="MonitoringUrl"><textBox refId="MonitoringUrl"><label>Table service SAS URL</label></textBox></presentation>
       <presentation id="MonitoringDetail"><dropdownList refId="MonitoringDetail" defaultItem="0">Error rows contain</dropdownList></presentation>
       <presentation id="DatabaseFiles"><dropdownList refId="DatabaseFiles" defaultItem="0">Database files</dropdownList></presentation>
+      <presentation id="ExplorerSearch"><dropdownList refId="ExplorerSearch" defaultItem="0">Searching in Explorer</dropdownList></presentation>
       <presentation id="HelpUrl"><textBox refId="HelpUrl"><label>Address</label><defaultValue>https://jsolve.nl</defaultValue></textBox></presentation>
       <presentation id="ExcludedSites"><multiTextBox refId="ExcludedSites">Site URL patterns, one per line</multiTextBox></presentation>
       <presentation id="IncludedSiteTemplates"><multiTextBox refId="IncludedSiteTemplates">Site templates, one per line</multiTextBox></presentation>

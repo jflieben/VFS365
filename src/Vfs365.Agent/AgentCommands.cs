@@ -92,10 +92,25 @@ public static class AgentCommands
 
         var command = args.FirstOrDefault()?.ToLowerInvariant();
         if (command is not ("settings" or "whoami" or "discover" or "shared" or "mount"or "unmount" or "inspect" or "put" or "watch" or "pin" or "unpin" or "pins" or "signout" or "machine-setup" or "machine-stop" or "machine-start" or "machine-report" or "about"
-            or "why" or "health" or "support-bundle"))
+            or "why" or "health" or "support-bundle" or "search-spike"))
         {
             error.WriteLine(Usage);
             return 2;
+        }
+
+        // Spike 15, not in Usage: windows needs no sign-in, urls signs in below
+        if (command == "search-spike" && args.ElementAtOrDefault(1)?.ToLowerInvariant() is var spike && spike is not ("urls" or "query"))
+        {
+            switch (spike)
+            {
+                case "windows":
+                    return SearchSpike.Windows(args, AgentSettings.Load(Option("--config")), output.WriteLine);
+                case "menu":
+                    return SearchSpike.Menu(args, output.WriteLine);
+                default:
+                    error.WriteLine(SearchSpike.Usage);
+                    return 2;
+            }
         }
 
         if (command == "about")
@@ -298,6 +313,13 @@ public static class AgentCommands
             if (command == "shared")
             {
                 return await SharedAsync(settings, api, client, tokens, Flag("--json"), Say, output);
+            }
+
+            if (command == "search-spike")
+            {
+                return args.ElementAtOrDefault(1)?.ToLowerInvariant() == "query"
+                    ? await SearchSpike.QueryAsync(args, api, client, Say)
+                    : await SearchSpike.UrlsAsync(args, settings, api, client, Say);
             }
 
             if (command == "inspect")
@@ -505,7 +527,7 @@ public static class AgentCommands
     }
 
     /// <summary>An engine without a mount, for the diagnostic commands: OneDrive plus the libraries and shared items of the last discovery.</summary>
-    static async Task<(DriveEngine Engine, DriveApi DriveApi)> ToolEngineAsync(AgentSettings settings, SharePointDiscoveryApi api, M365Client client)
+    internal static async Task<(DriveEngine Engine, DriveApi DriveApi)> ToolEngineAsync(AgentSettings settings, SharePointDiscoveryApi api, M365Client client)
     {
         var oneDrive = await api.GetMyDriveAsync(default);
         var driveApi = new DriveApi(client);
@@ -1703,11 +1725,30 @@ public static class AgentCommands
                 }
                 // Windows 11's context menu: the menu package registered for this user in the background (ShellPackage.cs)
                 var shellPackage = ShellPackage.EnsureRegisteredAsync(log);
+                // Searching with Microsoft 365 (decision 48): the folder verb, the tray item and Explorer's search box on the drive
+                string? DriveVolumePath(string path) => ExplorerVerbs.VolumePath(
+                    ExplorerSearch.Unshell(path, ExplorerLocation.Clsid, drive.DriveLetter is { } navLetter ? navLetter + "\\" : unc),
+                    unc, drive.DriveLetter, driveLetters?.Folders() ?? new Dictionary<string, string>());
+                var search = new SearchActions(engine, driveApi.GetLinksAsync, DriveVolumePath, oneDrive, AskWindow.AskAsync, ExplorerMenu.Shell,
+                    (title, text, problem) => VerbPipe.Tell(tray, title, text, problem), log);
                 // The VFS365 menu on the drive's files and folders and the shell section for overlay icons (ExplorerMenu.cs); removed and
                 // cleared when this block ends at the stop
-                using var explorerMenu = ExplorerMenu.Start(engine, driveApi, unc, drive.DriveLetter, driveLetters, settings.OverlayIcons,
+                using var explorerMenu = ExplorerMenu.Start(engine, driveApi, unc, drive.DriveLetter, driveLetters, settings.OverlayIcons, search.AskAndSearchAsync,
                     (title, text, problem) => VerbPipe.Tell(tray, title, text, problem), say, log);
                 _ = shellPackage.ContinueWith(_ => explorerMenu?.Update(), TaskScheduler.Default); // legacy verbs go once the package is there
+                using var searchWatcher = ExplorerSearchWatcher.Start(engine, settings.ExplorerSearch,
+                    () => ExplorerMenu.Roots(unc, drive.DriveLetter, driveLetters?.Folders().Keys ?? []), DriveVolumePath, search.HandOffAsync,
+                    (title, text) => VerbPipe.Tell(tray, title, text, false), log);
+                say(settings.ExplorerSearch switch
+                {
+                    ExplorerSearchMode.Browser => "Search:     Explorer searches on the drive open in Microsoft 365",
+                    ExplorerSearchMode.Stop => "Search:     Explorer searches on the drive are stopped (policy ExplorerSearch)",
+                    _ => "Search:     Explorer searches the drive itself (policy ExplorerSearch)",
+                });
+                if (tray is not null)
+                {
+                    tray.Actions = tray.Actions with { Search = () => _ = Task.Run(() => search.AskAndSearchEverythingAsync(default)) };
+                }
 
                 // What Windows tells Explorer about the drive: checked now and every 5 minutes, logged when it changes
                 if (NetworkProviderOrder.Problem(NetworkProviderOrder.Current()) is { } providerProblem)

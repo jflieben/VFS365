@@ -438,9 +438,9 @@ public sealed class ShellExtensionTests
         Assert.Equal(ExplorerVerbs.Verbs.Select(v => v.Name), names);
         for (var i = 0; i < ExplorerVerbs.Verbs.Length; i++)
         {
-            var (name, folders) = ExplorerVerbs.Verbs[i];
+            var (name, files, folders) = ExplorerVerbs.Verbs[i];
             Assert.Equal(folders, ShellDll.Verb(i + 1, @"M:\Docs", true)!.Value.Shown);
-            Assert.Equal(name is not ("keep" or "compare"), ShellDll.Verb(i + 1, @"M:\Docs\a.docx", false)!.Value.Shown);
+            Assert.Equal(files && name is not ("keep" or "compare"), ShellDll.Verb(i + 1, @"M:\Docs\a.docx", false)!.Value.Shown);
         }
         Assert.Equal("VFS365", ShellDll.Verb(0, @"M:\a.docx", false)!.Value.Title);
         Assert.Equal("Open in browser", ShellDll.Verb(1, @"M:\a.docx", false)!.Value.Title);
@@ -524,7 +524,8 @@ public sealed class ShellExtensionTests
         Assert.Equal(1, verbs.Next(10, commands, out var fetched)); // S_FALSE: fewer than asked
         Assert.Equal((uint)ExplorerVerbs.Verbs.Length, fetched);
         var titles = commands.Take((int)fetched).Select(c => c.GetTitle(IntPtr.Zero, out var t) == 0 ? Take(t) : null);
-        Assert.Equal(["Open in browser", "Open in desktop app", "Copy link", "Version history", "Share in browser", "Keep this version", "Compare with the original"], titles);
+        Assert.Equal(["Open in browser", "Open in desktop app", "Copy link", "Version history", "Share in browser", "Keep this version", "Compare with the original",
+            "Search in Microsoft 365"], titles);
         Assert.Equal(0, commands[5].GetFlags(out var keepFlags));
         Assert.Equal(0x20u, keepFlags); // ECF_SEPARATORBEFORE
         Assert.Equal(0, verbs.Reset());
@@ -534,6 +535,11 @@ public sealed class ShellExtensionTests
         Assert.Equal(0, copy.Next(1, last, out _));
         Assert.Equal(0, last[0].GetTitle(IntPtr.Zero, out var lastTitle));
         Assert.Equal("Compare with the original", Take(lastTitle));
+        Assert.Equal(0, copy.Next(1, last, out _));
+        Assert.Equal(0, last[0].GetTitle(IntPtr.Zero, out var searchTitle));
+        Assert.Equal("Search in Microsoft 365", Take(searchTitle));
+        Assert.Equal(0, commands[7].GetFlags(out var searchFlags));
+        Assert.Equal(0x20u, searchFlags); // ECF_SEPARATORBEFORE
         Assert.Equal(1, copy.Next(1, last, out var none));
         Assert.Equal(0u, none);
     }

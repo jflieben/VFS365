@@ -8,7 +8,9 @@ namespace Vfs365.Agent;
 /// Explorer's "VFS365" submenu on files and folders of the volume, per user (HKCU\Software\Classes\*\shell and Directory\shell, no admin
 /// rights): static verbs, shown only for items whose path starts with one of the volume's roots (AppliesTo, Advanced Query Syntax on
 /// System.ItemPathDisplay), single selection only. Each runs "vfs365-agent.exe verb &lt;name&gt; "%1"", which hands it to the running
-/// agent (<see cref="VerbPipe"/>). Windows 11 shows them under "Show more options".
+/// agent (<see cref="VerbPipe"/>). Windows 11 shows them under "Show more options". No folder background menu: Explorer hides a
+/// Directory\Background verb that has AppliesTo even on a matching folder (spike 15, `search-spike menu`), and without it the verb
+/// would show in every folder.
 /// </summary>
 public static class ExplorerVerbs
 {
@@ -17,9 +19,12 @@ public static class ExplorerVerbs
     const string Files = Classes + @"\*\shell\" + KeyName, Folders = Classes + @"\Directory\shell\" + KeyName;
     const string Signature = "VFS365Signature";
 
-    /// <summary>The verbs in menu order, and whether folders get them too.</summary>
-    public static readonly (string Name, bool Folders)[] Verbs =
-        [("browser", true), ("desktop", false), ("link", true), ("versions", false), ("share", true), ("keep", false), ("compare", false)];
+    /// <summary>The verbs in menu order, and whether files and folders get them.</summary>
+    public static readonly (string Name, bool Files, bool Folders)[] Verbs =
+    [
+        ("browser", true, true), ("desktop", true, false), ("link", true, true), ("versions", true, false), ("share", true, true), ("keep", true, false),
+        ("compare", true, false), ("search", false, true),
+    ];
 
     public static bool IsVerb(string name) => Verbs.Any(v => v.Name == name);
 
@@ -60,7 +65,7 @@ public static class ExplorerVerbs
         }
         culture ??= CultureInfo.CurrentUICulture;
         var appliesTo = AppliesTo(roots);
-        var signature = $"{exe}|{appliesTo}|{culture.Name}|{Verbs.Length}";
+        var signature = $"{exe}|{appliesTo}|{culture.Name}|{string.Join(',', Verbs.Select(v => v.Name))}";
         using (var existing = hive.OpenSubKey(Files))
         {
             if (existing?.GetValue(Signature) as string == signature)
@@ -69,7 +74,7 @@ public static class ExplorerVerbs
             }
         }
         Remove(hive);
-        foreach (var (path, folders) in new[] { (Files, false), (Folders, true) })
+        foreach (var (path, folders) in new[] { (Folders, true), (Files, false) })
         {
             using var menu = hive.CreateSubKey(path);
             menu.SetValue("MUIVerb", UiText.Get(culture, "Verb.Menu"));
@@ -78,7 +83,7 @@ public static class ExplorerVerbs
             menu.SetValue("MultiSelectModel", "Single");
             menu.SetValue("Icon", $"{exe},0");
             var order = 0;
-            foreach (var (name, forFolders) in Verbs.Where(v => !folders || v.Folders))
+            foreach (var (name, _, _) in Verbs.Where(v => folders ? v.Folders : v.Files))
             {
                 // Explorer lists subcommands by key name
                 using var verb = menu.CreateSubKey($@"shell\{++order:00}{name}");
@@ -95,11 +100,17 @@ public static class ExplorerVerbs
                     case "compare":
                         verb.SetValue("AppliesTo", ConflictCopyFiles());
                         break;
+                    case "search":
+                        verb.SetValue("CommandFlags", 0x20, RegistryValueKind.DWord); // ECF_SEPARATORBEFORE
+                        break;
                 }
                 using var command = verb.CreateSubKey("command");
                 command.SetValue("", Command(exe, name));
             }
-            menu.SetValue(Signature, signature); // last: a menu written halfway is written again
+            if (path == Files)
+            {
+                menu.SetValue(Signature, signature); // last: a menu written halfway is written again
+            }
         }
         return true;
     }
