@@ -75,6 +75,7 @@ public sealed record CheckedExclusion(string Reason, DateTimeOffset CheckedAt);
 /// TenantId: the signed-in tenant, when the caller passed it. Misses: shown libraries search didn't return, with the number of runs in
 /// a row (hidden at the second, or the third while the set shrank by more than the safety ratio). Exclusions: libraries left out for a
 /// reason that can change (hidden, offline clients excluded). EmptyPins: pinned URLs where nothing was found or nothing is shown.
+/// Shared: what other people shared with the user, for the Shared with me folder (<see cref="SharedWithMeService"/>).
 /// </summary>
 public sealed record DiscoveryState(
     DateTimeOffset RunAt,
@@ -89,7 +90,8 @@ public sealed record DiscoveryState(
     string? TenantId = null,
     IReadOnlyDictionary<string, int>? Misses = null,
     IReadOnlyDictionary<string, CheckedExclusion>? Exclusions = null,
-    IReadOnlyDictionary<string, CheckedExclusion>? EmptyPins = null);
+    IReadOnlyDictionary<string, CheckedExclusion>? EmptyPins = null,
+    SharedState? Shared = null);
 
 /// <summary>
 /// SearchError: why search was incomplete (a page failed, too many pages); non-null means the run failed, though libraries from the

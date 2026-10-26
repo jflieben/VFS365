@@ -23,6 +23,8 @@ public static class AgentCommands
           vfs365 discover [--config <file>] [--drives] [--json] [--full] [--audit]
                                                           find the user's libraries (--drives resolves Graph drive IDs, --full reads all metadata again,
                                                           --audit checks recall against site search, followed sites and hubs)
+          vfs365 shared   [--config <file>] [--json]      what other people shared with you, as the Shared with me folder shows it
+                                                          (owner, kind, drive and item ID, path in the owner's drive); reads it now
           vfs365 mount    [--config <file>] [--drive M:|*|None] [--verbose] [--trace] [--no-shell] [--discover-now]
                                                           mount OneDrive and the discovered libraries (--discover-now skips the
                                                           5 to 90 minute wait before discovery at a start with recent state)
@@ -55,6 +57,9 @@ public static class AgentCommands
         """;
 
     static readonly TimeSpan SessionEndWait = TimeSpan.FromSeconds(60);
+
+    /// <summary>Listing the Shared with me folder reads the shared list again when it is older than this (and no try was this recent).</summary>
+    static readonly TimeSpan SharedListedAge = TimeSpan.FromMinutes(5);
     static volatile ManualResetEventSlim? finished;
     static volatile Action<bool>? powerChanged;
 
@@ -86,7 +91,7 @@ public static class AgentCommands
         bool Flag(string name) => args.Contains(name, StringComparer.OrdinalIgnoreCase);
 
         var command = args.FirstOrDefault()?.ToLowerInvariant();
-        if (command is not ("settings" or "whoami" or "discover" or "mount" or "unmount" or "inspect" or "put" or "watch" or "pin" or "unpin" or "pins" or "signout" or "machine-setup" or "machine-stop" or "machine-start" or "machine-report" or "about"
+        if (command is not ("settings" or "whoami" or "discover" or "shared" or "mount"or "unmount" or "inspect" or "put" or "watch" or "pin" or "unpin" or "pins" or "signout" or "machine-setup" or "machine-stop" or "machine-start" or "machine-report" or "about"
             or "why" or "health" or "support-bundle"))
         {
             error.WriteLine(Usage);
@@ -152,6 +157,7 @@ public static class AgentCommands
                 // Machine-wide steps first: a profile that can't be cleaned must not leave them behind. Folders still in VFS365 go
                 // back before the data goes, which holds where they came from.
                 MachineCleanup.RemoveExplorerEntries(dryRun, Say);
+                ShellPackage.RemoveForAllUsers(dryRun, Say);
                 NetworkProviderOrder.Remove(dryRun, Say);
                 var profiles = MachineCleanup.ProfileDataFolders().ToList();
                 MachineCleanup.RestoreKnownFolders(profiles, dryRun, Say);
@@ -287,6 +293,11 @@ public static class AgentCommands
                 Say($"OneDrive:   {me.WebUrl}");
                 Say($"SharePoint: {SharePointUrls.TenantRootFromOneDriveUrl(me.WebUrl)}");
                 return 0;
+            }
+
+            if (command == "shared")
+            {
+                return await SharedAsync(settings, api, client, tokens, Flag("--json"), Say, output);
             }
 
             if (command == "inspect")
@@ -493,13 +504,15 @@ public static class AgentCommands
         File.Delete(CacheKey.FilePath);
     }
 
-    /// <summary>An engine without a mount, for the diagnostic commands: OneDrive plus the libraries of the last discovery.</summary>
+    /// <summary>An engine without a mount, for the diagnostic commands: OneDrive plus the libraries and shared items of the last discovery.</summary>
     static async Task<(DriveEngine Engine, DriveApi DriveApi)> ToolEngineAsync(AgentSettings settings, SharePointDiscoveryApi api, M365Client client)
     {
         var oneDrive = await api.GetMyDriveAsync(default);
         var driveApi = new DriveApi(client);
+        var state = DiscoveryStore.Load();
         var engine = new DriveEngine(
-            DriveNamespace.Build(oneDrive, DiscoveryStore.Load()?.Libraries ?? [], api.GetLibraryDriveIdAsync, settings.Scope),
+            DriveNamespace.Build(oneDrive, state?.Libraries ?? [], api.GetLibraryDriveIdAsync, settings.Scope,
+                shared: settings.SharedWithMe ? state?.Shared?.Items ?? [] : null),
             driveApi,
             new ContentCache(Path.Combine(Path.GetTempPath(), $"vfs365-tool-{Environment.ProcessId}"), driveApi),
             new DriveEngineOptions { StagingDirectory = Path.Combine(Path.GetTempPath(), $"vfs365-tool-{Environment.ProcessId}", "staging") });
@@ -576,6 +589,48 @@ public static class AgentCommands
             existing?.ItemId is { } id ? new UploadTarget(id, null, null, null) : UploadTarget.New(target.DrivePath, name), file, default);
         say($"Uploaded:   {target.Path}\\{item.Name} ({item.Id}, {item.Size:N0} bytes)");
         return 0;
+    }
+
+    /// <summary>`vfs365 shared`: what the Shared with me folder's source returns, every item looked up, for support.</summary>
+    static async Task<int> SharedAsync(AgentSettings settings, SharePointDiscoveryApi api, M365Client client, WamTokenSource tokens, bool json,
+        Action<string> say, TextWriter output)
+    {
+        var me = await api.GetMyDriveAsync(default);
+        var user = tokens.LastResult?.Username ?? throw new IOException("The signed-in account's name is unknown");
+        var sharedApi = new SharedWithMeApi(client);
+        var result = await new SharedWithMeService(sharedApi).RunAsync(user, me.DriveId, null, recheck: true, default);
+        var names = DriveNamespace.SharedNames(result.State.Items);
+        if (json)
+        {
+            output.WriteLine(JsonSerializer.Serialize(new
+            {
+                user,
+                result.Hits,
+                result.SearchError,
+                result.Errors,
+                Items = result.State.Items.Select(i => new { ShownAs = names.GetValueOrDefault(i.Key), i.Name, i.OwnerName, i.OwnerEmail, Kind = i.IsFolder ? "folder" : "file", i.DriveId, i.ItemId, i.Path, i.ReadOnly, i.Size, i.Modified, i.WebUrl }),
+            }, new JsonSerializerOptions { WriteIndented = true }));
+            return result.SearchError is null ? 0 : 1;
+        }
+        var shown = settings.Scope != DriveScope.All ? $"; Scope is {settings.Scope}, so the drive doesn't show them (Scope All does)"
+            : !settings.SharedWithMe ? "; policy SharedWithMe is 0, so the drive doesn't show them" : "";
+        say($"User:       {user}");
+        say($"Search:     {result.Hits} hits (duplicates and your own items left out), {result.SearchError ?? "complete"}");
+        say($"Shared:     {result.State.Items.Count} items ({result.State.Items.Count(i => i.IsFolder)} folders) from other people{shown}");
+        foreach (var item in result.State.Items.OrderBy(i => names.GetValueOrDefault(i.Key), StringComparer.OrdinalIgnoreCase))
+        {
+            say($@"  \{DriveNamespace.SharedFolderName}\{names.GetValueOrDefault(item.Key) ?? item.Name}");
+            say($"      {(item.IsFolder ? "folder" : "file")}{(item.ReadOnly ? ", view only" : "")}, shared by {item.OwnerName ?? "?"}{(item.OwnerEmail is null ? "" : $" <{item.OwnerEmail}>")}");
+            say($"      drive {item.DriveId}, item {item.ItemId}");
+            say($"      path in the owner's drive: /{item.Path}");
+        }
+        foreach (var problem in result.Errors)
+        {
+            say($"Error:      {problem}");
+        }
+        say($"Requests:   Graph {client.GraphRequests}, SharePoint {client.SharePointRequests}");
+        say("Search covers sharing with named people; files opened through an \"anyone\" or organization link aren't listed.");
+        return result.SearchError is null ? 0 : 1;
     }
 
     /// <summary>
@@ -917,9 +972,13 @@ public static class AgentCommands
             var driveApi = new DriveApi(client);
             DriveHost? drive = null;
             var notices = new NoticeBatcher(settings.NotifyUploads);
+            // Shared with me: only with Scope All; shown at once with the last run's list, read again in the background
+            var sharedShown = settings.Scope == DriveScope.All && settings.SharedWithMe;
+            Action? sharedListed = null;
+            var ns = DriveNamespace.Build(oneDrive, settings.Scope == DriveScope.OneDrive ? [] : keeper.Current.Libraries, api.GetLibraryDriveIdAsync, settings.Scope,
+                (library, driveId) => keeper.RememberDriveId(library.Key, driveId), sharedShown ? keeper.Current.Shared?.Items ?? [] : null);
             var engine = new DriveEngine(
-                DriveNamespace.Build(oneDrive, settings.Scope == DriveScope.OneDrive ? [] : keeper.Current.Libraries, api.GetLibraryDriveIdAsync, settings.Scope,
-                    (library, driveId) => keeper.RememberDriveId(library.Key, driveId)),
+                ns,
                 driveApi,
                 cache,
                 new DriveEngineOptions
@@ -933,6 +992,7 @@ public static class AgentCommands
                     RepeatSaveWindow = TimeSpan.FromSeconds(settings.RepeatSaveSeconds),
                     DatabaseFiles = settings.DatabaseFiles,
                     Changed = change => drive?.Notify(change),
+                    SharedListed = () => sharedListed?.Invoke(),
                     Notice = notice =>
                     {
                         if (notice.Kind == NoticeKind.UploadWaiting && PlainCause.Of(notice.Detail) == Cause.Offline)
@@ -1426,6 +1486,7 @@ public static class AgentCommands
                                 network: false, searchFailed: true);
                         }
                         say($"Libraries:  {result.Libraries.Count} from discovery in {watch.Elapsed.TotalSeconds:N1} s");
+                        _ = Task.Run(() => RefreshSharedAsync(recheck: everything));
                     }
                     discoveryFailures = 0;
                     nextDiscovery = NextDay();
@@ -1440,6 +1501,76 @@ public static class AgentCommands
                     discoveryGate.Release();
                 }
             }
+
+            // Shared with me: one search call per run for most users (paths and rights only for new, moved or week-old items), one run at
+            // a time; after discovery (daily, and on Refresh with every item checked again) and when the folder is listed and the list is
+            // older than SharedListedAge. A failed run keeps the list and is tried again at the next of those.
+            var sharedGate = new SemaphoreSlim(1, 1);
+            var sharedTriedTicks = DateTimeOffset.MinValue.UtcTicks;
+            string? sharedProblem = null;
+            async Task RefreshSharedAsync(bool recheck)
+            {
+                if (!sharedShown || !await sharedGate.WaitAsync(0))
+                {
+                    return;
+                }
+                RequestPriority.MarkBackground();
+                var watch = Stopwatch.StartNew();
+                try
+                {
+                    Volatile.Write(ref sharedTriedTicks, DateTimeOffset.UtcNow.UtcTicks);
+                    if (tokens.LastResult?.Username is null)
+                    {
+                        await tokens.GetAccessTokenAsync(M365Client.GraphResource, default); // the account's name, without a call to Graph
+                    }
+                    var user = tokens.LastResult?.Username ?? throw new IOException("the signed-in account's name is unknown");
+                    var before = keeper.Current.Shared;
+                    var result = await new SharedWithMeService(new SharedWithMeApi(client)).RunAsync(user, oneDrive.DriveId, before, recheck, default);
+                    if (result.SearchError is { } error)
+                    {
+                        throw new IOException($"search failed: {error}");
+                    }
+                    keeper.SetShared(result.State);
+                    engine.SetShared(result.State.Items);
+                    foreach (var gone in (before?.Items ?? []).Select(i => i.DriveId).Distinct(StringComparer.Ordinal).Where(id => ns.VolumePathOf(id) is null))
+                    {
+                        cache.ForgetDrive(gone); // no longer shown anywhere: its cached content goes
+                    }
+                    var added = result.State.Items.Count(i => before?.Items.Any(b => b.Key == i.Key) != true);
+                    var line = $"{result.State.Items.Count} item(s) from other people ({added} new, {result.State.Items.Count(i => i.IsFolder)} folder(s))";
+                    if (line != sharedProblem || added > 0 || recheck)
+                    {
+                        say($"Shared:     {line}, read in {watch.Elapsed.TotalSeconds:N1} s");
+                    }
+                    sharedProblem = line;
+                    foreach (var problem in result.Errors)
+                    {
+                        log($"shared with me: {problem}");
+                    }
+                }
+                catch (Exception e) when (e is not OutOfMemoryException)
+                {
+                    var line = $"failed, the last list stays: {e.Message}";
+                    if (line != sharedProblem)
+                    {
+                        say($"Shared:     {line}");
+                    }
+                    sharedProblem = line;
+                }
+                finally
+                {
+                    sharedGate.Release();
+                }
+            }
+            sharedListed = () =>
+            {
+                var now = DateTimeOffset.UtcNow;
+                if (now - (keeper.Current.Shared?.RunAt ?? DateTimeOffset.MinValue) >= SharedListedAge
+                    && now.UtcTicks - Volatile.Read(ref sharedTriedTicks) >= SharedListedAge.Ticks)
+                {
+                    _ = Task.Run(() => RefreshSharedAsync(recheck: false));
+                }
+            };
 
             DateTimeOffset LibrariesReadAt() => DiscoverySchedule.LibrariesReadAt(keeper.Current, settings.Scope);
             string? RefreshBlocked() => RefreshRule.Blocked(DateTimeOffset.UtcNow, LibrariesReadAt(), DiscoveryStore.LastRefresh, refreshing);
@@ -1570,9 +1701,13 @@ public static class AgentCommands
                 {
                     Explorer("remove the navigation pane entry", ExplorerLocation.Unregister); // an entry left by a run with the navigation pane on, or one that was ended
                 }
-                // The VFS365 menu on the drive's files and folders (ExplorerMenu.cs); removed when this block ends at the stop
-                using var explorerMenu = ExplorerMenu.Start(engine, driveApi, unc, drive.DriveLetter, driveLetters,
+                // Windows 11's context menu: the menu package registered for this user in the background (ShellPackage.cs)
+                var shellPackage = ShellPackage.EnsureRegisteredAsync(log);
+                // The VFS365 menu on the drive's files and folders and the shell section for overlay icons (ExplorerMenu.cs); removed and
+                // cleared when this block ends at the stop
+                using var explorerMenu = ExplorerMenu.Start(engine, driveApi, unc, drive.DriveLetter, driveLetters, settings.OverlayIcons,
                     (title, text, problem) => VerbPipe.Tell(tray, title, text, problem), say, log);
+                _ = shellPackage.ContinueWith(_ => explorerMenu?.Update(), TaskScheduler.Default); // legacy verbs go once the package is there
 
                 // What Windows tells Explorer about the drive: checked now and every 5 minutes, logged when it changes
                 if (NetworkProviderOrder.Problem(NetworkProviderOrder.Current()) is { } providerProblem)

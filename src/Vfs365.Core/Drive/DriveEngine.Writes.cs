@@ -264,7 +264,7 @@ public sealed partial class DriveEngine
             if (bound.Result is { } result)
             {
                 var path = bound.ResultPath!;
-                return Follow(ItemEntry(VolumePath(driveId, path) ?? entry.Path, drive, driveId, path, result));
+                return Follow(ItemEntry(VolumePath(driveId, path, drive) ?? entry.Path, drive, driveId, path, result));
             }
             if (bound.Discarded)
             {
@@ -272,7 +272,7 @@ public sealed partial class DriveEngine
             }
             return bound.DrivePath.Equals(entry.DrivePath, StringComparison.Ordinal)
                 ? entry
-                : PendingEntry(VolumePath(driveId, bound.DrivePath) ?? entry.Path, drive, bound);
+                : PendingEntry(VolumePath(driveId, bound.DrivePath, drive) ?? entry.Path, drive, bound);
         }
         if (overlay.GetValueOrDefault(Key(driveId, entry.DrivePath)) is PendingFile { IsLive: true } staged && staged.Base?.Id == entry.ItemId)
         {
@@ -380,6 +380,10 @@ public sealed partial class DriveEngine
         if (PendingOf(file) is { } pending)
         {
             pending.Wrote();
+            if (!pending.Dirty)
+            {
+                MarkStates(); // now waits to upload
+            }
             pending.Dirty = true;
             pending.Modified = Now;
             if (pending.Flushed)
@@ -434,7 +438,7 @@ public sealed partial class DriveEngine
         string? key = null;
         if (only is null)
         {
-            if (ns.Resolve(path!) is not { Drive: { } drive } resolved || resolved.DrivePath.Length == 0)
+            if (ns.Resolve(path!) is not { Drive: { } drive } resolved || resolved.IsTop)
             {
                 return;
             }
@@ -766,7 +770,7 @@ public sealed partial class DriveEngine
     /// <summary>Throws when the entry may not be deleted.</summary>
     public async Task CanDeleteAsync(FsEntry entry, CancellationToken ct)
     {
-        await WritableAsync(entry.Path, ct);
+        await DeletableAsync(entry.Path, ct);
         if (entry.IsDirectory && (await ListAsync(entry, ct)).Count > 0)
         {
             throw new FsException(FsError.DirectoryNotEmpty, entry.Path);
@@ -779,7 +783,7 @@ public sealed partial class DriveEngine
     /// </summary>
     public async Task DeleteAsync(string path, CancellationToken ct)
     {
-        var target = await WritableAsync(path, ct);
+        var target = await DeletableAsync(path, ct);
         await LookAheadAsync(target.DriveId, target.DrivePath, ct);
         await writeGate.WaitAsync(ct);
         try
@@ -839,7 +843,7 @@ public sealed partial class DriveEngine
     {
         var from = await WritableAsync(source, ct);
         var to = ns.Resolve(destination);
-        if (to?.Drive is null || to.DrivePath.Length == 0)
+        if (to?.Drive is null || to.IsTop)
         {
             throw new FsException(FsError.AccessDenied, destination);
         }
@@ -2258,19 +2262,58 @@ public sealed partial class DriveEngine
     async Task<WriteTarget> WritableAsync(string path, CancellationToken ct)
     {
         var resolved = ns.Resolve(path);
-        if (resolved?.Drive is null || resolved.DrivePath.Length == 0)
+        if (resolved?.Drive is null || resolved.IsTop && !resolved.Drive.IsFile)
         {
             throw new FsException(FsError.AccessDenied, $"{path} is part of the fixed tree");
         }
         if (resolved.Drive.ReadOnly)
         {
-            throw new FsException(FsError.ReadOnly, $"{path} is in a read-only library");
+            throw new FsException(FsError.ReadOnly, resolved.Drive.IsFile
+                ? $"{path} is a file shared with you, read-only at the top of {DriveNamespace.SharedFolderName}"
+                : $"{path} is in a read-only library");
+        }
+        if (resolved.IsTop)
+        {
+            throw new FsException(FsError.AccessDenied, $"{path} is part of the fixed tree");
         }
         if (options.DatabaseFiles != DatabaseFilePolicy.Allow && DatabaseFiles.IsDatabase(NameOf(resolved.DrivePath)))
         {
             throw new FsException(FsError.ReadOnly, $"{path} is a multi-user database file, which policy keeps read-only");
         }
         return new WriteTarget(resolved, resolved.Drive, await resolved.Drive.GetDriveIdAsync(ct));
+    }
+
+    /// <summary>
+    /// <see cref="WritableAsync"/> for a delete. Windows deletes a folder's content before the folder (Explorer and Directory.Delete
+    /// alike), so when a shared folder's own delete is refused, the files in it whose deletes still wait for the settle window are kept
+    /// and show again. Folders below it were deleted at once and stay deleted.
+    /// </summary>
+    async Task<WriteTarget> DeletableAsync(string path, CancellationToken ct)
+    {
+        try
+        {
+            return await WritableAsync(path, ct);
+        }
+        catch (FsException) when (ns.Resolve(path) is { IsTop: true, Drive: { IsFile: false, BasePath.Length: > 0 } drive } top)
+        {
+            var below = Key(await drive.GetDriveIdAsync(ct), top.DrivePath + "/");
+            await writeGate.WaitAsync(ct);
+            try
+            {
+                foreach (var gone in overlay.Values.OfType<GoneItem>()
+                    .Where(g => g.DeleteOnExpiry && g.Key.StartsWith(below, StringComparison.OrdinalIgnoreCase) && !transfers.ContainsKey(g.Key)).ToList())
+                {
+                    DropLocal(gone);
+                    Report(gone.DriveId, gone.DrivePath, ChangeKind.Added, false);
+                    Log($"{gone.DrivePath} is kept: it was deleted with its shared folder, which can't be deleted from the drive");
+                }
+            }
+            finally
+            {
+                ReleaseGate();
+            }
+            throw;
+        }
     }
 
     async Task<string> FolderIdAsync(string driveId, string folderPath, CancellationToken ct)
@@ -2360,10 +2403,12 @@ public sealed partial class DriveEngine
 
     void Log(string message) => options.Log?.Invoke(message);
 
-    void Notify(NoticeKind kind, string driveId, string drivePath, string? detail, DriveItemInfo? other = null) =>
+    void Notify(NoticeKind kind, string driveId, string drivePath, string? detail, DriveItemInfo? other = null)
+    {
+        NoteStates(kind, driveId, drivePath);
         options.Notice?.Invoke(new EngineNotice(kind, NameOf(drivePath), VolumePath(driveId, drivePath), detail, other?.ModifiedBy, other?.Modified));
+    }
 
-    /// <summary>Where a drive path shows on the volume; null when its library isn't mounted.</summary>
-    string? VolumePath(string driveId, string drivePath) =>
-        ns.VolumePathOf(driveId) is { } top ? Join(top, drivePath.Replace('/', '\\')) : null;
+    /// <summary>Where a drive path shows on the volume (through <paramref name="prefer"/> when that mount shows it); null when no mount shows it.</summary>
+    string? VolumePath(string driveId, string drivePath, DriveMount? prefer = null) => ns.VolumePathOf(driveId, drivePath, prefer);
 }

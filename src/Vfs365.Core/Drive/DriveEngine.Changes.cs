@@ -273,6 +273,7 @@ public sealed partial class DriveEngine
             feed.Backoff = 0;
         }
         Touch(driveId);
+        MarkStates();
     }
 
     const int MaxPushedBackoff = 3, MaxPolledBackoff = 2;
@@ -339,6 +340,11 @@ public sealed partial class DriveEngine
     /// </summary>
     public Task PollAsync(string driveId)
     {
+        if (ns.MountsOnlyBelowRoot(driveId))
+        {
+            // Only folders or files shared from it are shown: the user can't read its feed (folders are read again when opened)
+            return Task.CompletedTask;
+        }
         var feed = feeds.GetOrAdd(driveId, _ => NewFeed());
         feed.Engaged = true;
         lock (feed)
@@ -432,7 +438,8 @@ public sealed partial class DriveEngine
     public IReadOnlyList<string> ActiveDrives() => feeds.Where(f => Now - f.Value.LastUsed < options.ActiveWindow).Select(f => f.Key).ToList();
 
     /// <summary>Drives used within ActiveWindow whose change feed works: they get push channels (while a feed fails, a push reads nothing).</summary>
-    public IReadOnlyList<string> PushDrives() => feeds.Where(f => Now - f.Value.LastUsed < options.ActiveWindow && !f.Value.Broken).Select(f => f.Key).ToList();
+    public IReadOnlyList<string> PushDrives() =>
+        feeds.Where(f => Now - f.Value.LastUsed < options.ActiveWindow && !f.Value.Broken && !ns.MountsOnlyBelowRoot(f.Key)).Select(f => f.Key).ToList();
 
     /// <summary>
     /// The network is back: feeds backing off after failures are read again soon, each 0 to 30 s from now at random, and lookups ask
@@ -862,6 +869,10 @@ public sealed partial class DriveEngine
     /// </summary>
     void TrackAncestors(string driveId, string folderPath)
     {
+        if (ns.MountsOnlyBelowRoot(driveId))
+        {
+            return; // no feed to keep listings current
+        }
         for (var path = ParentOf(folderPath); path.Length > 0; path = ParentOf(path))
         {
             var key = Key(driveId, path);
@@ -1422,7 +1433,7 @@ public sealed partial class DriveEngine
         {
             return;
         }
-        var shown = ns.VolumePathOf(driveId) is { } top ? Join(top, path.Replace('/', '\\')) : path;
+        var shown = ns.VolumePathOf(driveId, path) ?? path;
         Log(listed == current.Size
             ? $"{shown}: changed in Microsoft 365 since it was listed (another version is served); a read failed, opening it again works"
             : $"{shown}: {listed} bytes listed, {current.Size} served (changed in Microsoft 365, or SharePoint wrote properties into it); " +
@@ -1599,7 +1610,7 @@ public sealed partial class DriveEngine
     void DropDrive(string driveId)
     {
         ForgetDrive(driveId);
-        if (ns.VolumePathOf(driveId) is { } top)
+        foreach (var top in ns.MountTopsOf(driveId))
         {
             options.Changed?.Invoke(new EngineChange(top, ChangeKind.Modified, true));
         }
@@ -1647,9 +1658,13 @@ public sealed partial class DriveEngine
         {
             feed.EchoUntil = Now + NotifyEcho;
         }
-        if (options.Changed is { } changed && ns.VolumePathOf(driveId) is { } top)
+        MarkStates();
+        if (options.Changed is { } changed)
         {
-            changed(new EngineChange(Join(top, drivePath.Replace('/', '\\')), kind, isDirectory));
+            foreach (var path in ns.VolumePathsOf(driveId, drivePath))
+            {
+                changed(new EngineChange(path, kind, isDirectory));
+            }
         }
     }
 
@@ -1657,12 +1672,21 @@ public sealed partial class DriveEngine
     /// Replaces the libraries (discovery finished or changed) and reports the virtual folders whose content changed. What is cached
     /// for libraries no longer shown goes.
     /// </summary>
-    public void SetLibraries(IReadOnlyList<Discovery.LibraryEntry> libraries)
+    public void SetLibraries(IReadOnlyList<Discovery.LibraryEntry> libraries) => Changed(ns.SetLibraries(libraries));
+
+    /// <summary>
+    /// Replaces what the Shared with me folder shows (null: no such folder) and reports what changed. What is cached for drives no longer
+    /// shown anywhere goes.
+    /// </summary>
+    public void SetShared(IReadOnlyList<Discovery.SharedItem>? shared) => Changed(ns.SetShared(shared));
+
+    void Changed(IReadOnlyList<string> paths)
     {
-        foreach (var path in ns.SetLibraries(libraries))
+        foreach (var path in paths)
         {
             options.Changed?.Invoke(new EngineChange(path, ChangeKind.Modified, true));
         }
+        MarkStates(); // volume paths may have changed
         foreach (var driveId in feeds.Keys)
         {
             if (ns.VolumePathOf(driveId) is null)

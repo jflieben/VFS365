@@ -125,6 +125,9 @@ public sealed record DriveEngineOptions
 
     /// <summary>Things the user should hear about (conflict copies, uploads that keep failing), for notifications.</summary>
     public Action<EngineNotice>? Notice { get; init; }
+
+    /// <summary>The Shared with me folder was listed: the host reads the shared list again when it is old.</summary>
+    public Action? SharedListed { get; init; }
 }
 
 public enum ChangeKind { Added, Removed, Modified }
@@ -439,8 +442,16 @@ public sealed partial class DriveEngine(DriveNamespace ns, IDriveApi api, Conten
         }
 
         var driveId = await resolved.Drive!.GetDriveIdAsync(ct);
-        Touch(driveId, engage: resolved.DrivePath.Contains('/')); // names at a library's top are probed for thumbnails and desktop.ini
+        // Names at a library's top are probed for thumbnails and desktop.ini
+        Touch(driveId, engage: resolved.Drive.RelativeOf(resolved.DrivePath)?.Contains('/') ?? false);
         var key = Key(driveId, resolved.DrivePath);
+        if (resolved.Drive.IsFile)
+        {
+            // A file shared with the user, shown under its name in the Shared with me folder
+            return await LookupAsync(driveId, resolved.DrivePath, ct) is { IsFolder: false } file
+                ? ItemEntry(resolved.Path, resolved.Drive, driveId, resolved.DrivePath, file with { Name = NameOf(resolved.Path.Replace('\\', '/')) })
+                : null;
+        }
         while (true)
         {
             switch (overlay.GetValueOrDefault(key))
@@ -461,6 +472,12 @@ public sealed partial class DriveEngine(DriveNamespace ns, IDriveApi api, Conten
         var item = await LookupAsync(driveId, resolved.DrivePath, ct);
         return item is null ? null : ItemEntry(resolved.Path, resolved.Drive, driveId, resolved.DrivePath, item);
     }
+
+    /// <summary>
+    /// Every volume path that shows a drive path ('/'-separated, "" for the drive's root): a drive can show in several places (a library
+    /// under Sites and folders of it shared with the user, several folders shared from one person's OneDrive). Empty when none does.
+    /// </summary>
+    public IReadOnlyList<string> VolumePathsOf(string driveId, string drivePath) => ns.VolumePathsOf(driveId, drivePath);
 
     /// <summary>The Graph drive an entry belongs to, resolved if needed; null above the libraries.</summary>
     public async Task<string?> DriveIdOfAsync(FsEntry entry, CancellationToken ct) => entry.Drive is { } drive ? await drive.GetDriveIdAsync(ct) : null;
@@ -497,6 +514,10 @@ public sealed partial class DriveEngine(DriveNamespace ns, IDriveApi api, Conten
     {
         if (directory.Folder is { Drive: null } folder)
         {
+            if (folder.SharedRoot)
+            {
+                options.SharedListed?.Invoke();
+            }
             yield return Sorted([.. folder.Children.Values.Select(child => FolderEntry(Join(directory.Path, child.Name), child))]);
             yield break;
         }
@@ -833,7 +854,7 @@ public sealed partial class DriveEngine(DriveNamespace ns, IDriveApi api, Conten
     {
         var key = Key(driveId, folderPath);
         var burst = lookupBursts.AddOrUpdate(key, _ => (1, Now), (_, b) => Now - b.Since > options.WalkWindow ? (1, Now) : (b.Count + 1, b.Since));
-        if (burst.Count < LookupBurst || listings.ContainsKey(key))
+        if (burst.Count < LookupBurst || listings.ContainsKey(key) || ns.Hides(driveId, folderPath))
         {
             return;
         }
@@ -1077,6 +1098,7 @@ public sealed partial class DriveEngine(DriveNamespace ns, IDriveApi api, Conten
         Local(driveId, drivePath, item);
         lookups[Key(driveId, drivePath)] = (item, Now);
         Reachable(driveId);
+        ClearStates(driveId, drivePath);
         LocalWrite(driveId);
     }
 
@@ -1085,6 +1107,7 @@ public sealed partial class DriveEngine(DriveNamespace ns, IDriveApi api, Conten
     {
         Local(driveId, drivePath, null);
         lookups[Key(driveId, drivePath)] = (null, Now);
+        ClearStates(driveId, drivePath);
         LocalWrite(driveId);
     }
 
@@ -1174,17 +1197,41 @@ public sealed partial class DriveEngine(DriveNamespace ns, IDriveApi api, Conten
         }
     }
 
-    FsEntry FolderEntry(string path, VirtualFolder folder) => new()
+    FsEntry FolderEntry(string path, VirtualFolder folder)
     {
-        Path = path,
-        Name = folder.Name,
-        IsDirectory = true,
-        Created = startedAt,
-        Modified = startedAt,
-        ReadOnly = folder.Drive?.ReadOnly ?? true,
-        Folder = folder,
-        Drive = folder.Drive,
-    };
+        var shown = folder.Shared is { Modified: var modified } && modified != default ? modified : startedAt;
+        if (folder.Drive is { IsFile: true } file)
+        {
+            // A shared file in the Shared with me folder: as last looked up, else as search reported it; opening it looks it up
+            var known = file.KnownDriveId is { } driveId && lookups.TryGetValue(Key(driveId, file.BasePath), out var looked) && looked.Item is { IsFolder: false } item
+                ? item : null;
+            return new FsEntry
+            {
+                Path = path,
+                Name = folder.Name,
+                Size = known?.Size ?? folder.Shared?.Size ?? 0,
+                Created = known?.Created ?? shown,
+                Modified = known?.Modified ?? shown,
+                ReadOnly = true,
+                ItemId = known?.Id ?? folder.Shared?.ItemId,
+                Drive = file,
+                DrivePath = file.BasePath,
+            };
+        }
+        return new()
+        {
+            Path = path,
+            Name = folder.Name,
+            IsDirectory = true,
+            Created = shown,
+            Modified = shown,
+            ReadOnly = folder.Drive?.ReadOnly ?? true,
+            ItemId = folder.Shared?.ItemId, // a shared folder's own item (a library's top has none: its drive's root)
+            Folder = folder,
+            Drive = folder.Drive,
+            DrivePath = folder.Drive?.BasePath ?? "",
+        };
+    }
 
     /// <summary>Read-only for this engine: the library is, or the database file policy makes the file so.</summary>
     bool IsReadOnly(DriveMount drive, string name, bool isFolder) =>
@@ -1222,7 +1269,7 @@ public sealed partial class DriveEngine(DriveNamespace ns, IDriveApi api, Conten
         }
         catch (FileNotFoundException) when (pending.Result is { } result)
         {
-            return ItemEntry(VolumePath(pending.DriveId, pending.ResultPath!) ?? path, drive, pending.DriveId, pending.ResultPath!, result);
+            return ItemEntry(VolumePath(pending.DriveId, pending.ResultPath!, drive) ?? path, drive, pending.DriveId, pending.ResultPath!, result);
         }
         catch (FileNotFoundException)
         {

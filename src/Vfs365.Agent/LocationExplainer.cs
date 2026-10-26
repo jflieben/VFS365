@@ -10,12 +10,25 @@ namespace Vfs365.Agent;
 /// <summary>
 /// What `vfs365 why` works from: the discovery options as the agent uses them (site patterns and templates from policy, pins from
 /// policy and the user), the last discovery's state (discovery.json) and report (discovery-report.json), and the drive's root as
-/// Windows shows it (a letter or \\VFS365\&lt;user&gt;). Source: where a setting comes from, for the explanation.
+/// Windows shows it (a letter or \\VFS365\&lt;user&gt;). Source: where a setting comes from, for the explanation. SharedWithMe: the policy
+/// of that name.
 /// </summary>
 public sealed record WhyContext(DiscoveryOptions Options, IReadOnlyList<string> PolicyPins, IReadOnlyList<string> UserPins, DriveScope Scope,
-    DiscoveryState? State, DiscoveryReport? Report, string DriveRoot, Func<string, string>? Source = null)
+    DiscoveryState? State, DiscoveryReport? Report, string DriveRoot, Func<string, string>? Source = null, bool SharedWithMe = true)
 {
     DriveNamespace? drive;
+    IReadOnlyDictionary<string, string>? sharedNames;
+
+    /// <summary>Where a shared item shows, as Windows shows it; null when the drive has no Shared with me folder.</summary>
+    internal string? PathOf(SharedItem item)
+    {
+        if (Scope != DriveScope.All || !SharedWithMe)
+        {
+            return null;
+        }
+        sharedNames ??= DriveNamespace.SharedNames(State?.Shared?.Items ?? []);
+        return sharedNames.TryGetValue(item.Key, out var name) ? WindowsPath($@"\{DriveNamespace.SharedFolderName}\{name}") : null;
+    }
 
     /// <summary>The library's folder as Windows shows it, with the names the drive gives the state's libraries.</summary>
     internal string PathOf(LibraryEntry library)
@@ -78,19 +91,27 @@ public static partial class LocationExplainer
         var target = $"https://{host}{path}";
         var segments = path.Split('/', StringSplitOptions.RemoveEmptyEntries);
 
-        // OneDrive: the user's own shows as OneDrive (Scope All or OneDrive); colleagues' never
+        // Shared with the user by name: in the Shared with me folder (Scope All)
+        var shared = (state?.Shared?.Items ?? []).Where(i => i.WebUrl is { } web && Under(target, Uri.UnescapeDataString(web).TrimEnd('/'))).ToList();
+        var sharedShown = ExplainShared(shared, context, lines);
+
+        // OneDrive: the user's own shows as OneDrive (Scope All or OneDrive); colleagues' only what they shared with the user
         if (host.Split('.')[0].EndsWith("-my", StringComparison.OrdinalIgnoreCase))
         {
             var own = state?.OneDrive?.WebUrl is { } mine && Under(target, PersonalSite(mine));
             if (!own)
             {
-                lines.Add("OneDrive:   a colleague's OneDrive. These never show (*/personal/* is always excluded); open the shared file or folder in the browser.");
-                return false;
+                if (shared.Count == 0)
+                {
+                    lines.Add("OneDrive:   a colleague's OneDrive. Only what was shared with you by name shows, in Shared with me (Scope All); " +
+                        "this link isn't in the last list of what was shared with you ('vfs365 shared' reads it now). Open it in the browser.");
+                }
+                return sharedShown;
             }
             var visible = context.Scope != DriveScope.SharePoint;
             lines.Add(visible
                 ? $"Shown:      your OneDrive, at {context.WindowsPath(context.Scope == DriveScope.OneDrive ? @"\" : @"\OneDrive")}"
-                : "Not shown:  your OneDrive. Scope is SharePoint (the default), which shows only SharePoint sites; Scope All or OneDrive shows the OneDrive.");
+                : $"Not shown:  your OneDrive. Scope is SharePoint ({Source(context, "Scope")}), which shows only SharePoint sites; Scope All or OneDrive shows the OneDrive.");
             return visible;
         }
         if (context.Scope == DriveScope.OneDrive)
@@ -194,6 +215,29 @@ public static partial class LocationExplainer
             lines.Add($"Hint:       if it opens in your browser, 'vfs365 pin {new Uri(target).AbsoluteUri}' shows it after Restart; 'vfs365 why <link> --check' tests " +
                 "access and search.");
         }
+        return shown || sharedShown;
+    }
+
+    /// <summary>Shared items a link or name matches: where each shows, or why not. True when one shows.</summary>
+    static bool ExplainShared(IReadOnlyList<SharedItem> items, WhyContext context, List<string> lines)
+    {
+        var shown = false;
+        foreach (var item in items.Take(MaxListed))
+        {
+            var by = item.OwnerName ?? item.OwnerEmail ?? "someone";
+            if (context.PathOf(item) is { } path)
+            {
+                shown = true;
+                lines.Add($"Shown:      {(item.IsFolder ? "folder" : "file")} shared with you by {by}, at {path}" +
+                    (item.IsFolder ? item.ReadOnly ? ", read-only (you may only view it)" : "" : ", read-only (a shared file at the top of Shared with me)"));
+            }
+            else
+            {
+                lines.Add($"Not shown:  {(item.IsFolder ? "folder" : "file")} shared with you by {by} ({item.Name}): " + (context.Scope != DriveScope.All
+                    ? $"Shared with me shows only with Scope All (Scope is {context.Scope}, {Source(context, "Scope")})"
+                    : $"policy SharedWithMe is off ({Source(context, "SharedWithMe")})"));
+            }
+        }
         return shown;
     }
 
@@ -214,6 +258,8 @@ public static partial class LocationExplainer
         found.AddRange((report?.Hidden.Where(h => Has(h.Title, h.SiteTitle, h.WebUrl)) ?? []).Take(MaxListed).Select(h => $"Hidden:     {h.SiteTitle} / {h.Title} ({h.WebUrl}): {h.Reason}"));
         found.AddRange(context.PolicyPins.Where(p => Has(p)).Select(p => $"Pinned:     {p} by policy PinnedLocations"));
         found.AddRange(context.UserPins.Where(p => Has(p)).Select(p => $"Pinned:     {p} by you ('vfs365 pin')"));
+        var shared = (context.State?.Shared?.Items ?? []).Where(i => Has(i.Name, i.OwnerName, i.OwnerEmail)).ToList();
+        var sharedShown = ExplainShared(shared, context, found);
         if (found.Count == 0)
         {
             lines.Add($"Not found:  nothing named like '{fragment}' in the last discovery. Search doesn't return every site (see 'vfs365 why <link>'); " +
@@ -221,7 +267,7 @@ public static partial class LocationExplainer
             return false;
         }
         lines.AddRange(found);
-        return shown.Count > 0;
+        return shown.Count > 0 || sharedShown;
     }
 
     /// <summary>A discovery reason in plain words, with the setting behind it.</summary>

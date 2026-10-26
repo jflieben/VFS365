@@ -157,6 +157,29 @@ public sealed class LocationExplainerTests
     }
 
     [Fact]
+    public void Items_shared_with_the_user_show_in_shared_with_me_with_scope_all()
+    {
+        SharedItem[] shared =
+        [
+            new("b!bob", "01A", "Plan.docx", false, "Docs/Plan.docx", "Bob", "bob@contoso.com", WebUrl: "https://contoso-my.sharepoint.com/personal/bob_contoso_com/Documents/Docs/Plan.docx"),
+            new("b!bob", "01F", "Q3", true, "Docs/Q3", "Bob", "bob@contoso.com", ReadOnly: true, WebUrl: "https://contoso-my.sharepoint.com/personal/bob_contoso_com/Documents/Docs/Q3"),
+        ];
+        WhyContext With(DriveScope scope, bool on = true) => Context(scope) with { State = State() with { Shared = new SharedState(T0, shared) }, SharedWithMe = on };
+
+        var file = Why("https://contoso-my.sharepoint.com/personal/bob_contoso_com/Documents/Docs/Plan.docx", With(DriveScope.All));
+        Assert.True(file.Shown);
+        Assert.Contains(@"file shared with you by Bob, at M:\Shared with me\Plan.docx, read-only", Text(file));
+        var inFolder = Why("https://contoso-my.sharepoint.com/personal/bob_contoso_com/Documents/Docs/Q3/Budget.xlsx", With(DriveScope.All));
+        Assert.Contains(@"folder shared with you by Bob, at M:\Shared with me\Q3, read-only (you may only view it)", Text(inFolder));
+        Assert.Contains(@"M:\Shared with me\Q3", Text(Why("q3", With(DriveScope.All))));
+
+        Assert.False(Why("https://contoso-my.sharepoint.com/personal/bob_contoso_com/Documents/Docs/Plan.docx", With(DriveScope.SharePoint)).Shown);
+        Assert.Contains("shows only with Scope All", Text(Why("Plan.docx", With(DriveScope.SharePoint))));
+        Assert.Contains("policy SharedWithMe is off", Text(Why("Plan.docx", With(DriveScope.All, on: false))));
+        Assert.Contains("isn't in the last list", Text(Why("https://contoso-my.sharepoint.com/personal/bob_contoso_com/Documents/Other.docx", With(DriveScope.All))));
+    }
+
+    [Fact]
     public void Other_tenants_teams_links_and_onedrive_scope_are_explained()
     {
         Assert.Contains("fabrikam.sharepoint.com is not your organisation's SharePoint (contoso.sharepoint.com)", Text(Why("https://fabrikam.sharepoint.com/sites/x")));

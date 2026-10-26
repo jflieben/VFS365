@@ -10,12 +10,13 @@ https://github.com/user-attachments/assets/a4b3872f-d3fd-4372-a001-83f90e983e33
 
 ## What users see
 
-One location in Explorer, named by policy (default "VFS365"), with every library the user can reach. Apps use plain paths such as `M:\Finance\Documents\Budget.xlsx` or `\\VFS365\<user>\Finance\Documents\Budget.xlsx`.
+One location in Explorer, named by policy (default "VFS365"), with every library the user can reach. Apps use plain paths such as `M:\Sites\Finance\Documents\Budget.xlsx` or `\\VFS365\<user>\Sites\Finance\Documents\Budget.xlsx`.
 
 ```
 VFS365 (navigation pane), \\VFS365\<user>, optionally a drive letter
-├── OneDrive                  with Scope = All or OneDrive
-└── Sites                     with Scope = All; with SharePoint (the default) these are the root
+├── OneDrive                  with Scope = All (the default) or OneDrive
+├── Shared with me            with Scope = All: files and folders others shared with you
+└── Sites                     with Scope = All; with SharePoint these are the root
     ├── Finance
     │   ├── Documents
     │   └── Contracts

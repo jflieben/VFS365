@@ -76,7 +76,7 @@ sealed class MountedDrive : IDisposable
         return installDir is not null && File.Exists(Path.Combine(installDir, "bin", dll)) ? null : "needs WinFsp installed";
     }
 
-    MountedDrive(bool winFspGuard, Action<FakeDriveApi>? seed, Func<DriveEngineOptions, DriveEngineOptions>? configure, bool trace)
+    MountedDrive(bool winFspGuard, Action<FakeDriveApi>? seed, Func<DriveEngineOptions, DriveEngineOptions>? configure, bool trace, DriveNamespace? ns)
     {
         Fake = new FakeDriveApi();
         seed?.Invoke(Fake);
@@ -89,7 +89,7 @@ sealed class MountedDrive : IDisposable
             Changed = change => notify?.Invoke(change),
         };
         Engine = new DriveEngine(
-            DriveNamespace.Build(new MyDrive("b!me", "https://x-my.sharepoint.com/personal/u"), [], (_, _) => Task.FromResult("unused"), DriveScope.OneDrive),
+            ns ?? DriveNamespace.Build(new MyDrive("b!me", "https://x-my.sharepoint.com/personal/u"), [], (_, _) => Task.FromResult("unused"), DriveScope.OneDrive),
             Api,
             new ContentCache(Path.Combine(directory, "cache"), Api, new ContentCacheOptions()),
             configure?.Invoke(options) ?? options);
@@ -103,9 +103,10 @@ sealed class MountedDrive : IDisposable
 
     /// <param name="winFspGuard">True keeps WinFsp's FINE namespace lock; false runs with the engine's own locking only.</param>
     /// <param name="trace">Logs every file system callback too.</param>
+    /// <param name="ns">Another namespace than the OneDrive at the root (the fake serves every drive ID).</param>
     public static MountedDrive Start(bool winFspGuard = false, Action<FakeDriveApi>? seed = null, Func<DriveEngineOptions, DriveEngineOptions>? configure = null,
-        bool trace = false) =>
-        new(winFspGuard, seed, configure, trace);
+        bool trace = false, DriveNamespace? ns = null) =>
+        new(winFspGuard, seed, configure, trace, ns);
 
     public string PathOf(string relative) => $@"{Root}\{relative.Replace('/', '\\')}";
 

@@ -157,6 +157,7 @@ public sealed class ContentCache
                 }
                 StreamingContent? download;
                 var landed = false;
+                var started = false;
                 lock (streaming)
                 {
                     if (streaming.TryGetValue(key, out download))
@@ -164,6 +165,7 @@ public sealed class ContentCache
                         if (download.References++ == 0)
                         {
                             download.Reopened(); // a released download kept for a reopen: tried afresh, like a new one
+                            started = true;
                         }
                     }
                     else if (known.ContainsKey(key))
@@ -175,11 +177,16 @@ public sealed class ContentCache
                         streaming[key] = download = created;
                         created = null;
                         download.References++;
+                        started = true;
                     }
                 }
                 if (download is not null)
                 {
                     created?.Dispose(); // another open added one meanwhile
+                    if (started)
+                    {
+                        Touched(null);
+                    }
                     return new Reference(this, key, download);
                 }
                 if (!landed)
@@ -205,6 +212,45 @@ public sealed class ContentCache
     /// </summary>
     public long? LengthOf(string driveId, string itemId, string? contentTag) =>
         Find(new ContentKey(driveId, itemId, contentTag ?? "")) is { ContentLength: >= 0 } entry ? entry.ContentLength : null;
+
+    /// <summary>The complete content of this version is here. In memory (a file of an earlier run the name index missed is hashed).</summary>
+    public bool IsCached(string driveId, string itemId, string? contentTag) => Find(new ContentKey(driveId, itemId, contentTag ?? "")) is not null;
+
+    /// <summary>Downloads a reader holds now (released ones kept for a reopen don't count): drive and item IDs.</summary>
+    public IReadOnlyList<(string DriveId, string ItemId)> Downloads()
+    {
+        lock (streaming)
+        {
+            return streaming.Count == 0 ? []
+                : [.. streaming.Where(s => s.Value.References > 0 && !s.Value.IsComplete).Select(s => (s.Key.DriveId, s.Key.ItemId))];
+        }
+    }
+
+    long version;
+    readonly ConcurrentDictionary<string, long> folderVersions = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>Changes with every complete file listed or dropped and every download a reader started or let go.</summary>
+    public long Version => Interlocked.Read(ref version);
+
+    /// <summary>Changes with every complete file of the drive listed or dropped.</summary>
+    public long VersionOf(string driveId) => folderVersions.GetValueOrDefault(FolderOf(driveId));
+
+    /// <summary>
+    /// Raised when <see cref="Version"/> changed. Raised on reading and transfer threads, sometimes with the cache's locks held:
+    /// handlers only note it and return.
+    /// </summary>
+    public event Action? Changed;
+
+    /// <summary>A complete file of a drive folder (null: a download) came or went.</summary>
+    void Touched(string? folder)
+    {
+        if (folder is not null)
+        {
+            folderVersions.AddOrUpdate(folder, 1, (_, v) => v + 1);
+        }
+        Interlocked.Increment(ref version);
+        Changed?.Invoke();
+    }
 
     /// <summary>The content is here, or downloading for a reader (a released download kept for a reopen doesn't count).</summary>
     public bool Has(string driveId, string itemId, string? contentTag)
@@ -401,6 +447,7 @@ public sealed class ContentCache
         {
             download.Dispose();
         }
+        Touched(null);
     }
 
     /// <summary>The complete file of this version: listed in memory, or (a file of an earlier run the name index missed) found by its hashed name.</summary>
@@ -522,6 +569,7 @@ public sealed class ContentCache
             unmatchedIn[entry.Folder] = unmatchedIn.GetValueOrDefault(entry.Folder) + 1;
             unmatched++;
         }
+        Touched(entry.Folder);
     }
 
     /// <summary>No longer lists a file; false when it wasn't listed. Called under sizeGate.</summary>
@@ -546,6 +594,7 @@ public sealed class ContentCache
             unmatchedIn[entry.Folder]--;
             unmatched--;
         }
+        Touched(entry.Folder);
         return true;
     }
 
@@ -740,6 +789,7 @@ public sealed class ContentCache
         {
             Remove(finished.FinalPath, always: true); // the item was deleted while it downloaded; readers keep their open handle
         }
+        Touched(null);
     }
 
     /// <summary>A download gave up: new readers start a fresh one, readers holding this one keep it.</summary>
@@ -752,6 +802,7 @@ public sealed class ContentCache
                 streaming.Remove(key);
             }
         }
+        Touched(null);
     }
 
     /// <summary>
@@ -946,6 +997,7 @@ public sealed class ContentCache
                 streaming.Remove(key);
             }
         }
+        Touched(null);
         foreach (var old in dropped)
         {
             old.Dispose();

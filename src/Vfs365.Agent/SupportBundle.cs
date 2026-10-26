@@ -165,7 +165,8 @@ public sealed class SupportBundle(string dataFolder, Func<AgentSettings> setting
         summary.txt       version, Windows, the user and the health check (health.json has it as JSON)
         settings.txt      the settings in effect, where each comes from, and warnings ('vfs365 settings')
         tenant.txt        how the tenant was chosen, and the account last signed in
-        discovery.txt     the last discovery: libraries shown, skipped (with the reason), errors and hidden libraries
+        discovery.txt     the last discovery: libraries shown, skipped (with the reason), errors and hidden libraries; what others shared
+                          (kinds and IDs, no names)
         drive.txt         drive letter, DriveMappings letters, network provider order, WinFsp
         waiting.txt       changes waiting to upload, with the cause, and changes kept on this PC
         status.json       what the running agent reported last
@@ -249,6 +250,13 @@ public sealed class SupportBundle(string dataFolder, Func<AgentSettings> setting
             foreach (var (url, keys) in state.Pinned ?? new Dictionary<string, IReadOnlyList<string>>())
             {
                 lines.Add($"Pinned:     {url}: {(state.EmptyPins?.GetValueOrDefault(url) is { } empty ? empty.Reason : $"{keys.Count} library(ies)")}");
+            }
+            // Shared with me: kinds and IDs only, no names ('vfs365 shared' shows them to the user)
+            if (state.Shared is { } shared)
+            {
+                lines.Add($"Shared:     {shared.Items.Count} item(s) other people shared, read {(shared.RunAt == DateTimeOffset.MinValue ? "never" : shared.RunAt.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture))}");
+                lines.AddRange(shared.Items.Select(i => $"  {(i.IsFolder ? "folder" : "file")}{(i.ReadOnly ? ", view only" : "")}{(i.Path is null ? ", place unknown" : "")}" +
+                    $"{(i.Misses > 0 ? $", missed by search {i.Misses}x" : "")}, drive {i.DriveId}, item {i.ItemId}"));
             }
         }
         if (report is not null)

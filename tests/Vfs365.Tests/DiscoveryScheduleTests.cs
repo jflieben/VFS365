@@ -124,4 +124,35 @@ public sealed class DiscoveryScheduleTests
         Assert.Single(saves);
         Assert.Equal(OneDrive, saves[0].OneDrive);
     }
+
+    [Fact]
+    public void The_shared_list_is_kept_when_discovery_replaces_the_state_and_saved_when_it_changes()
+    {
+        var saves = new List<DiscoveryState>();
+        var keeper = new DiscoveryStateKeeper(DiscoverySchedule.Placeholder(OneDrive, "contoso", DriveScope.All, Now), saves.Add);
+        var shared = new SharedState(Now, [new SharedItem("b!bob", "01A", "Plan.docx", false, "Docs/Plan.docx")]);
+
+        keeper.SetShared(shared);
+        keeper.SaveIfChanged();
+        keeper.Replace(DiscoverySchedule.Placeholder(OneDrive, "contoso", DriveScope.All, Now) with { RunAt = Now });
+
+        Assert.Same(shared, saves.Single().Shared);
+        Assert.Same(shared, keeper.Current.Shared);
+        Assert.Equal(Now, keeper.Current.RunAt);
+
+        // Through discovery.json and back
+        var file = Path.Combine(Path.GetTempPath(), $"vfs365-discovery-{Guid.NewGuid():N}.json");
+        try
+        {
+            File.WriteAllText(file, System.Text.Json.JsonSerializer.Serialize(keeper.Current));
+            var loaded = DiscoveryStore.Load(file)!.Shared!;
+            Assert.Equal(Now, loaded.RunAt);
+            Assert.Equal(shared.Items, loaded.Items);
+            Assert.DoesNotContain("\"Key\"", File.ReadAllText(file));
+        }
+        finally
+        {
+            File.Delete(file);
+        }
+    }
 }

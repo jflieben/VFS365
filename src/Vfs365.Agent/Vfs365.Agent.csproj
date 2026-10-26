@@ -23,5 +23,9 @@
   <ItemGroup>
     <Content Include="..\..\assets\tray\*.ico" Link="tray\%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
   </ItemGroup>
+  <!-- The Windows 11 menu package's logo, which it finds in its external location: the install folder (ShellPackage.cs) -->
+  <ItemGroup>
+    <Content Include="..\..\assets\vfs365-256.png" Link="vfs365shell.png" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+  </ItemGroup>
 
 </Project>

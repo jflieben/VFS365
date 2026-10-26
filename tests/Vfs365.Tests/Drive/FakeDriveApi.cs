@@ -204,9 +204,16 @@ sealed class FakeDriveApi : IDriveApi
         }
     }
 
+    /// <summary>Paths looked up with <see cref="GetItemAsync"/>.</summary>
+    public List<string> LookedUp { get; } = [];
+
     public Task<DriveItemInfo?> GetItemAsync(string driveId, string path, CancellationToken ct)
     {
         Interlocked.Increment(ref GetCalls);
+        lock (LookedUp)
+        {
+            LookedUp.Add(path);
+        }
         return Task.FromResult(Find(path) is { } node ? node.Item with { ParentId = path.Length == 0 ? null : ParentIdOf(path) } : null);
     }
 

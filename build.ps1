@@ -18,11 +18,17 @@
     np: compiles the network provider (src\Vfs365.Np) for x64, ARM64 and x86 into artifacts\np\. Uses Zig from $env:VFS365_ZIG, else a
     pinned portable copy in %LOCALAPPDATA%\zig-portable, downloaded and checked on first use. release does this too.
 
+    shell: compiles the shell extension (src\Vfs365.Shell: Windows 11 context menu and overlay icons) for x64, ARM64 and x86 into
+    artifacts\shell\, with the same Zig. release does this too. A signed release also packs src\Vfs365.Shell\package into
+    vfs365shell.msix (makeappx.exe from the Windows SDK, or $env:VFS365_MAKEAPPX; publisher = the signing certificate's subject) and
+    signs it; unsigned or without makeappx the MSIs ship no package and Explorer keeps the legacy verbs.
+
     sign <files>: Authenticode-signs files in place with Azure Artifact Signing (Trusted Signing) when $env:VFS365_SIGN_DLIB (path to
     Azure.CodeSigning.Dlib.dll from the Microsoft.ArtifactSigning.Client package) and $env:VFS365_SIGN_METADATA (its metadata.json:
     Endpoint, CodeSigningAccountName, CertificateProfileName) are set; otherwise does nothing. Uses the newest Windows SDK signtool, or
-    $env:VFS365_SIGNTOOL. With them set, release signs vfs365np.dll, VFS365's own exes and DLLs, the MSIs and the setups, then fails
-    when any program, DLL, MSI or setup in the release, or any program or DLL inside the MSIs, lacks a valid signature.
+    $env:VFS365_SIGNTOOL. With them set, release signs vfs365np.dll, vfs365shell.dll, vfs365shell.msix, VFS365's own exes and DLLs,
+    the MSIs and the setups, then fails when any program, DLL, MSI or setup in the release, or any program, DLL or package inside the
+    MSIs, lacks a valid signature.
 
     -NoTest skips the tests in release (CI runs them in a job of their own).
 
@@ -33,7 +39,7 @@
     ./build.ps1 release
 #>
 param(
-    [ValidateSet('build','test','run','np','bump','release','sign')][String]$Task = 'test',
+    [ValidateSet('build','test','run','np','shell','bump','release','sign')][String]$Task = 'test',
     [Switch]$Release,
     [Switch]$NoTest,
     [Switch]$BuildOnly,
@@ -134,6 +140,46 @@ function Build-NetworkProvider([String]$zigExe, [String]$arch){
         -o $dll (Join-Path $source 'vfs365np.c') (Join-Path $source 'vfs365np.def') -lkernel32 -ladvapi32 "-Wl,--entry=$entry" | Out-Host
     if($LASTEXITCODE -ne 0){ Throw "zig cc for $arch failed ($LASTEXITCODE)" }
     return $dll
+}
+
+#vfs365shell.dll (src\Vfs365.Shell: Explorer menu and overlay icons) for x64, arm64 or x86 in artifacts\shell\<arch>\, with the
+#overlay icons from assets\overlay as resources
+function Build-ShellExtension([String]$zigExe, [String]$arch){
+    $target = @{ x64 = 'x86_64-windows-gnu'; arm64 = 'aarch64-windows-gnu'; x86 = 'x86-windows-gnu' }[$arch]
+    $entry = if($arch -eq 'x86'){ 'DllMain@12' }else{ 'DllMain' }
+    $source = Join-Path $PSScriptRoot 'src\Vfs365.Shell'
+    $dll = Join-Path $PSScriptRoot "artifacts\shell\$arch\vfs365shell.dll"
+    New-Item -ItemType Directory -Force -Path (Split-Path $dll) | Out-Null
+    & $zigExe cc -target $target -shared -O2 -nostdlib -fno-builtin -Wall -Wextra -Werror `
+        -isystem (Join-Path (Split-Path $zigExe) 'lib\libc\include\any-windows-any') `
+        -o $dll (Join-Path $source 'vfs365shell.c') (Join-Path $source 'vfs365shell.def') (Join-Path $source 'vfs365shell.rc') `
+        -lkernel32 -ladvapi32 -lole32 "-Wl,--entry=$entry" | Out-Host
+    if($LASTEXITCODE -ne 0){ Throw "zig cc for the shell extension ($arch) failed ($LASTEXITCODE)" }
+    return $dll
+}
+
+#makeappx.exe from the newest Windows SDK, or $env:VFS365_MAKEAPPX; null when there is none (GitHub's Windows runners have it)
+function Get-MakeAppx(){
+    if($env:VFS365_MAKEAPPX){ return $env:VFS365_MAKEAPPX }
+    Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\makeappx.exe" -ErrorAction SilentlyContinue |
+        Sort-Object { [Version]$_.Directory.Parent.Name } -Descending | Select-Object -First 1 -ExpandProperty FullName
+}
+
+#The sparse package (package with external location) that registers the Explorer menu: src\Vfs365.Shell\package\AppxManifest.xml
+#with the version and the signing certificate's subject as publisher, packed by makeappx into $msix. Its files are in the install
+#folder: the package only holds the manifest. Architecture neutral, so one package serves both MSIs.
+function New-ShellPackage([String]$makeAppx, [String]$publisher, [String]$msix){
+    $folder = Join-Path $PSScriptRoot 'artifacts\shell\package'
+    if(Test-Path -LiteralPath $folder){ Remove-Item -LiteralPath $folder -Recurse -Force }
+    New-Item -ItemType Directory -Path $folder | Out-Null
+    $manifest = [Xml](Get-Content -LiteralPath (Join-Path $PSScriptRoot 'src\Vfs365.Shell\package\AppxManifest.xml') -Raw)
+    $manifest.Package.Identity.Version = "$version.0"
+    $manifest.Package.Identity.Publisher = $publisher
+    $manifest.Save((Join-Path $folder 'AppxManifest.xml'))
+    if(Test-Path -LiteralPath $msix){ Remove-Item -LiteralPath $msix }
+    #/nv: the files the manifest names are in the external location, not in the package
+    & $makeAppx pack /o /nv /d $folder /p $msix | Out-Host
+    if($LASTEXITCODE -ne 0){ Throw "makeappx failed ($LASTEXITCODE)" }
 }
 
 #The files an MSI installs, unpacked from its embedded cabinet (Windows Installer's API and expand.exe; nothing is installed): Name, FullName
@@ -238,7 +284,7 @@ function Assert-Signed([String]$folder){
     $files = @(Get-ChildItem -LiteralPath $folder -File | Where-Object Extension -in '.exe', '.dll', '.msi' |
         ForEach-Object { [PSCustomObject]@{ Name = $_.Name; FullName = $_.FullName; Display = $_.Name } })
     foreach($msi in @($files | Where-Object Name -like '*.msi')){
-        $files += @(Expand-Msi $msi.FullName (Join-Path $unpacked ([IO.Path]::GetFileNameWithoutExtension($msi.Name))) | Where-Object Name -match '\.(exe|dll|sys)$' |
+        $files += @(Expand-Msi $msi.FullName (Join-Path $unpacked ([IO.Path]::GetFileNameWithoutExtension($msi.Name))) | Where-Object Name -match '\.(exe|dll|sys|msix)$' |
             ForEach-Object { $_ | Add-Member Display "$($msi.Name): $($_.Name)" -PassThru })
     }
     $failed = foreach($file in $files){
@@ -252,6 +298,12 @@ function Assert-Signed([String]$folder){
 if($Task -eq 'np'){
     $zigExe = Get-Zig
     foreach($arch in 'x64', 'arm64', 'x86'){ Build-NetworkProvider $zigExe $arch }
+    Exit 0
+}
+
+if($Task -eq 'shell'){
+    $zigExe = Get-Zig
+    foreach($arch in 'x64', 'arm64', 'x86'){ Build-ShellExtension $zigExe $arch }
     Exit 0
 }
 
@@ -292,6 +344,8 @@ if($Task -eq 'release'){
     $winFspMsi = Join-Path $PSScriptRoot "artifacts\winfsp\$($winFsp.Name)"
     $np = [ordered]@{}
     foreach($arch in 'x86', 'x64', 'arm64'){ $np[$arch] = Join-Path $PSScriptRoot "artifacts\np\$arch\vfs365np.dll" }
+    $shell = [ordered]@{}
+    foreach($arch in $np.Keys){ $shell[$arch] = Join-Path $PSScriptRoot "artifacts\shell\$arch\vfs365shell.dll" }
     $publish = [ordered]@{}
     foreach($arch in 'x64', 'arm64'){ $publish[$arch] = Join-Path $PSScriptRoot "artifacts\publish\win-$arch" }
 
@@ -303,7 +357,10 @@ if($Task -eq 'release'){
             Invoke-WebRequest -Uri $winFsp.Url -OutFile $winFspMsi
         }
         $zigExe = Get-Zig
-        foreach($arch in $np.Keys){ Build-NetworkProvider $zigExe $arch | Out-Null }
+        foreach($arch in $np.Keys){
+            Build-NetworkProvider $zigExe $arch | Out-Null
+            Build-ShellExtension $zigExe $arch | Out-Null
+        }
         foreach($arch in $publish.Keys){
             if(Test-Path -LiteralPath $publish[$arch]){ Remove-Item -LiteralPath $publish[$arch] -Recurse -Force }
             foreach($project in 'src\Vfs365.Cli\Vfs365.Cli.csproj', 'src\Vfs365.Background\Vfs365.Background.csproj'){
@@ -312,13 +369,13 @@ if($Task -eq 'release'){
             foreach($file in 'LICENSE', 'THIRD-PARTY-NOTICES.md'){ Copy-Item -LiteralPath (Join-Path $PSScriptRoot $file) -Destination $publish[$arch] }
         }
         if($BuildOnly){
-            Write-Host "Built $version in artifacts\ (np, publish, winfsp); the Package stage signs and packages it"
+            Write-Host "Built $version in artifacts\ (np, shell, publish, winfsp); the Package stage signs and packages it"
             Exit 0
         }
     }
 
     #Package: signs what the Build stage made (here or in another job) and wraps it in MSIs and setups
-    foreach($path in @($winFspMsi) + @($np.Values) + @($publish.Values)){
+    foreach($path in @($winFspMsi) + @($np.Values) + @($shell.Values) + @($publish.Values)){
         if(-not (Test-Path -LiteralPath $path)){ Throw "$path is missing: run the Build stage first" }
     }
     if((Get-FileHash -LiteralPath $winFspMsi -Algorithm SHA256).Hash -ne $winFsp.Sha256){
@@ -326,13 +383,29 @@ if($Task -eq 'release'){
         Throw "$($winFsp.Name) does not match its pinned SHA256; download it again or update the pin"
     }
     $signOutput = "-p:SignOutput=$($signing.ToString().ToLower())"
-    Invoke-Sign $np['x86']
+    Invoke-Sign @($np['x86'], $shell['x86'])
+
+    #Windows 11's context menu package: only signed (Windows refuses unsigned packages), its publisher the signing certificate's
+    #subject as a signed file carries it. Without it the MSIs ship none and the agent keeps the legacy Explorer verbs.
+    $shellMsix = ''
+    if(-not $signing){
+        Write-Host "Unsigned: no Windows 11 context menu package (vfs365shell.msix); Explorer gets the legacy VFS365 verbs"
+    }elseif(-not ($makeAppx = Get-MakeAppx)){
+        if($env:GITHUB_ACTIONS){ Throw "makeappx.exe (Windows SDK) not found: a signed release needs the Windows 11 context menu package" }
+        Write-Host "makeappx.exe (Windows SDK) not found: no Windows 11 context menu package (vfs365shell.msix); set VFS365_MAKEAPPX to build it"
+    }else{
+        $publisher = (Get-AuthenticodeSignature -LiteralPath $np['x86']).SignerCertificate.Subject
+        if(-not $publisher){ Throw "No signer subject on $($np['x86']) for the package's publisher" }
+        $shellMsix = Join-Path $PSScriptRoot 'artifacts\shell\vfs365shell.msix'
+        New-ShellPackage $makeAppx $publisher $shellMsix
+        Invoke-Sign $shellMsix
+    }
 
     $output = Join-Path $PSScriptRoot "release\$version"
     if(Test-Path -LiteralPath $output){ Remove-Item -LiteralPath $output -Recurse -Force }
     New-Item -ItemType Directory -Path $output | Out-Null
     foreach($arch in $publish.Keys){
-        Invoke-Sign $np[$arch]
+        Invoke-Sign @($np[$arch], $shell[$arch])
         #Only VFS365's own binaries; the .NET runtime files carry Microsoft's signatures
         Invoke-Sign @(Get-ChildItem -LiteralPath $publish[$arch] -File | Where-Object Name -match '^vfs365.*\.(exe|dll)$' | ForEach-Object FullName)
         $msiFolder = Join-Path $PSScriptRoot "artifacts\installer\$arch"
@@ -340,7 +413,7 @@ if($Task -eq 'release'){
         foreach($folder in $msiFolder, $bundleFolder){
             if(Test-Path -LiteralPath $folder){ Remove-Item -LiteralPath $folder -Recurse -Force }
         }
-        Invoke-Dotnet @('build', (Join-Path $PSScriptRoot 'installer\Vfs365.Installer.wixproj'), '-c', 'Release', "-p:Platform=$arch", "-p:Version=$version", "-p:PublishDir=$($publish[$arch])", "-p:NpDll=$($np[$arch])", "-p:NpDllX86=$($np['x86'])", $signOutput, '-o', $msiFolder, '--nologo', '-v', 'q')
+        Invoke-Dotnet @('build', (Join-Path $PSScriptRoot 'installer\Vfs365.Installer.wixproj'), '-c', 'Release', "-p:Platform=$arch", "-p:Version=$version", "-p:PublishDir=$($publish[$arch])", "-p:NpDll=$($np[$arch])", "-p:NpDllX86=$($np['x86'])", "-p:ShellDll=$($shell[$arch])", "-p:ShellDllX86=$($shell['x86'])", "-p:ShellMsix=$shellMsix", $signOutput, '-o', $msiFolder, '--nologo', '-v', 'q')
         $msi = Get-ChildItem -LiteralPath $msiFolder -Filter '*.msi' -Recurse | Select-Object -First 1
         Copy-Item -LiteralPath $msi.FullName -Destination (Join-Path $output "VFS365-$version-$arch.msi")
         Invoke-Dotnet @('build', (Join-Path $PSScriptRoot 'installer\bundle\Vfs365.Bundle.wixproj'), '-c', 'Release', "-p:Platform=$arch", "-p:Version=$version", "-p:VfsMsi=$($msi.FullName)", "-p:WinFspMsi=$winFspMsi", $signOutput, '-o', $bundleFolder, '--nologo', '-v', 'q')

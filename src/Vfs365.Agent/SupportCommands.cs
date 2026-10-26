@@ -81,7 +81,7 @@ static class SupportCommands
         var effective = settings.Effective();
         var context = new WhyContext(AgentCommands.DiscoveryOptionsOf(settings), settings.PinnedLocations, UserPins.Load(), settings.Scope, state,
             DiscoveryReport.Load(), StatusFile.Read(StatusFile.DefaultPath)?.DriveLetter ?? $@"\{AgentCommands.UncPrefix(Environment.UserName)}",
-            name => effective.FirstOrDefault(s => s.Name == name).Source ?? AgentSettings.Default);
+            name => effective.FirstOrDefault(s => s.Name == name).Source ?? AgentSettings.Default, settings.SharedWithMe);
         var answer = LocationExplainer.Explain(query, context);
         foreach (var line in answer.Lines)
         {

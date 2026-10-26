@@ -361,7 +361,7 @@ public sealed class DiscoveryService(ISharePointDiscoveryApi api, DiscoveryOptio
         var runAt = searchError is null ? now : previous?.RunAt ?? DateTimeOffset.MinValue;
         var state = new DiscoveryState(runAt, tenantRoot, visible, new Dictionary<string, string>(staticExclusions), LibraryRules.Version, oneDrive,
             visible.Count == 0 ? now : visible.Min(l => l.CheckedAt ?? now), previous?.TenantHint, pinned, tenantId, reconciliation.Misses,
-            new Dictionary<string, CheckedExclusion>(exclusions), emptyPins);
+            new Dictionary<string, CheckedExclusion>(exclusions), emptyPins, previous?.Shared);
 
         return new DiscoveryResult(
             oneDrive,

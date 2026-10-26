@@ -27,7 +27,7 @@ For a drive letter only, set a letter here and disable "Show in the navigation p
       <string id="Label_Help">Name of the drive and of the navigation pane entry in Explorer. Default: VFS365.</string>
 
       <string id="Scope">Content</string>
-      <string id="Scope_Help">What the drive shows. Only SharePoint sites (the default when not configured) or only OneDrive: that content is the root of the drive, without the extra folder level. Everything: OneDrive and Sites folders.</string>
+      <string id="Scope_Help">What the drive shows. Everything (the default when not configured): OneDrive and Sites folders. Only SharePoint sites or only OneDrive: that content is the root of the drive, without the extra folder level.</string>
       <string id="Scope_All">Everything</string>
       <string id="Scope_OneDrive">Only OneDrive</string>
       <string id="Scope_SharePoint">Only SharePoint sites</string>
@@ -134,6 +134,18 @@ No paths: every file and folder path becomes a short code ([path 1a2b3c4d], the 
       <string id="NavigationPane_Help">Shows the drive as its own entry in Explorer's navigation pane and in Open and Save dialogs. Enabled by default.
 
 Disabled: no entry. With a drive letter (see "Drive letter") the drive shows under This PC with that letter only. Without a drive letter only the UNC path \\VFS365\&lt;user name&gt; is left.</string>
+
+      <string id="OverlayIcons">Show file status icons</string>
+      <string id="OverlayIcons_Help">Enabled (the default): Explorer shows a small icon on the drive's files: online only, on this device, uploading, downloading, or a problem (an upload or delete Microsoft 365 refused or that keeps failing). Folders show uploading or a problem when a file in them does.
+
+Disabled: no status icons. The VFS365 menu in Explorer stays.</string>
+
+      <string id="SharedWithMe">Show Shared with me</string>
+      <string id="SharedWithMe_Help">Shows a "Shared with me" folder next to OneDrive and Sites with the files and folders other people shared with the user, like OneDrive's Shared view. Only when "Content" is Everything. Enabled by default.
+
+Shared folders work like library folders: open, save, create and delete as SharePoint allows (read-only when the user may only view them). Shared files directly in "Shared with me" open read-only; to change one, open it from a shared folder, or with Open in desktop app in the VFS365 menu. Lists what was shared with the user by name; files the user only opened through an "anyone" or organisation link aren't listed.
+
+Disabled: no such folder.</string>
     </stringTable>
     <presentationTable>
       <presentation id="ClientId"><textBox refId="ClientId"><label>Client ID</label></textBox></presentation>

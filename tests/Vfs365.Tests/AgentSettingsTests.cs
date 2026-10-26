@@ -23,9 +23,19 @@ public sealed class AgentSettingsTests : IDisposable
         Assert.Null(settings.TenantId.Value);
         Assert.Equal("VFS365", settings.Label);
         Assert.Equal("None", settings.DriveLetter);
-        Assert.Equal(DriveScope.SharePoint, settings.Scope);
+        Assert.Equal(DriveScope.All, settings.Scope);
         Assert.Null(settings.IncludedSites);
         Assert.True(settings.NavigationPane);
+        Assert.True(settings.SharedWithMe);
+    }
+
+    [Fact]
+    public void Shared_with_me_can_be_turned_off_and_says_when_scope_hides_it()
+    {
+        Assert.False(Policy(("SharedWithMe", 0)).SharedWithMe);
+        Assert.Equal("on (shown with Scope All only)", Policy(("Scope", "SharePoint")).Effective().Single(s => s.Name == "SharedWithMe").Value);
+        Assert.Equal("off", Policy(("SharedWithMe", 0), ("Scope", "All")).Effective().Single(s => s.Name == "SharedWithMe").Value);
+        Assert.Contains("SharedWithMe 'maybe' is not on or off (1 or 0); on is used", Policy(("SharedWithMe", "maybe")).Adjusted());
     }
 
     [Fact]
@@ -115,8 +125,8 @@ public sealed class AgentSettingsTests : IDisposable
     public void Choices_take_only_their_names(string value)
     {
         var settings = Policy(("Scope", value), ("DatabaseFiles", value), ("MonitoringDetail", value));
-        Assert.Equal((DriveScope.SharePoint, DatabaseFilePolicy.Allow, MonitoringDetail.Full), (settings.Scope, settings.DatabaseFiles, settings.MonitoringDetail));
-        Assert.Contains($"Scope '{value}' is not SharePoint, OneDrive or All; SharePoint is used", settings.Adjusted());
+        Assert.Equal((DriveScope.All, DatabaseFilePolicy.Allow, MonitoringDetail.Full), (settings.Scope, settings.DatabaseFiles, settings.MonitoringDetail));
+        Assert.Contains($"Scope '{value}' is not All, SharePoint or OneDrive; All is used", settings.Adjusted());
         Assert.Equal(3, settings.Adjusted().Count);
         Assert.Equal(DatabaseFilePolicy.ReadOnly, Policy(("DatabaseFiles", " readonly ")).DatabaseFiles);
     }
@@ -160,7 +170,7 @@ public sealed class AgentSettingsTests : IDisposable
         var settings = Load("""{ "ClientId": "", "Scope": "Teams", "Label": "", "IncludedSites": [] }""");
 
         Assert.Equal(AgentSettings.DefaultClientId, settings.ClientId.Value);
-        Assert.Equal(DriveScope.SharePoint, settings.Scope);
+        Assert.Equal(DriveScope.All, settings.Scope);
         Assert.Equal("VFS365", settings.Label);
         Assert.Null(settings.IncludedSites);
     }
@@ -197,7 +207,7 @@ public sealed class AgentSettingsTests : IDisposable
         Assert.Equal("0 (off)", effective["ReadAheadFiles"].Value);
         Assert.StartsWith("contoso.table.core.windows.net", effective["MonitoringUrl"].Value);
         Assert.DoesNotContain(settings.Effective(), s => s.Value.Contains("secret123") || s.Value.Contains("sig="));
-        Assert.Equal(27, effective.Count);
+        Assert.Equal(29, effective.Count);
         Assert.Equal(AgentSettings.Names.Order(), effective.Keys.Order());
     }
 

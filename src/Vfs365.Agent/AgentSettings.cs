@@ -18,7 +18,7 @@ public sealed class AgentSettings
     public const string PolicyKey = @"SOFTWARE\Policies\JSolve\VFS365";
     public const string DefaultLabel = "VFS365";
     public const string DefaultDriveLetter = "None";
-    public const DriveScope DefaultScope = DriveScope.SharePoint;
+    public const DriveScope DefaultScope = DriveScope.All;
 
     /// <summary>JSolve's multi-tenant public client app; an admin consents to it once per tenant (docs/APP-REGISTRATION.md).</summary>
     public const string DefaultClientId = "08e570ea-9711-4dc6-b450-2e00fc550fca";
@@ -27,9 +27,9 @@ public sealed class AgentSettings
     public static readonly IReadOnlyList<string> Names =
     [
         "ClientId", "TenantId", "DriveLetter", "Label", "Scope", "IncludedSites", "ExcludedSites", "IncludedSiteTemplates", "ExcludedSiteTemplates",
-        "PinnedLocations", "NavigationPane", "CacheSizeMB", "TrayIcon", "NotifyUploads", "HelpUrl", "ChangeCheckSeconds", "ApiBudgetPerMinute",
+        "PinnedLocations", "NavigationPane", "OverlayIcons", "CacheSizeMB", "TrayIcon", "NotifyUploads", "HelpUrl", "ChangeCheckSeconds", "ApiBudgetPerMinute",
         "ThrottlePauseMinutes", "WalkPrefetchFolders", "ReadAheadFiles", "BackgroundUploads", "RepeatSaveSeconds", "DatabaseFiles", "MonitoringUrl",
-        "MonitoringDetail", "FolderRedirection", "DriveMappings",
+        "MonitoringDetail", "FolderRedirection", "DriveMappings", "SharedWithMe",
     ];
 
     readonly List<(string Source, Func<string, object?> Read)> sources = [];
@@ -72,6 +72,12 @@ public sealed class AgentSettings
     public IReadOnlyList<string> PinnedLocations => List("PinnedLocations") ?? [];
 
     public bool NavigationPane => Bool("NavigationPane") ?? true;
+
+    /// <summary>Overlay icons on the volume's files in Explorer: online only, on this device, uploading, downloading, problem.</summary>
+    public bool OverlayIcons => Bool("OverlayIcons") ?? true;
+
+    /// <summary>A "Shared with me" folder next to OneDrive and Sites (Scope All only): files and folders other people shared with the user.</summary>
+    public bool SharedWithMe => Bool("SharedWithMe") ?? true;
 
     /// <summary>Known folders moved into the volume while it is mounted: "Documents=OneDrive\Documents", "|move" moves their content.</summary>
     public IReadOnlyList<string> FolderRedirection => List("FolderRedirection") ?? [];
@@ -168,6 +174,8 @@ public sealed class AgentSettings
             ("ExcludedSiteTemplates", ExcludedSiteTemplates.Count == 0 ? "none" : string.Join("; ", ExcludedSiteTemplates), From("ExcludedSiteTemplates")),
             ("PinnedLocations", PinnedLocations.Count == 0 ? "none" : string.Join("; ", PinnedLocations), From("PinnedLocations")),
             ("NavigationPane", OnOff(NavigationPane), From("NavigationPane")),
+            ("OverlayIcons", OnOff(OverlayIcons), From("OverlayIcons")),
+            ("SharedWithMe", Scope == DriveScope.All ? OnOff(SharedWithMe) : $"{OnOff(SharedWithMe)} (shown with Scope All only)", From("SharedWithMe")),
             ("FolderRedirection", FolderRedirection.Count == 0 ? "none" : string.Join("; ", FolderRedirection), From("FolderRedirection")),
             ("DriveMappings", DriveMappings.Count == 0 ? "none" : string.Join("; ", DriveMappings), From("DriveMappings")),
             ("CacheSizeMB", CacheSizeMB.ToString(), From("CacheSizeMB")),
@@ -218,11 +226,12 @@ public sealed class AgentSettings
         Check("WalkPrefetchFolders", WalkPrefetchFolders);
         Check("ReadAheadFiles", ReadAheadFiles);
         Check("RepeatSaveSeconds", RepeatSaveSeconds);
-        foreach (var (name, used) in new[] { ("NavigationPane", NavigationPane), ("TrayIcon", TrayIcon), ("NotifyUploads", NotifyUploads), ("BackgroundUploads", BackgroundUploads) })
+        foreach (var (name, used) in new[] { ("NavigationPane", NavigationPane), ("OverlayIcons", OverlayIcons), ("SharedWithMe", SharedWithMe), ("TrayIcon", TrayIcon), ("NotifyUploads", NotifyUploads),
+            ("BackgroundUploads", BackgroundUploads) })
         {
             Unreadable(name, Bool(name) is not null, "on or off (1 or 0)", used ? "on" : "off");
         }
-        Unreadable("Scope", Choice<DriveScope>("Scope") is not null, "SharePoint, OneDrive or All", Scope.ToString());
+        Unreadable("Scope", Choice<DriveScope>("Scope") is not null, "All, SharePoint or OneDrive", Scope.ToString());
         Unreadable("DatabaseFiles", Choice<DatabaseFilePolicy>("DatabaseFiles") is not null, "Allow, ReadOnly or Block", DatabaseFiles.ToString());
         Unreadable("MonitoringDetail", Choice<MonitoringDetail>("MonitoringDetail") is not null, "Full or NoPaths", MonitoringDetail.ToString());
         Unreadable("HelpUrl", ValidHelpUrl(Text("HelpUrl").Value) is not null, "an http or https address", DefaultHelpUrl);

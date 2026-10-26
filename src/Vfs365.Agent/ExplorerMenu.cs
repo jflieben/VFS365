@@ -211,6 +211,7 @@ public sealed class ExplorerMenu : IDisposable
     readonly string exe, unc;
     readonly string? letter;
     readonly SessionDriveLetters? folders;
+    readonly ShellPublisher? shell;
     readonly Action<string> log;
     readonly CancellationTokenSource stop = new();
     readonly Timer timer;
@@ -218,9 +219,9 @@ public sealed class ExplorerMenu : IDisposable
     readonly Lock gate = new();
     bool disposed;
 
-    ExplorerMenu(string exe, string unc, string? letter, SessionDriveLetters? folders, VerbActions actions, Action<string> log)
+    ExplorerMenu(string exe, string unc, string? letter, SessionDriveLetters? folders, ShellPublisher? shell, VerbActions actions, Action<string> log)
     {
-        (this.exe, this.unc, this.letter, this.folders, this.log) = (exe, unc, letter, folders, log);
+        (this.exe, this.unc, this.letter, this.folders, this.shell, this.log) = (exe, unc, letter, folders, shell, log);
         Update();
         timer = new Timer(_ => Update(), null, TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(30));
         serving = Task.Run(async () =>
@@ -249,9 +250,10 @@ public sealed class ExplorerMenu : IDisposable
 
     /// <summary>
     /// Starts the menu for a mounted drive; null (and said why) when vfs365-agent.exe isn't next to this program (a development build of
-    /// vfs365.exe) or the registry refuses it.
+    /// vfs365.exe) or the registry refuses it. The shell section (overlay icons, the Windows 11 menu) starts with it; without
+    /// <paramref name="overlays"/> (policy OverlayIcons) it says there are none.
     /// </summary>
-    public static ExplorerMenu? Start(DriveEngine engine, DriveApi api, string unc, string? letter, SessionDriveLetters? folders,
+    public static ExplorerMenu? Start(DriveEngine engine, DriveApi api, string unc, string? letter, SessionDriveLetters? folders, bool overlays,
         Action<string, string, bool> notify, Action<string> say, Action<string> log)
     {
         var exe = Path.Combine(AppContext.BaseDirectory, "vfs365-agent.exe");
@@ -263,14 +265,35 @@ public sealed class ExplorerMenu : IDisposable
         var actions = new VerbActions(engine, api.GetLinksAsync,
             path => ExplorerVerbs.VolumePath(path, unc, letter, folders?.Folders() ?? new Dictionary<string, string>()),
             Shell, Clipboard.SetText, notify, log);
+        var shell = StartShell(engine, overlays, say, log);
         try
         {
-            return new ExplorerMenu(exe, unc, letter, folders, actions, log);
+            return new ExplorerMenu(exe, unc, letter, folders, shell, actions, log);
         }
         catch (Exception e) when (e is IOException or UnauthorizedAccessException or System.Security.SecurityException)
         {
             say($"Warning:    could not add the VFS365 menu in Explorer: {e.Message}");
+            shell?.Dispose();
             ExplorerVerbs.Remove(Registry.CurrentUser);
+            return null;
+        }
+    }
+
+    static ShellPublisher? StartShell(DriveEngine engine, bool overlays, Action<string> say, Action<string> log)
+    {
+        try
+        {
+            using var identity = System.Security.Principal.WindowsIdentity.GetCurrent();
+            var section = ShellSection.Open(ShellSection.NameFor(identity.User!), identity.User!);
+            if (!overlays)
+            {
+                say("Explorer:   no overlay icons (policy OverlayIcons)");
+            }
+            return new ShellPublisher(engine, section, overlays, ShellPublisher.MenuStrings(System.Globalization.CultureInfo.CurrentUICulture), log);
+        }
+        catch (Exception e) when (e is System.ComponentModel.Win32Exception or UnauthorizedAccessException or IOException)
+        {
+            say($"Warning:    no overlay icons or Windows 11 menu in Explorer: {e.Message}");
             return null;
         }
     }
@@ -279,7 +302,34 @@ public sealed class ExplorerMenu : IDisposable
     public static IReadOnlyList<string> Roots(string unc, string? letter, IEnumerable<string> folderLetters) =>
         [.. new[] { letter }.Concat(folderLetters).OfType<string>().Select(l => l.TrimEnd('\\') + @"\"), unc.TrimEnd('\\') + @"\"];
 
-    void Update()
+    /// <summary>
+    /// The roots for the shell section, with the volume path each stands for: the drive's letter and UNC path the volume's top ("\"), a
+    /// letter for a folder (<paramref name="folders"/>: "Z:" to \\VFS365\ann\Sites\Sales\Documents) that folder ("\Sites\Sales\Documents\").
+    /// </summary>
+    public static IReadOnlyList<ShellRoot> ShellRoots(string unc, string? letter, IReadOnlyDictionary<string, string> folders)
+    {
+        var roots = new List<ShellRoot>();
+        if (letter is not null)
+        {
+            roots.Add(new ShellRoot(letter.TrimEnd('\\') + @"\", @"\"));
+        }
+        foreach (var (folderLetter, folder) in folders.OrderBy(f => f.Key, StringComparer.OrdinalIgnoreCase))
+        {
+            if (VolumePaths.Relative(folder, unc, null) is { } relative)
+            {
+                var segments = relative.Split('\\', StringSplitOptions.RemoveEmptyEntries);
+                roots.Add(new ShellRoot(folderLetter.TrimEnd('\\') + @"\", segments.Length == 0 ? @"\" : $@"\{string.Join('\\', segments)}\"));
+            }
+        }
+        roots.Add(new ShellRoot(unc.TrimEnd('\\') + @"\", @"\"));
+        return roots;
+    }
+
+    /// <summary>
+    /// Writes the roots and the menu. With Windows 11's menu package registered (and the shell section that tells it where it shows) the
+    /// HKCU verbs go, so "Show more options" doesn't list the menu twice.
+    /// </summary>
+    public void Update()
     {
         lock (gate)
         {
@@ -289,7 +339,15 @@ public sealed class ExplorerMenu : IDisposable
             }
             try
             {
-                if (ExplorerVerbs.Register(Registry.CurrentUser, exe, Roots(unc, letter, folders?.Folders().Keys ?? [])))
+                if (shell is not null && ShellPackage.IsActive)
+                {
+                    if (ExplorerVerbs.IsRegistered(Registry.CurrentUser))
+                    {
+                        ExplorerVerbs.Remove(Registry.CurrentUser);
+                        log("Explorer menu: Windows 11 menu package active, the classic verbs are removed");
+                    }
+                }
+                else if (ExplorerVerbs.Register(Registry.CurrentUser, exe, Roots(unc, letter, folders?.Folders().Keys ?? [])))
                 {
                     log("Explorer menu: written for the drive's current letters");
                 }
@@ -298,6 +356,7 @@ public sealed class ExplorerMenu : IDisposable
             {
                 log($"Explorer menu: could not write it: {e.Message}");
             }
+            shell?.SetRoots(ShellRoots(unc, letter, folders?.Folders() ?? new Dictionary<string, string>()));
         }
     }
 
@@ -312,6 +371,7 @@ public sealed class ExplorerMenu : IDisposable
             disposed = true;
         }
         timer.Dispose();
+        shell?.Dispose();
         stop.Cancel();
         try
         {

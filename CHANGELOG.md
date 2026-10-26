@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.7.1
+
+- New default: `Scope` All, so the drive shows OneDrive and Sites (and Shared with me) at its root. Without a `Scope` policy, paths change from `M:\Finance\Documents` to `M:\Sites\Finance\Documents`, also in `DriveMappings`, `FolderRedirection` and paths apps remember. Set `Scope` to `SharePoint` to keep the earlier layout.
+- A "Shared with me" folder at the root (Scope All): files and folders others shared with you by name. Shared folders work like library folders (read-only when you may only view them); shared files directly in it open read-only (Open in desktop app edits them in Microsoft 365). Files you only opened through an "anyone" or organisation link aren't listed. Policy `SharedWithMe` (default on). `vfs365 shared` lists what it shows.
+- Windows 11: the VFS365 menu is in the first right-click menu instead of under "Show more options", and only on the drive's files and folders. Signed releases only: a small package gives the menu its identity and each user's agent registers it at start.
+- Status icons in Explorer on the drive's files: online only, on this device, uploading, downloading, or a problem. Folders show uploading or a problem when a file in them does. Policy `OverlayIcons` (default on) turns them off.
+
 ## 0.7.0
 
 Result of a performance review, and new tools for users, helpdesks and admins.

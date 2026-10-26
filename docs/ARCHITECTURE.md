@@ -39,10 +39,12 @@ A Cloud Files API front end, if ever built, is another `Drive.*` project over th
 ```
 \\VFS365\<user>  (optionally a drive letter too)
   OneDrive\
+  Shared with me\           items shared with the user (Graph search on SharedWithUsersOWSUSER): a folder is a mount rooted at its
+                            path in the owner's drive (DriveMount.BasePath, no change feed), a file a read-only one-file mount
   Sites\<site>\<library>\   what discovery finds plus pinned locations, Teams and channel sites included
 ```
 
-That is `Scope` = `All`. With `SharePoint` (the default) the site folders are the root of the drive; with `OneDrive` the OneDrive root is. Drive letter (default none), name and filters come from policy ([DEPLOYMENT.md](DEPLOYMENT.md)).
+That is `Scope` = `All`, the default. With `SharePoint` the site folders are the root of the drive; with `OneDrive` the OneDrive root is. Drive letter (default none), name and filters come from policy ([DEPLOYMENT.md](DEPLOYMENT.md)).
 
 One volume per user session. UNC prefixes are machine-wide (a second volume with the same prefix fails with `0x80070050`), so the share is the Windows user name; drive letters are per session. Each volume's security descriptor grants only its user and SYSTEM. When the prefix is taken, `DriveHost` reads the holder's owner: another user's volume (`MountConflictException.OwnedByAnotherUser`) is reported as a security problem and tried again only hourly or on Retry in the tray; it would otherwise receive saves from apps that stored `\\VFS365\<user>` paths. When the holder has the same user name in another domain (`SameNameHolder`), the message names that account instead of a generic security alert.
 

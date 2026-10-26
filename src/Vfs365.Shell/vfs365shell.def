@@ -1,0 +1,8 @@
+LIBRARY vfs365shell
+EXPORTS
+    DllCanUnloadNow
+    DllGetClassObject
+    VfsShellIsOnVolume
+    VfsShellQueryState
+    VfsShellTestSection
+    VfsShellVerb

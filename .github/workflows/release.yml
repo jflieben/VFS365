@@ -9,9 +9,11 @@
 # the NuGet cache (keyed by those files), build also the Zig cache; package, which signs, uses neither.
 #
 # Code signing with Azure Artifact Signing (formerly Trusted Signing): with the repository variable SIGNING_PROFILE set to the
-# certificate profile name (Settings, Secrets and variables, Actions, Variables), package signs vfs365np.dll, VFS365's exes and DLLs,
-# the MSIs and the setups before the checksums, and fails when a program, DLL, MSI or setup, or a program or DLL inside the MSIs, is
-# not validly signed (winfsp-msil.dll excepted, see build.ps1). Without it the release is unsigned. No secret is stored: package signs
+# certificate profile name (Settings, Secrets and variables, Actions, Variables), package signs vfs365np.dll, vfs365shell.dll, VFS365's
+# exes and DLLs, the MSIs and the setups before the checksums, builds and signs the Windows 11 context menu package vfs365shell.msix
+# (makeappx from the runner's Windows SDK; publisher = the certificate's subject), and fails when a program, DLL, MSI or setup, or a
+# program, DLL or package inside the MSIs, is not validly signed (winfsp-msil.dll excepted, see build.ps1). Without it the release is
+# unsigned and has no menu package (Explorer then keeps the legacy verbs). No secret is stored: package signs
 # in to Azure with GitHub's OIDC token as app "VFS365 release signing", whose federated credential trusts this repository's
 # environment "release" (limit it to the main branch: Settings, Environments, release, Deployment branches) and which needs the
 # Artifact Signing Certificate Profile Signer role on the account or profile. The sign-in lives only in package, which compiles
@@ -127,6 +129,7 @@ jobs:
           name: unsigned
           path: |
             artifacts/np
+            artifacts/shell
             artifacts/publish
             artifacts/winfsp
           if-no-files-found: error

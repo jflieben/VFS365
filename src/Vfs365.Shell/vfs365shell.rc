@@ -1,0 +1,6 @@
+// Overlay icons (tools\New-OverlayIcons.ps1) in state order: GetOverlayInfo gives index state - 1
+1 ICON "../../assets/overlay/cached.ico"
+2 ICON "../../assets/overlay/uploading.ico"
+3 ICON "../../assets/overlay/downloading.ico"
+4 ICON "../../assets/overlay/problem.ico"
+5 ICON "../../assets/overlay/online-only.ico"

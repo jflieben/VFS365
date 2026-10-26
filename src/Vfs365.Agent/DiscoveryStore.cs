@@ -123,13 +123,27 @@ public sealed class DiscoveryStateKeeper(DiscoveryState initial, Action<Discover
         }
     }
 
-    /// <summary>A new discovery result; drive IDs learned meanwhile are kept.</summary>
+    /// <summary>A new discovery result; drive IDs learned meanwhile are kept, and so is the shared list (read on its own).</summary>
     public void Replace(DiscoveryState state)
     {
         lock (gate)
         {
             var known = current.Libraries.Where(l => l.DriveId is not null).ToDictionary(l => l.Key, l => l.DriveId!, StringComparer.OrdinalIgnoreCase);
-            current = state with { Libraries = state.Libraries.Select(l => l.DriveId is null && known.TryGetValue(l.Key, out var id) ? l with { DriveId = id } : l).ToList() };
+            current = state with
+            {
+                Libraries = state.Libraries.Select(l => l.DriveId is null && known.TryGetValue(l.Key, out var id) ? l with { DriveId = id } : l).ToList(),
+                Shared = current.Shared,
+            };
+            dirty = true;
+        }
+    }
+
+    /// <summary>A new shared list (the Shared with me folder).</summary>
+    public void SetShared(SharedState shared)
+    {
+        lock (gate)
+        {
+            current = current with { Shared = shared };
             dirty = true;
         }
     }

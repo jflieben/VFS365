@@ -2,7 +2,8 @@
   <!--
     Installs VFS365 for all users in Program Files\VFS365 and starts vfs365-agent.exe at every user's logon (HKLM Run).
     Needs WinFsp (the setup bundle installs it first). Settings come from policy (policy\VFS365.admx).
-    Also installs the network provider vfs365np.dll (System32 and SysWOW64) so typed \\VFS365 paths work in Explorer.
+    Also installs the network provider vfs365np.dll (System32 and SysWOW64) so typed \\VFS365 paths work in Explorer, and the shell
+    extension vfs365shell.dll (overlay icons; with the signed package vfs365shell.msix, the Windows 11 context menu).
     Removal runs vfs365.exe machine-stop as SYSTEM before files go: agents stop cleanly (Explorer entry removed, pending changes
     uploaded), and on a real uninstall (not an upgrade) per-user caches and Explorer entries are removed; unsaved changes are kept.
     An install or upgrade ends with vfs365.exe machine-start, which starts the agent in every signed-in session without one.
@@ -37,7 +38,9 @@
 <?endif?>
 
     <StandardDirectory Id="ProgramFiles6432Folder">
-      <Directory Id="INSTALLFOLDER" Name="VFS365" />
+      <Directory Id="INSTALLFOLDER" Name="VFS365">
+        <Directory Id="SHELLX86FOLDER" Name="x86" />
+      </Directory>
     </StandardDirectory>
 
     <ComponentGroup Id="AppFiles" Directory="INSTALLFOLDER">
@@ -87,6 +90,132 @@
       </Component>
     </StandardDirectory>
 
+    <!-- Shell extension vfs365shell.dll (src\Vfs365.Shell): overlay icons on the volume's items, five classes registered here, the x86
+       build for 32-bit programs' file dialogs (its keys written straight into the 32-bit view, WOW6432Node). Its Windows 11 context menu class is registered per user by the package
+       vfs365shell.msix (signed releases only; ShellPackage.cs), never here. The overlay identifiers' names start with one space:
+       Explorer uses only the first 15 in name order, and this puts them right after OneDrive's (" OneDrive1" to " OneDrive7"). -->
+    <Component Id="ShellExtension" Directory="INSTALLFOLDER" Guid="{D7C4A21E-89F0-455F-85EC-687894ABC500}" Bitness="always64">
+      <File Id="vfs365shell.dll" Name="vfs365shell.dll" Source="$(ShellDll)" KeyPath="yes" />
+      <RegistryKey Root="HKLM" Key="SOFTWARE\Classes\CLSID\{446CAE69-A613-4F61-B33B-6845715EF0E8}" ForceDeleteOnUninstall="yes">
+        <RegistryValue Type="string" Value="VFS365 overlay: Problem" />
+        <RegistryKey Key="InprocServer32">
+          <RegistryValue Type="string" Value="[#vfs365shell.dll]" />
+          <RegistryValue Name="ThreadingModel" Type="string" Value="Apartment" />
+        </RegistryKey>
+      </RegistryKey>
+      <RegistryKey Root="HKLM" Key="SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\ShellIconOverlayIdentifiers\ VFS365 1 Problem" ForceDeleteOnUninstall="yes">
+        <RegistryValue Type="string" Value="{446CAE69-A613-4F61-B33B-6845715EF0E8}" />
+      </RegistryKey>
+      <RegistryValue Root="HKLM" Key="SOFTWARE\Microsoft\Windows\CurrentVersion\Shell Extensions\Approved" Name="{446CAE69-A613-4F61-B33B-6845715EF0E8}" Type="string" Value="VFS365 overlay: Problem" />
+      <RegistryKey Root="HKLM" Key="SOFTWARE\Classes\CLSID\{B7C851F1-2B15-49B3-B30E-769011CF84D2}" ForceDeleteOnUninstall="yes">
+        <RegistryValue Type="string" Value="VFS365 overlay: Uploading" />
+        <RegistryKey Key="InprocServer32">
+          <RegistryValue Type="string" Value="[#vfs365shell.dll]" />
+          <RegistryValue Name="ThreadingModel" Type="string" Value="Apartment" />
+        </RegistryKey>
+      </RegistryKey>
+      <RegistryKey Root="HKLM" Key="SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\ShellIconOverlayIdentifiers\ VFS365 2 Uploading" ForceDeleteOnUninstall="yes">
+        <RegistryValue Type="string" Value="{B7C851F1-2B15-49B3-B30E-769011CF84D2}" />
+      </RegistryKey>
+      <RegistryValue Root="HKLM" Key="SOFTWARE\Microsoft\Windows\CurrentVersion\Shell Extensions\Approved" Name="{B7C851F1-2B15-49B3-B30E-769011CF84D2}" Type="string" Value="VFS365 overlay: Uploading" />
+      <RegistryKey Root="HKLM" Key="SOFTWARE\Classes\CLSID\{372835A3-0CA9-4E2C-936E-42827149C031}" ForceDeleteOnUninstall="yes">
+        <RegistryValue Type="string" Value="VFS365 overlay: Downloading" />
+        <RegistryKey Key="InprocServer32">
+          <RegistryValue Type="string" Value="[#vfs365shell.dll]" />
+          <RegistryValue Name="ThreadingModel" Type="string" Value="Apartment" />
+        </RegistryKey>
+      </RegistryKey>
+      <RegistryKey Root="HKLM" Key="SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\ShellIconOverlayIdentifiers\ VFS365 3 Downloading" ForceDeleteOnUninstall="yes">
+        <RegistryValue Type="string" Value="{372835A3-0CA9-4E2C-936E-42827149C031}" />
+      </RegistryKey>
+      <RegistryValue Root="HKLM" Key="SOFTWARE\Microsoft\Windows\CurrentVersion\Shell Extensions\Approved" Name="{372835A3-0CA9-4E2C-936E-42827149C031}" Type="string" Value="VFS365 overlay: Downloading" />
+      <RegistryKey Root="HKLM" Key="SOFTWARE\Classes\CLSID\{9DB55147-CB02-47F4-A386-E0EE3D556021}" ForceDeleteOnUninstall="yes">
+        <RegistryValue Type="string" Value="VFS365 overlay: Cached" />
+        <RegistryKey Key="InprocServer32">
+          <RegistryValue Type="string" Value="[#vfs365shell.dll]" />
+          <RegistryValue Name="ThreadingModel" Type="string" Value="Apartment" />
+        </RegistryKey>
+      </RegistryKey>
+      <RegistryKey Root="HKLM" Key="SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\ShellIconOverlayIdentifiers\ VFS365 4 Cached" ForceDeleteOnUninstall="yes">
+        <RegistryValue Type="string" Value="{9DB55147-CB02-47F4-A386-E0EE3D556021}" />
+      </RegistryKey>
+      <RegistryValue Root="HKLM" Key="SOFTWARE\Microsoft\Windows\CurrentVersion\Shell Extensions\Approved" Name="{9DB55147-CB02-47F4-A386-E0EE3D556021}" Type="string" Value="VFS365 overlay: Cached" />
+      <RegistryKey Root="HKLM" Key="SOFTWARE\Classes\CLSID\{04668249-3350-4510-9629-814408AA98D3}" ForceDeleteOnUninstall="yes">
+        <RegistryValue Type="string" Value="VFS365 overlay: OnlineOnly" />
+        <RegistryKey Key="InprocServer32">
+          <RegistryValue Type="string" Value="[#vfs365shell.dll]" />
+          <RegistryValue Name="ThreadingModel" Type="string" Value="Apartment" />
+        </RegistryKey>
+      </RegistryKey>
+      <RegistryKey Root="HKLM" Key="SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\ShellIconOverlayIdentifiers\ VFS365 5 OnlineOnly" ForceDeleteOnUninstall="yes">
+        <RegistryValue Type="string" Value="{04668249-3350-4510-9629-814408AA98D3}" />
+      </RegistryKey>
+      <RegistryValue Root="HKLM" Key="SOFTWARE\Microsoft\Windows\CurrentVersion\Shell Extensions\Approved" Name="{04668249-3350-4510-9629-814408AA98D3}" Type="string" Value="VFS365 overlay: OnlineOnly" />
+    </Component>
+    <Component Id="ShellExtension32" Directory="SHELLX86FOLDER" Guid="{12F777DB-F0E0-43B4-85E1-01C5613CD881}" Bitness="always64">
+      <File Id="vfs365shell32.dll" Name="vfs365shell.dll" Source="$(ShellDllX86)" KeyPath="yes" />
+      <RegistryKey Root="HKLM" Key="SOFTWARE\Classes\WOW6432Node\CLSID\{446CAE69-A613-4F61-B33B-6845715EF0E8}" ForceDeleteOnUninstall="yes">
+        <RegistryValue Type="string" Value="VFS365 overlay: Problem" />
+        <RegistryKey Key="InprocServer32">
+          <RegistryValue Type="string" Value="[#vfs365shell32.dll]" />
+          <RegistryValue Name="ThreadingModel" Type="string" Value="Apartment" />
+        </RegistryKey>
+      </RegistryKey>
+      <RegistryKey Root="HKLM" Key="SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Explorer\ShellIconOverlayIdentifiers\ VFS365 1 Problem" ForceDeleteOnUninstall="yes">
+        <RegistryValue Type="string" Value="{446CAE69-A613-4F61-B33B-6845715EF0E8}" />
+      </RegistryKey>
+      <RegistryValue Root="HKLM" Key="SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Shell Extensions\Approved" Name="{446CAE69-A613-4F61-B33B-6845715EF0E8}" Type="string" Value="VFS365 overlay: Problem" />
+      <RegistryKey Root="HKLM" Key="SOFTWARE\Classes\WOW6432Node\CLSID\{B7C851F1-2B15-49B3-B30E-769011CF84D2}" ForceDeleteOnUninstall="yes">
+        <RegistryValue Type="string" Value="VFS365 overlay: Uploading" />
+        <RegistryKey Key="InprocServer32">
+          <RegistryValue Type="string" Value="[#vfs365shell32.dll]" />
+          <RegistryValue Name="ThreadingModel" Type="string" Value="Apartment" />
+        </RegistryKey>
+      </RegistryKey>
+      <RegistryKey Root="HKLM" Key="SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Explorer\ShellIconOverlayIdentifiers\ VFS365 2 Uploading" ForceDeleteOnUninstall="yes">
+        <RegistryValue Type="string" Value="{B7C851F1-2B15-49B3-B30E-769011CF84D2}" />
+      </RegistryKey>
+      <RegistryValue Root="HKLM" Key="SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Shell Extensions\Approved" Name="{B7C851F1-2B15-49B3-B30E-769011CF84D2}" Type="string" Value="VFS365 overlay: Uploading" />
+      <RegistryKey Root="HKLM" Key="SOFTWARE\Classes\WOW6432Node\CLSID\{372835A3-0CA9-4E2C-936E-42827149C031}" ForceDeleteOnUninstall="yes">
+        <RegistryValue Type="string" Value="VFS365 overlay: Downloading" />
+        <RegistryKey Key="InprocServer32">
+          <RegistryValue Type="string" Value="[#vfs365shell32.dll]" />
+          <RegistryValue Name="ThreadingModel" Type="string" Value="Apartment" />
+        </RegistryKey>
+      </RegistryKey>
+      <RegistryKey Root="HKLM" Key="SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Explorer\ShellIconOverlayIdentifiers\ VFS365 3 Downloading" ForceDeleteOnUninstall="yes">
+        <RegistryValue Type="string" Value="{372835A3-0CA9-4E2C-936E-42827149C031}" />
+      </RegistryKey>
+      <RegistryValue Root="HKLM" Key="SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Shell Extensions\Approved" Name="{372835A3-0CA9-4E2C-936E-42827149C031}" Type="string" Value="VFS365 overlay: Downloading" />
+      <RegistryKey Root="HKLM" Key="SOFTWARE\Classes\WOW6432Node\CLSID\{9DB55147-CB02-47F4-A386-E0EE3D556021}" ForceDeleteOnUninstall="yes">
+        <RegistryValue Type="string" Value="VFS365 overlay: Cached" />
+        <RegistryKey Key="InprocServer32">
+          <RegistryValue Type="string" Value="[#vfs365shell32.dll]" />
+          <RegistryValue Name="ThreadingModel" Type="string" Value="Apartment" />
+        </RegistryKey>
+      </RegistryKey>
+      <RegistryKey Root="HKLM" Key="SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Explorer\ShellIconOverlayIdentifiers\ VFS365 4 Cached" ForceDeleteOnUninstall="yes">
+        <RegistryValue Type="string" Value="{9DB55147-CB02-47F4-A386-E0EE3D556021}" />
+      </RegistryKey>
+      <RegistryValue Root="HKLM" Key="SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Shell Extensions\Approved" Name="{9DB55147-CB02-47F4-A386-E0EE3D556021}" Type="string" Value="VFS365 overlay: Cached" />
+      <RegistryKey Root="HKLM" Key="SOFTWARE\Classes\WOW6432Node\CLSID\{04668249-3350-4510-9629-814408AA98D3}" ForceDeleteOnUninstall="yes">
+        <RegistryValue Type="string" Value="VFS365 overlay: OnlineOnly" />
+        <RegistryKey Key="InprocServer32">
+          <RegistryValue Type="string" Value="[#vfs365shell32.dll]" />
+          <RegistryValue Name="ThreadingModel" Type="string" Value="Apartment" />
+        </RegistryKey>
+      </RegistryKey>
+      <RegistryKey Root="HKLM" Key="SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Explorer\ShellIconOverlayIdentifiers\ VFS365 5 OnlineOnly" ForceDeleteOnUninstall="yes">
+        <RegistryValue Type="string" Value="{04668249-3350-4510-9629-814408AA98D3}" />
+      </RegistryKey>
+      <RegistryValue Root="HKLM" Key="SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Shell Extensions\Approved" Name="{04668249-3350-4510-9629-814408AA98D3}" Type="string" Value="VFS365 overlay: OnlineOnly" />
+    </Component>
+<?if $(ShellMsix) != "" ?>
+    <Component Id="ShellPackage" Directory="INSTALLFOLDER" Guid="{CCD50449-13C7-44EE-A035-EB62E7475B24}">
+      <File Id="vfs365shell.msix" Name="vfs365shell.msix" Source="$(ShellMsix)" KeyPath="yes" />
+    </Component>
+<?endif?>
+
     <!-- Custom actions run vfs365.exe as SYSTEM through WiX's WixQuietExec: no console window, which on a user's desktop would let that
          user run anything as SYSTEM, and the output goes to the MSI log. The command line is the action's CustomActionData, set
          just before it. None fails setup. -->
@@ -125,6 +254,11 @@
       <ComponentRef Id="StartMenuShortcut" />
       <ComponentRef Id="NetworkProvider" />
       <ComponentRef Id="NetworkProvider32" />
+      <ComponentRef Id="ShellExtension" />
+      <ComponentRef Id="ShellExtension32" />
+<?if $(ShellMsix) != "" ?>
+      <ComponentRef Id="ShellPackage" />
+<?endif?>
     </Feature>
   </Package>
 </Wix>
