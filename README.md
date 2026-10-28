@@ -4,7 +4,7 @@
 
 Shows Microsoft 365 (OneDrive, Teams and SharePoint libraries) as a drive and as an entry in Explorer's navigation pane, browsable with the signed-in user's own permissions and usable by legacy apps through ordinary file paths: open, save, delete, rename. No per-library setup, no sync.
 
-Status: early releases, in use at the first organisations. Downloads: [Releases](../../releases). What changed: [CHANGELOG.md](CHANGELOG.md).
+Install: [Deployment](docs/DEPLOYMENT.md) Downloads: [Releases](../../releases). What changed: [CHANGELOG.md](CHANGELOG.md).
 
 https://github.com/user-attachments/assets/a4b3872f-d3fd-4372-a001-83f90e983e33
 
