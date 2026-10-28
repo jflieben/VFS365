@@ -308,9 +308,10 @@ public sealed class ShellExtensionTests
         Assert.Equal(Cached, ShellDll.QueryState(@"\\vfs365\ANN\Docs\a.docx"));
         Assert.Equal(Cached, ShellDll.QueryState(@"\\?\UNC\VFS365\ann\Docs\a.docx"));
         Assert.Equal(Uploading, ShellDll.QueryState(@"Z:\Plan.xlsx"));
-        Assert.Equal(Downloading, ShellDll.QueryState(@"Z:", directory: true));
-        Assert.Equal(Downloading, ShellDll.QueryState(@"Z:\", directory: true));
-        Assert.Equal(Downloading, ShellDll.QueryState(@"M:\café\menu.pdf"));
+        // Downloading has no overlay class: a file shows online only, a folder nothing
+        Assert.Equal(None, ShellDll.QueryState(@"Z:", directory: true));
+        Assert.Equal(None, ShellDll.QueryState(@"Z:\", directory: true));
+        Assert.Equal(OnlineOnly, ShellDll.QueryState(@"M:\café\menu.pdf"));
         Assert.Equal(Problem, ShellDll.QueryState(@"M:\Docs", directory: true));
         Assert.Equal(Problem, ShellDll.QueryState(@"M:\Docs\", directory: true));
         Assert.Equal(Cached, ShellDll.QueryState(@"\\VFS365\ann", directory: true));
@@ -490,13 +491,15 @@ public sealed class ShellExtensionTests
         Assert.Equal("Version history", ShellDll.Verb(4, @"M:\a.docx", false)!.Value.Title);
     }
 
-    // Class IDs as in vfs365shell.c, src\Vfs365.Shell\package\AppxManifest.xml and installer\Package.wxs
+    // Class IDs as in vfs365shell.c, src\Vfs365.Shell\package\AppxManifest.xml and installer\Package.wxs; the overlays with their states
     static readonly Guid MenuClass = new("A7AED2F3-B922-46C7-BBAB-64B986061C74");
-    static readonly Guid[] OverlayClasses =
+    static readonly (Guid Class, int State)[] OverlayClasses =
     [
-        new("9DB55147-CB02-47F4-A386-E0EE3D556021"), new("B7C851F1-2B15-49B3-B30E-769011CF84D2"), new("372835A3-0CA9-4E2C-936E-42827149C031"),
-        new("446CAE69-A613-4F61-B33B-6845715EF0E8"), new("04668249-3350-4510-9629-814408AA98D3"),
+        (new("9DB55147-CB02-47F4-A386-E0EE3D556021"), Cached), (new("B7C851F1-2B15-49B3-B30E-769011CF84D2"), Uploading),
+        (new("446CAE69-A613-4F61-B33B-6845715EF0E8"), Problem), (new("04668249-3350-4510-9629-814408AA98D3"), OnlineOnly),
     ];
+    // The class Downloading had until 0.7.3: Explorer loads only 11 overlay handlers and OneDrive takes 7
+    static readonly Guid DownloadingClass = new("372835A3-0CA9-4E2C-936E-42827149C031");
 
     static string Take(IntPtr text)
     {
@@ -548,23 +551,26 @@ public sealed class ShellExtensionTests
     public void Each_overlay_class_claims_its_own_state_with_its_own_icon()
     {
         using var section = Written();
-        var overlays = OverlayClasses.Select(ShellDll.Create<IShellIconOverlayIdentifier>).ToArray();
-        string[] paths = [@"M:\Docs\a.docx", @"Z:\Plan.xlsx", @"M:\Café\Menu.pdf", @"M:\Docs", @"M:\Docs\b.docx"];
+        var overlays = OverlayClasses.Select(o => ShellDll.Create<IShellIconOverlayIdentifier>(o.Class)).ToArray();
+        // A path in each class's state, in OverlayClasses' order; a downloading file (Café) counts as online only
+        string[] paths = [@"M:\Docs\a.docx", @"Z:\Plan.xlsx", @"M:\Docs", @"M:\Docs\b.docx"];
         for (var i = 0; i < overlays.Length; i++)
         {
             var file = new StringBuilder(1024);
             Assert.Equal(0, overlays[i].GetOverlayInfo(file, file.Capacity, out var index, out var infoFlags));
             Assert.Equal(ShellDll.Path, file.ToString(), ignoreCase: true);
-            Assert.Equal(i, index);
+            Assert.Equal(OverlayClasses[i].State - 1, index);
             Assert.Equal(3u, infoFlags); // ISIOI_ICONFILE | ISIOI_ICONINDEX
             for (var j = 0; j < paths.Length; j++)
             {
                 var attributes = paths[j] == @"M:\Docs" ? 0x10u : 0x80u;
                 Assert.Equal(i == j ? 0 : 1, overlays[i].IsMemberOf(paths[j], attributes));
             }
+            Assert.Equal(OverlayClasses[i].State == OnlineOnly ? 0 : 1, overlays[i].IsMemberOf(@"M:\Café\Menu.pdf", 0x80u));
         }
         var priorities = overlays.Select(o => o.GetPriority(out var p) == 0 ? p : -1).ToArray();
-        Assert.Equal(priorities.Min(), priorities[Problem - 1]);
+        Assert.Equal(priorities.Min(), priorities[Array.FindIndex(OverlayClasses, o => o.State == Problem)]);
+        Assert.Equal(unchecked((int)0x80040111), ShellDll.GetClassObject(DownloadingClass, new Guid("00000001-0000-0000-C000-000000000046"))); // CLASS_E_CLASSNOTAVAILABLE
     }
 
     [ShellFact]

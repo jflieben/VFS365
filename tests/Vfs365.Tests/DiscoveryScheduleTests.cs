@@ -48,7 +48,6 @@ public sealed class DiscoveryScheduleTests
         Assert.NotNull(result.SearchError);
         Assert.Equal(["Finance", "HR", "Sales"], kept.Libraries.Select(l => l.ListId).Order());
         Assert.Equal(previous.RunAt, kept.RunAt); // not "read just now"
-        Assert.Null(RefreshRule.Blocked(Now, DiscoverySchedule.LibrariesReadAt(kept, DriveScope.SharePoint), null, running: false));
         Assert.InRange(DiscoverySchedule.AfterFailure(1, hasLibraries: true, new Random(1)), TimeSpan.FromMinutes(15), TimeSpan.FromMinutes(60));
     }
 
@@ -72,7 +71,7 @@ public sealed class DiscoveryScheduleTests
     }
 
     [Fact]
-    public void A_start_after_an_interrupted_first_run_discovers_at_once_and_may_refresh()
+    public void A_start_after_an_interrupted_first_run_discovers_at_once()
     {
         // First start: the OneDrive is read and the placeholder saved; the PC restarts before discovery ends
         var placeholder = SavedAndRead(DiscoverySchedule.Placeholder(OneDrive, "contoso", DriveScope.SharePoint, Now));
@@ -81,7 +80,6 @@ public sealed class DiscoveryScheduleTests
         Assert.False(DiscoverySchedule.Recent(placeholder, DriveScope.SharePoint, secondStart));
         Assert.False(DiscoverySchedule.Recent(placeholder, DriveScope.All, secondStart));
         Assert.Equal(TimeSpan.Zero, DiscoverySchedule.StartWait(recent: false, Random.Shared));
-        Assert.Null(RefreshRule.Blocked(secondStart, DiscoverySchedule.LibrariesReadAt(placeholder, DriveScope.SharePoint), null, running: false));
 
         // A placeholder of an earlier version has the first start's time: without libraries it isn't recent either
         var earlier = placeholder with { RunAt = Now };

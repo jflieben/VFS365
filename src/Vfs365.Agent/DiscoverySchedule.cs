@@ -7,8 +7,8 @@ namespace Vfs365.Agent;
 /// When the mounted agent discovers and what a run means. A start with a recent state (under a week old, with libraries) shows it and
 /// waits 5 to 90 minutes, so a tenant's sign-ins don't all discover at once; any other start discovers at once. Then daily, plus up to
 /// 2 hours. A run whose search failed, also partly, is a failure: its libraries are kept (nothing is hidden on an incomplete search),
-/// its time isn't (the next start and Refresh don't take it as recent), and it is tried again in 15 to 60 minutes, sooner while there
-/// are no libraries at all.
+/// its time isn't (the next start doesn't take it as recent), and it is tried again in 15 to 60 minutes, sooner while there are no
+/// libraries at all.
 /// </summary>
 public static class DiscoverySchedule
 {
@@ -16,7 +16,7 @@ public static class DiscoverySchedule
 
     /// <summary>
     /// A first start's state before any discovery: the OneDrive it just read. In OneDrive scope that is all discovery reads; with sites
-    /// RunAt is MinValue (never discovered), so a start after an interrupted first run discovers at once and Refresh isn't held back.
+    /// RunAt is MinValue (never discovered), so a start after an interrupted first run discovers at once.
     /// </summary>
     public static DiscoveryState Placeholder(MyDrive oneDrive, string tenantHint, DriveScope scope, DateTimeOffset now) =>
         new(scope == DriveScope.OneDrive ? now : DateTimeOffset.MinValue, SharePointUrls.TenantRootFromOneDriveUrl(oneDrive.WebUrl), [],
@@ -27,9 +27,6 @@ public static class DiscoverySchedule
         now - state.RunAt < RecentState && (scope == DriveScope.OneDrive || state.Libraries.Count > 0);
 
     public static TimeSpan StartWait(bool recent, Random random) => recent ? TimeSpan.FromSeconds(random.Next(5 * 60, 90 * 60 + 1)) : TimeSpan.Zero;
-
-    /// <summary>When the libraries were last read, for Refresh's one-hour rule; MinValue in OneDrive scope, where only the daily rule applies.</summary>
-    public static DateTimeOffset LibrariesReadAt(DiscoveryState state, DriveScope scope) => scope == DriveScope.OneDrive ? DateTimeOffset.MinValue : state.RunAt;
 
     public static DateTimeOffset NextDay(DateTimeOffset now, Random random) => now + Daily + TimeSpan.FromMinutes(random.Next(0, 121));
 

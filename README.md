@@ -89,7 +89,7 @@ Right-click a file or folder in the drive (on Windows 11 under "Show more option
 
 ### Tray
 
-The tray icon follows the taskbar theme and shows whether everything is saved (plain), something is waiting to upload (amber) or needs attention (red). Its menu has Show files, Show log, Collect diagnostics (one zip for the helpdesk, tokens removed), Refresh, Restart, Sign in when needed, and Help (your own service desk page by policy). English or Dutch, by the Windows display language.
+The tray icon follows the taskbar theme and shows whether everything is saved (plain), something is waiting to upload (amber) or needs attention (red). Its menu has Show files, Show log, Collect diagnostics (one zip for the helpdesk, tokens removed), Restart, Sign in when needed, and Help (your own service desk page by policy). English or Dutch, by the Windows display language.
 
 <img src="assets/tray/preview.png" width="420" alt="Tray icons: normal, waiting and problem, for dark and light taskbars">
 

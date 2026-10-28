@@ -80,7 +80,7 @@ public sealed class SharedWithMeService(ISharedWithMeApi api, SharedOptions? opt
 {
     readonly SharedOptions options = options ?? new SharedOptions();
 
-    /// <param name="recheck">Read every item's path and rights again (Refresh in the tray).</param>
+    /// <param name="recheck">Read every item's path and rights again (vfs365 shared).</param>
     public async Task<SharedResult> RunAsync(string user, string ownDriveId, SharedState? previous, bool recheck, CancellationToken ct)
     {
         var before = (previous?.Items ?? []).ToDictionary(i => i.Key, StringComparer.Ordinal);

@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.7.3
+
+- The tray menu no longer has Refresh. Discovery still runs at each start and daily, and folders stay current through the change feeds.
+- Status icons in Explorer now show next to OneDrive: Explorer loads only 11 overlay handlers and OneDrive registers 7, so the fifth VFS365 handler (online only, the most common one) never loaded. There are four now: problem, uploading, online only and on this device. A file that is downloading shows online only. Explorer picks up the change after the next sign-in.
+
 ## 0.7.2
 
 - Searching the drive uses Microsoft 365: a search in Explorer's search box on the drive no longer reads every folder from Microsoft 365 (which got whole tenants throttled). Once the words stop changing, VFS365 sends the window back to the folder and opens SharePoint search in the browser with the same words, limited to that folder, library or site; the browser comes to the front and a notification says the results are there. Filters SharePoint doesn't know (`kind:`, dates) are left out; `ext:` and `type:` become `filetype:`. Policy `ExplorerSearch`: `Browser` (default), `Stop` (only stop the search and say how to search instead) or `Allow` (Explorer reads the folders itself, as before).

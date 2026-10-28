@@ -7,17 +7,13 @@ namespace Vfs365.Agent;
 public enum TrayState { Normal, Waiting, Error }
 
 /// <summary>
-/// What the tray menu offers; an item shows only when its action is set. ShowFiles: what Show files opens. RefreshBlocked: null when
-/// Refresh is allowed now, else why not (the hint); RefreshLabel: the item's text. SignIn shows while SignInNeeded says so.
-/// SessionEnded runs when Windows ends the session (it may block until pending changes are uploaded).
+/// What the tray menu offers; an item shows only when its action is set. ShowFiles: what Show files opens. SignIn shows while
+/// SignInNeeded says so. SessionEnded runs when Windows ends the session (it may block until pending changes are uploaded).
 /// </summary>
 public sealed record TrayActions(string HelpUrl)
 {
     public string? ShowFiles { get; init; }
     public Action? Restart { get; init; }
-    public Action? Refresh { get; init; }
-    public Func<string?>? RefreshBlocked { get; init; }
-    public Func<string>? RefreshLabel { get; init; }
     public Action? Retry { get; init; }
     public Action? SignIn { get; init; }
     public Func<bool>? SignInNeeded { get; init; }
@@ -39,7 +35,7 @@ sealed class Tray : IDisposable
     const uint NinSelect = 0x0400, NinKeySelect = 0x0401, NinBalloonUserClick = 0x0405, WmLButtonDblClk = 0x0203;
     const uint NimAdd = 0, NimModify = 1, NimDelete = 2, NimSetVersion = 4, NifMessage = 1, NifIcon = 2, NifTip = 4, NifInfo = 0x10, NifShowTip = 0x80;
     const uint NiifUser = 4, NiifLargeIcon = 0x20, MfString = 0, MfGrayed = 1, MfSeparator = 0x800, TpmReturnCmd = 0x100, TpmRightButton = 2;
-    const int ShowFiles = 1, ShowLog = 2, Restart = 3, Help = 4, Website = 5, Refresh = 6, SignIn = 7, Retry = 8, Diagnostics = 9, Search = 10;
+    const int ShowFiles = 1, ShowLog = 2, Restart = 3, Help = 4, Website = 5, SignIn = 7, Retry = 8, Diagnostics = 9, Search = 10;
     public const string JSolveUrl = "https://jsolve.nl";
 
     readonly string label;
@@ -53,11 +49,6 @@ sealed class Tray : IDisposable
     uint taskbarCreated;
     volatile string status;
     TrayState state = TrayState.Normal;
-
-    /// <summary>The hint window shown while the pointer is on a greyed-out Refresh, and the open menu with Refresh's position in it.</summary>
-    IntPtr tooltip, openMenu;
-    int refreshPosition = -1;
-    string? refreshBlocked;
 
     /// <summary>What a click on the last notification does (sign in), if anything; and when the files were last opened by a click.</summary>
     volatile Action? notificationClicked;
@@ -96,7 +87,7 @@ sealed class Tray : IDisposable
         Post(UpdateTipMessage);
     }
 
-    /// <summary>What the menu offers from now on (a start that waits offers Retry, a mounted drive Show files and Refresh).</summary>
+    /// <summary>What the menu offers from now on (a start that waits offers Retry, a mounted drive Show files and Restart).</summary>
     public TrayActions Actions
     {
         get => actions;
@@ -157,7 +148,6 @@ sealed class Tray : IDisposable
     }
 
     const uint ReloadIconMessage = 0x0400 + 2, BlockShutdownMessage = 0x0400 + 3, UpdateTipMessage = 0x0400 + 4, NotifyMessage = 0x0400 + 5;
-    const uint WmMenuSelect = 0x011F, WmExitMenuLoop = 0x0212;
 
     void Run()
     {
@@ -180,7 +170,6 @@ sealed class Tray : IDisposable
             ExtractIconEx(Environment.ProcessPath!, 0, out balloonIcon, IntPtr.Zero, 1);
             LoadIcon();
             Add();
-            CreateTooltip();
         }
         catch (Exception e)
         {
@@ -222,16 +211,6 @@ sealed class Tray : IDisposable
     {
         try
         {
-            if (hwnd != window && window != IntPtr.Zero)
-            {
-                // The hint window: it only paints itself
-                if (message == WmPaint)
-                {
-                    PaintHint(hwnd);
-                    return IntPtr.Zero;
-                }
-                return DefWindowProc(hwnd, message, wParam, lParam);
-            }
             if (message == CallbackMessage)
             {
                 // Version 4: the event in lParam's low word, the anchor point (icon or pointer) in wParam
@@ -302,25 +281,6 @@ sealed class Tray : IDisposable
                 actions.SessionEnded?.Invoke();
                 return IntPtr.Zero;
             }
-            if (message == WmMenuSelect)
-            {
-                // Sent for disabled items too: explain a greyed-out Refresh while the pointer or keyboard is on it
-                var item = (int)(wParam.ToInt64() & 0xFFFF);
-                if (item == Refresh && refreshBlocked is not null && openMenu != IntPtr.Zero && lParam == openMenu)
-                {
-                    ShowTooltip(refreshBlocked);
-                }
-                else
-                {
-                    HideTooltip();
-                }
-                return IntPtr.Zero;
-            }
-            if (message == WmExitMenuLoop)
-            {
-                HideTooltip();
-                return IntPtr.Zero;
-            }
             if (message == WmSettingChange && lParam != IntPtr.Zero && Marshal.PtrToStringUni(lParam) == "ImmersiveColorSet")
             {
                 // Light or dark taskbar switched
@@ -366,14 +326,8 @@ sealed class Tray : IDisposable
     void ShowMenu(int x, int y)
     {
         var current = actions;
-        refreshBlocked = current.Refresh is null ? null : current.RefreshBlocked?.Invoke();
         var menu = CreatePopupMenu();
-        var position = 0;
-        void Item(uint flags, int id, string? text)
-        {
-            AppendMenu(menu, flags, id, text);
-            position++;
-        }
+        void Item(uint flags, int id, string? text) => AppendMenu(menu, flags, id, text);
         Item(MfString | MfGrayed, 0, UiText.Get("Menu.Status", status.Replace("&", "&&")));
         Item(MfSeparator, 0, null);
         if (current.SignIn is not null && current.SignInNeeded?.Invoke() == true)
@@ -397,12 +351,6 @@ sealed class Tray : IDisposable
         {
             Item(MfString, Diagnostics, UiText.Get("Menu.Diagnostics"));
         }
-        refreshPosition = -1;
-        if (current.Refresh is not null)
-        {
-            refreshPosition = position;
-            Item(MfString | (refreshBlocked is null ? 0 : MfGrayed), Refresh, current.RefreshLabel?.Invoke() ?? UiText.Get("Menu.Refresh"));
-        }
         if (current.Restart is not null)
         {
             Item(MfString, Restart, UiText.Get("Menu.Restart"));
@@ -417,10 +365,7 @@ sealed class Tray : IDisposable
             (x, y) = (pointer.X, pointer.Y);
         }
         SetForegroundWindow(window);
-        openMenu = menu;
         var command = TrackPopupMenu(menu, TpmReturnCmd | TpmRightButton, x, y, 0, window, IntPtr.Zero);
-        openMenu = IntPtr.Zero;
-        HideTooltip();
         DestroyMenu(menu);
         switch (command)
         {
@@ -435,9 +380,6 @@ sealed class Tray : IDisposable
                 break;
             case Search:
                 current.Search?.Invoke();
-                break;
-            case Refresh:
-                current.Refresh?.Invoke();
                 break;
             case Restart:
                 current.Restart?.Invoke();
@@ -456,78 +398,6 @@ sealed class Tray : IDisposable
                 break;
         }
     }
-
-    // The hint beside a greyed-out Refresh. Standard menus have no tooltips, and the common controls tooltip crashed in this process
-    // (comctl32 5.82 on ARM64), so this is a plain popup window painted with user32 and gdi32 only.
-    const string HintClass = "VFS365.Hint";
-    const int HintPadding = 6;
-    IntPtr hintFont;
-    string hintText = "";
-
-    void CreateTooltip()
-    {
-        var hintClass = new WNDCLASSEX
-        {
-            cbSize = Marshal.SizeOf<WNDCLASSEX>(),
-            lpfnWndProc = Marshal.GetFunctionPointerForDelegate(procedure),
-            hInstance = GetModuleHandle(null),
-            lpszClassName = HintClass,
-        };
-        RegisterClassEx(ref hintClass);
-        // WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, WS_POPUP | WS_BORDER
-        tooltip = CreateWindowEx(0x8 | 0x80 | 0x08000000, HintClass, "", 0x80000000 | 0x00800000, 0, 0, 0, 0, window, IntPtr.Zero, GetModuleHandle(null), IntPtr.Zero);
-        hintFont = CreateFont(-MulDiv(9, (int)GetDpiForSystem(), 72), 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5, 0, "Segoe UI"); // DEFAULT_CHARSET, CLEARTYPE_QUALITY
-    }
-
-    /// <summary>Shows <paramref name="text"/> beside the Refresh item, to the left of the menu (the tray sits at the screen's edge), else to its right.</summary>
-    void ShowTooltip(string text)
-    {
-        if (tooltip == IntPtr.Zero || hintFont == IntPtr.Zero || !GetMenuItemRect(window, openMenu, (uint)refreshPosition, out var item))
-        {
-            return;
-        }
-        hintText = text;
-        var bounds = new RECT { Right = MulDiv(320, (int)GetDpiForSystem(), 96) };
-        var dc = GetDC(tooltip);
-        var previous = SelectObject(dc, hintFont);
-        DrawText(dc, hintText, -1, ref bounds, DtWordBreak | DtNoPrefix | DtCalcRect);
-        SelectObject(dc, previous);
-        ReleaseDC(tooltip, dc);
-        var width = bounds.Right + 2 * HintPadding + 2;
-        var height = bounds.Bottom + 2 * HintPadding + 2;
-
-        var monitor = new MONITORINFO { cbSize = Marshal.SizeOf<MONITORINFO>() };
-        GetMonitorInfo(MonitorFromRect(ref item, 2), ref monitor); // MONITOR_DEFAULTTONEAREST
-        var x = item.Left - width - 4 >= monitor.rcWork.Left ? item.Left - width - 4 : item.Right + 4;
-        var y = Math.Min(item.Top, monitor.rcWork.Bottom - height);
-        SetWindowPos(tooltip, new IntPtr(-1), x, y, width, height, 0x10 | 0x40); // HWND_TOPMOST, SWP_NOACTIVATE | SWP_SHOWWINDOW
-        InvalidateRect(tooltip, IntPtr.Zero, true);
-    }
-
-    void HideTooltip()
-    {
-        if (tooltip != IntPtr.Zero)
-        {
-            ShowWindow(tooltip, 0);
-        }
-    }
-
-    void PaintHint(IntPtr hwnd)
-    {
-        GetClientRect(hwnd, out var client);
-        var dc = GetDC(hwnd);
-        FillRect(dc, ref client, GetSysColorBrush(24)); // COLOR_INFOBK
-        SetBkMode(dc, 1); // TRANSPARENT
-        SetTextColor(dc, GetSysColor(23)); // COLOR_INFOTEXT
-        var previous = SelectObject(dc, hintFont);
-        var text = new RECT { Left = HintPadding, Top = HintPadding, Right = client.Right - HintPadding, Bottom = client.Bottom - HintPadding };
-        DrawText(dc, hintText, -1, ref text, DtWordBreak | DtNoPrefix);
-        SelectObject(dc, previous);
-        ReleaseDC(hwnd, dc);
-        ValidateRect(hwnd, IntPtr.Zero);
-    }
-
-    const uint DtWordBreak = 0x10, DtCalcRect = 0x400, DtNoPrefix = 0x800, WmPaint = 0x000F;
 
     /// <summary>A shell location (shell:::{CLSID}, path) in Explorer, or a URL in the default browser.</summary>
     void Open(string target)
@@ -611,10 +481,6 @@ sealed class Tray : IDisposable
                 DestroyIcon(handle);
             }
         }
-        if (hintFont != IntPtr.Zero)
-        {
-            DeleteObject(hintFont);
-        }
         ready.Dispose();
     }
 
@@ -664,82 +530,6 @@ sealed class Tray : IDisposable
         public int X;
         public int Y;
     }
-
-    [StructLayout(LayoutKind.Sequential)]
-    struct RECT
-    {
-        public int Left, Top, Right, Bottom;
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    struct MONITORINFO
-    {
-        public int cbSize;
-        public RECT rcMonitor;
-        public RECT rcWork;
-        public uint dwFlags;
-    }
-
-    [DllImport("user32.dll")]
-    static extern IntPtr GetDC(IntPtr hwnd);
-
-    [DllImport("user32.dll")]
-    static extern int ReleaseDC(IntPtr hwnd, IntPtr dc);
-
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
-    static extern int DrawText(IntPtr dc, string text, int length, ref RECT rect, uint format);
-
-    [DllImport("user32.dll")]
-    static extern int FillRect(IntPtr dc, ref RECT rect, IntPtr brush);
-
-    [DllImport("user32.dll")]
-    static extern IntPtr GetSysColorBrush(int index);
-
-    [DllImport("user32.dll")]
-    static extern uint GetSysColor(int index);
-
-    [DllImport("user32.dll")]
-    static extern bool GetClientRect(IntPtr hwnd, out RECT rect);
-
-    [DllImport("user32.dll")]
-    static extern bool InvalidateRect(IntPtr hwnd, IntPtr rect, bool erase);
-
-    [DllImport("user32.dll")]
-    static extern bool ValidateRect(IntPtr hwnd, IntPtr rect);
-
-    [DllImport("user32.dll")]
-    static extern bool ShowWindow(IntPtr hwnd, int command);
-
-    [DllImport("gdi32.dll", CharSet = CharSet.Unicode)]
-    static extern IntPtr CreateFont(int height, int width, int escapement, int orientation, int weight, uint italic, uint underline, uint strikeOut,
-        uint charSet, uint outputPrecision, uint clipPrecision, uint quality, uint pitchAndFamily, string face);
-
-    [DllImport("gdi32.dll")]
-    static extern IntPtr SelectObject(IntPtr dc, IntPtr gdiObject);
-
-    [DllImport("gdi32.dll")]
-    static extern bool DeleteObject(IntPtr gdiObject);
-
-    [DllImport("gdi32.dll")]
-    static extern int SetBkMode(IntPtr dc, int mode);
-
-    [DllImport("gdi32.dll")]
-    static extern uint SetTextColor(IntPtr dc, uint color);
-
-    [DllImport("user32.dll")]
-    static extern bool GetMenuItemRect(IntPtr hwnd, IntPtr menu, uint item, out RECT rect);
-
-    [DllImport("user32.dll")]
-    static extern IntPtr MonitorFromRect(ref RECT rect, uint flags);
-
-    [DllImport("user32.dll")]
-    static extern bool GetMonitorInfo(IntPtr monitor, ref MONITORINFO info);
-
-    [DllImport("user32.dll")]
-    static extern bool SetWindowPos(IntPtr hwnd, IntPtr after, int x, int y, int width, int height, uint flags);
-
-    [DllImport("kernel32.dll")]
-    static extern int MulDiv(int number, int numerator, int denominator);
 
     [StructLayout(LayoutKind.Sequential)]
     struct MSG

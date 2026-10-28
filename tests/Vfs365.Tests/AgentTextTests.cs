@@ -31,9 +31,9 @@ public sealed class AgentTextTests
     [Fact]
     public void Dutch_for_dutch_windows_english_otherwise()
     {
-        Assert.Equal("&Vernieuwen", UiText.Get(CultureInfo.GetCultureInfo("nl-NL"), "Menu.Refresh"));
-        Assert.Equal("&Refresh", UiText.Get(CultureInfo.GetCultureInfo("de-DE"), "Menu.Refresh"));
-        Assert.Equal("&Refresh", UiText.Get(CultureInfo.InvariantCulture, "Menu.Refresh"));
+        Assert.Equal("&Aanmelden", UiText.Get(CultureInfo.GetCultureInfo("nl-NL"), "Menu.SignIn"));
+        Assert.Equal("S&ign in", UiText.Get(CultureInfo.GetCultureInfo("de-DE"), "Menu.SignIn"));
+        Assert.Equal("S&ign in", UiText.Get(CultureInfo.InvariantCulture, "Menu.SignIn"));
         Assert.Equal("3 wijziging(en) wachten op uploaden", UiText.Get(Dutch, "Status.Waiting", 3));
     }
 

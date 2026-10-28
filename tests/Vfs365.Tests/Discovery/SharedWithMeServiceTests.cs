@@ -91,7 +91,7 @@ public sealed class SharedWithMeServiceTests
         await Service().RunAsync("u@x.com", "b!me", second.State, false, default);
         Assert.Equal(1, api.Lookups);
 
-        // After a week, or on Refresh, every item
+        // After a week, or with recheck, every item
         now += TimeSpan.FromDays(8);
         api.Lookups = 0;
         await Service().RunAsync("u@x.com", "b!me", second.State, false, default);

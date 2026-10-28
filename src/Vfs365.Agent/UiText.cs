@@ -3,7 +3,7 @@ using System.Globalization;
 namespace Vfs365.Agent;
 
 /// <summary>
-/// What users read in the tray menu, its tooltip, notifications and the Refresh hint, in English and Dutch. Dutch for a Dutch Windows
+/// What users read in the tray menu, its tooltip and notifications, in English and Dutch. Dutch for a Dutch Windows
 /// display language (CultureInfo.CurrentUICulture), English otherwise. Log lines and monitoring stay English.
 /// </summary>
 public static class UiText
@@ -15,20 +15,15 @@ public static class UiText
         ["Menu.ShowFiles"] = ("&Show files", "&Bestanden weergeven"),
         ["Menu.ShowLog"] = ("Show &log", "&Logboek weergeven"),
         ["Menu.Diagnostics"] = ("Collect &diagnostics", "&Diagnosegegevens verzamelen"),
-        ["Menu.Refresh"] = ("&Refresh", "&Vernieuwen"),
-        ["Menu.RefreshFrom"] = ("&Refresh (from {0})", "&Vernieuwen (vanaf {0})"),
-        ["Menu.RefreshRunning"] = ("&Refresh (running)", "&Vernieuwen (bezig)"),
         ["Menu.Restart"] = ("Res&tart", "&Opnieuw starten"), // shown only once mounted, Retry only before: they never share T
         ["Menu.SignIn"] = ("S&ign in", "&Aanmelden"),
         ["Menu.Retry"] = ("Re&try", "Opnieuw &proberen"),
         ["Menu.Help"] = ("&Help", "&Help"),
         ["Menu.Version"] = ("VFS365 {0} by JSolve B.V.", "VFS365 {0} van JSolve B.V."),
-        ["Tomorrow"] = ("tomorrow {0}", "morgen {0}"),
 
         // Status, also the tooltip ("VFS365: up to date")
         ["Status.Starting"] = ("starting", "wordt gestart"),
         ["Status.UpToDate"] = ("up to date", "bijgewerkt"),
-        ["Status.Refreshing"] = ("refreshing", "vernieuwen"),
         ["Status.Waiting"] = ("{0} change(s) waiting to upload", "{0} wijziging(en) wachten op uploaden"),
         ["Status.SignIn"] = ("sign-in needed", "aanmelden nodig"),
         ["Status.Offline"] = ("offline", "offline"),
@@ -67,12 +62,6 @@ public static class UiText
         ["Uploaded.Title"] = ("Uploaded", "Geüpload"),
         ["Uploaded.One"] = ("{0} is saved to Microsoft 365.", "{0} is opgeslagen in Microsoft 365."),
         ["Uploaded.Many"] = ("{0} waiting files are saved to Microsoft 365.", "{0} wachtende bestanden zijn opgeslagen in Microsoft 365."),
-        ["Refreshed.Title"] = ("Refreshed", "Vernieuwd"),
-        ["Refreshed.Folders"] = ("Folders update as you open them.", "Mappen worden bijgewerkt zodra u ze opent."),
-        ["Refreshed.Libraries"] = ("{0} libraries found. Folders update as you open them.", "{0} bibliotheken gevonden. Mappen worden bijgewerkt zodra u ze opent."),
-        ["RefreshFailed.Title"] = ("Refresh failed", "Vernieuwen mislukt"),
-        ["RefreshFailed.Text"] = ("Refresh failed: {0}. The libraries you had stay; you can try again.",
-            "Vernieuwen mislukt: {0}. Uw bibliotheken blijven staan; u kunt het opnieuw proberen."),
         ["SignIn.Title"] = ("Sign-in needed", "Aanmelden nodig"),
         ["SignIn.Text"] = ("VFS365 couldn't sign you in by itself: {0}. Click here, or choose Sign in in the VFS365 menu.",
             "VFS365 kon u niet zelf aanmelden: {0}. Klik hier, of kies Aanmelden in het VFS365-menu."),
@@ -174,14 +163,6 @@ public static class UiText
         ["Aad.Cancelled"] = ("sign-in was cancelled", "aanmelden is geannuleerd"),
         ["Aad.Unavailable"] = ("Windows' sign-in (Web Account Manager) isn't working", "de aanmelding van Windows (Web Account Manager) werkt niet"),
         ["Aad.Other"] = ("sign-in failed", "aanmelden is mislukt"),
-
-        // Refresh hint (RefreshRule)
-        ["Refresh.Running"] = ("Refreshing now.", "Wordt nu vernieuwd."),
-        ["Refresh.Daily"] = ("Refresh works once a day. You refreshed at {0}{1}; you can again from {2}.",
-            "Vernieuwen kan één keer per dag. U hebt vernieuwd om {0}{1}; u kunt het weer vanaf {2}."),
-        ["Refresh.Yesterday"] = (" yesterday", " gisteren"),
-        ["Refresh.Recent"] = ("Your libraries were read {0} minute(s) ago. Refresh works when that is more than an hour ago: from {1}.",
-            "Uw bibliotheken zijn {0} minuut/minuten geleden gelezen. Vernieuwen kan als dat meer dan een uur geleden is: vanaf {1}."),
     };
 
     public static IReadOnlyCollection<string> Keys => Table.Keys;

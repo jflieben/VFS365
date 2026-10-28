@@ -1,7 +1,8 @@
 // VFS365 shell extension (vfs365shell.dll):
 // - the VFS365 submenu in Windows 11's context menu (IExplorerCommand), registered by the sparse package JSolve.VFS365.Shell
 //   (package\AppxManifest.xml) and shown only on items of the volume;
-// - Explorer's overlay icons (IShellIconOverlayIdentifier, five classes), registered by the MSI.
+// - Explorer's overlay icons (IShellIconOverlayIdentifier, four classes), registered by the MSI. Explorer loads only the first 11
+//   overlay handlers in name order (it keeps 4 of its 15 slots), and OneDrive registers 7: a fifth class would never load.
 // Both answer from the agent's shared section (Local\VFS365.Shell.<user SID>) and never touch the volume: Explorer asks for every
 // item it shows, also on other drives. Built with Zig (zig cc) by build.ps1, without a C runtime.
 
@@ -26,7 +27,8 @@
 #define FLAG_OVERLAYS 0x2u
 #define SLOT_SIZE 16u
 
-// Overlay states: the section's slot states, plus 5 for a file the section doesn't list
+// Overlay states: the section's slot states, plus 5 for a file the section doesn't list. A downloading file shows online only (no
+// class of its own); icon 3 in vfs365shell.rc stays so icon indexes stay state - 1.
 #define STATE_NONE 0
 #define STATE_CACHED 1
 #define STATE_UPLOADING 2
@@ -34,6 +36,7 @@
 #define STATE_PROBLEM 4
 #define STATE_ONLINE_ONLY 5
 #define STATES 5
+#define OVERLAY_CLASSES 4
 
 // Longer paths get no menu or overlay; longer roots are ignored
 #define MAX_CHARS 4096
@@ -44,7 +47,7 @@
 // The section is retried, and the agent's process checked, at most this often
 #define RETRY_MS 2000
 #define ALIVE_MS 2000
-// Explorer asks each of the five overlay classes in turn: one lookup serves them for this long
+// Explorer asks each of the overlay classes in turn: one lookup serves them for this long
 #define CACHE_MS 1000
 
 static HINSTANCE Module;
@@ -75,11 +78,10 @@ static const GUID IidEnumExplorerCommand = { 0xA88826F8, 0x186F, 0x4987, { 0xAA,
 static const GUID IidOverlayIdentifier = { 0x0C6C4200, 0xC589, 0x11D0, { 0x99, 0x9A, 0x00, 0xC0, 0x4F, 0xD6, 0x55, 0xE1 } };
 
 // Class IDs: the menu's is in package\AppxManifest.xml, the overlays' in installer\Package.wxs
-static const GUID Classes[1 + STATES] = {
+static const GUID Classes[1 + OVERLAY_CLASSES] = {
     { 0xA7AED2F3, 0xB922, 0x46C7, { 0xBB, 0xAB, 0x64, 0xB9, 0x86, 0x06, 0x1C, 0x74 } }, // menu
     { 0x9DB55147, 0xCB02, 0x47F4, { 0xA3, 0x86, 0xE0, 0xEE, 0x3D, 0x55, 0x60, 0x21 } }, // Cached
     { 0xB7C851F1, 0x2B15, 0x49B3, { 0xB3, 0x0E, 0x76, 0x90, 0x11, 0xCF, 0x84, 0xD2 } }, // Uploading
-    { 0x372835A3, 0x0CA9, 0x4E2C, { 0x93, 0x6E, 0x42, 0x82, 0x71, 0x49, 0xC0, 0x31 } }, // Downloading
     { 0x446CAE69, 0xA613, 0x4F61, { 0xB3, 0x3B, 0x68, 0x45, 0x71, 0x5E, 0xF0, 0xE8 } }, // Problem
     { 0x04668249, 0x3350, 0x4510, { 0x96, 0x29, 0x81, 0x44, 0x08, 0xAA, 0x98, 0xD3 } }, // OnlineOnly
 };
@@ -493,7 +495,9 @@ static int OverlayState(LPCWSTR path, DWORD attributes)
             LONG sequence = 0;
             if (Ask(upper, length, TRUE, &answer, &sequence) && (answer.Flags & FLAG_OVERLAYS) && answer.OnVolume)
             {
-                if (answer.State > 0)
+                if (answer.State == STATE_DOWNLOADING)
+                    state = directory ? STATE_NONE : STATE_ONLINE_ONLY;
+                else if (answer.State > 0)
                     state = answer.State;
                 else if (answer.State == STATE_NONE && !directory)
                     state = STATE_ONLINE_ONLY;
@@ -1015,9 +1019,8 @@ static COMMAND Commands[1 + VERB_COUNT] = {
     { &CommandVtbl, 8 },
 };
 
-static OVERLAY Overlays[STATES] = {
-    { &OverlayVtbl, STATE_CACHED }, { &OverlayVtbl, STATE_UPLOADING }, { &OverlayVtbl, STATE_DOWNLOADING },
-    { &OverlayVtbl, STATE_PROBLEM }, { &OverlayVtbl, STATE_ONLINE_ONLY },
+static OVERLAY Overlays[OVERLAY_CLASSES] = {
+    { &OverlayVtbl, STATE_CACHED }, { &OverlayVtbl, STATE_UPLOADING }, { &OverlayVtbl, STATE_PROBLEM }, { &OverlayVtbl, STATE_ONLINE_ONLY },
 };
 
 // Class factories: one per class ID, index into Classes
@@ -1072,8 +1075,8 @@ static const IClassFactoryVtbl FactoryVtbl = {
     FactoryLockServer,
 };
 
-static FACTORY Factories[1 + STATES] = {
-    { &FactoryVtbl, 0 }, { &FactoryVtbl, 1 }, { &FactoryVtbl, 2 }, { &FactoryVtbl, 3 }, { &FactoryVtbl, 4 }, { &FactoryVtbl, 5 },
+static FACTORY Factories[1 + OVERLAY_CLASSES] = {
+    { &FactoryVtbl, 0 }, { &FactoryVtbl, 1 }, { &FactoryVtbl, 2 }, { &FactoryVtbl, 3 }, { &FactoryVtbl, 4 },
 };
 
 EXPORT HRESULT WINAPI DllGetClassObject(REFCLSID clsid, REFIID iid, LPVOID *object)
@@ -1081,7 +1084,7 @@ EXPORT HRESULT WINAPI DllGetClassObject(REFCLSID clsid, REFIID iid, LPVOID *obje
     if (!object)
         return E_POINTER;
     *object = NULL;
-    for (int i = 0; i < 1 + STATES; i++)
+    for (int i = 0; i < 1 + OVERLAY_CLASSES; i++)
     {
         if (SameGuid(clsid, &Classes[i]))
             return FactoryQueryInterface((IClassFactory *)&Factories[i], iid, object);

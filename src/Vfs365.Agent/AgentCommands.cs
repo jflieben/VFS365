@@ -1168,16 +1168,14 @@ public static class AgentCommands
                 }
             }
 
-            // Discovery runs one at a time: at the start (after a wait when the last run's state is recent), daily, and on Refresh in the tray
+            // Discovery runs one at a time: at the start (after a wait when the last run's state is recent), then daily
             var discoveryGate = new SemaphoreSlim(1, 1);
-            using var startupDiscovery = new CancellationTokenSource();
-            var refreshing = false;
             var accountChanged = false;
             var nextDiscovery = DateTimeOffset.MaxValue;
             var discoveryFailures = 0;
             DateTimeOffset NextDay() => DiscoverySchedule.NextDay(DateTimeOffset.UtcNow, Random.Shared);
 
-            // The agent's own state files (discovery state, folder listings, Refresh time): a failed write is logged once per cause and
+            // The agent's own state files (discovery state, folder listings): a failed write is logged once per cause and
             // tried again later; it never ends the agent or skips the saves after it
             var saveProblems = new Dictionary<string, string>(StringComparer.Ordinal);
             bool SaveQuietly(string what, Action save)
@@ -1445,8 +1443,8 @@ public static class AgentCommands
             }
 
             // A failed run (an error, or a search that failed even partly): logged and reported, tried again in 15 to 60 minutes, sooner
-            // without libraries. Returns why, in the display language (for Refresh).
-            string DiscoveryFailed(string message, string cause, bool network, bool searchFailed = false)
+            // without libraries.
+            void DiscoveryFailed(string message, string cause, bool network, bool searchFailed = false)
             {
                 var delay = DiscoverySchedule.AfterFailure(++discoveryFailures, settings.Scope == DriveScope.OneDrive || keeper.Current.Libraries.Count > 0, Random.Shared);
                 say($"Discovery:  failed, showing {(settings.Scope == DriveScope.OneDrive ? "the OneDrive" : $"{keeper.Current.Libraries.Count} libraries")} " +
@@ -1459,11 +1457,9 @@ public static class AgentCommands
                     networkFailedAt = DateTimeOffset.UtcNow;
                 }
                 nextDiscovery = DateTimeOffset.UtcNow + delay;
-                return PlainCause.Text(plain);
             }
 
-            // Null when it worked, else why not in the display language (for Refresh)
-            async Task<string?> DiscoverAsync(bool everything)
+            async Task DiscoverAsync()
             {
                 RequestPriority.MarkBackground();
                 await discoveryGate.WaitAsync();
@@ -1483,16 +1479,15 @@ public static class AgentCommands
                     else
                     {
                         var before = keeper.Current;
-                        var result = await new DiscoveryService(api, everything ? discoveryOptions with { MetadataMaxAge = TimeSpan.Zero } : discoveryOptions)
-                            .RunAsync(before, default, justRead, tokens.LastResult?.TenantId);
+                        var result = await new DiscoveryService(api, discoveryOptions).RunAsync(before, default, justRead, tokens.LastResult?.TenantId);
                         justRead = null;
-                        // A failed search keeps the libraries (nothing is hidden) but not the time: the next start and Refresh don't take it as recent
+                        // A failed search keeps the libraries (nothing is hidden) but not the time: the next start doesn't take it as recent
                         keeper.Replace(DiscoverySchedule.Keep(result, before) with { TenantHint = tenantHint });
                         SaveQuietly("the discovery report", () => DiscoveryReport.Record(result, before)); // for 'vfs365 why' and support bundles
                         if (result.OneDrive.DriveId != oneDrive.DriveId)
                         {
                             AccountChanged();
-                            return null;
+                            return;
                         }
                         engine.SetLibraries(keeper.Current.Libraries);
                         _ = Task.Run(ApplyLayoutAsync); // targets in libraries that only now are known
@@ -1504,19 +1499,19 @@ public static class AgentCommands
                         if (result.SearchError is { } searchError)
                         {
                             // "Search failed after N rows: <the request's error>": the cause is in the request's error
-                            return DiscoveryFailed(searchError, searchError.IndexOf(": ", StringComparison.Ordinal) is var at and >= 0 ? searchError[(at + 2)..] : searchError,
+                            DiscoveryFailed(searchError, searchError.IndexOf(": ", StringComparison.Ordinal) is var at and >= 0 ? searchError[(at + 2)..] : searchError,
                                 network: false, searchFailed: true);
+                            return;
                         }
                         say($"Libraries:  {result.Libraries.Count} from discovery in {watch.Elapsed.TotalSeconds:N1} s");
-                        _ = Task.Run(() => RefreshSharedAsync(recheck: everything));
+                        _ = Task.Run(RefreshSharedAsync);
                     }
                     discoveryFailures = 0;
                     nextDiscovery = NextDay();
-                    return null;
                 }
                 catch (Exception e) when (e is not OutOfMemoryException) // nothing cancels discovery: a timeout or a cancellation is a failure too
                 {
-                    return DiscoveryFailed(e.Message, e.Message, PlainCause.IsNetwork(e));
+                    DiscoveryFailed(e.Message, e.Message, PlainCause.IsNetwork(e));
                 }
                 finally
                 {
@@ -1525,12 +1520,12 @@ public static class AgentCommands
             }
 
             // Shared with me: one search call per run for most users (paths and rights only for new, moved or week-old items), one run at
-            // a time; after discovery (daily, and on Refresh with every item checked again) and when the folder is listed and the list is
-            // older than SharedListedAge. A failed run keeps the list and is tried again at the next of those.
+            // a time; after discovery (daily) and when the folder is listed and the list is older than SharedListedAge. A failed run keeps
+            // the list and is tried again at the next of those.
             var sharedGate = new SemaphoreSlim(1, 1);
             var sharedTriedTicks = DateTimeOffset.MinValue.UtcTicks;
             string? sharedProblem = null;
-            async Task RefreshSharedAsync(bool recheck)
+            async Task RefreshSharedAsync()
             {
                 if (!sharedShown || !await sharedGate.WaitAsync(0))
                 {
@@ -1547,7 +1542,7 @@ public static class AgentCommands
                     }
                     var user = tokens.LastResult?.Username ?? throw new IOException("the signed-in account's name is unknown");
                     var before = keeper.Current.Shared;
-                    var result = await new SharedWithMeService(new SharedWithMeApi(client)).RunAsync(user, oneDrive.DriveId, before, recheck, default);
+                    var result = await new SharedWithMeService(new SharedWithMeApi(client)).RunAsync(user, oneDrive.DriveId, before, recheck: false, default);
                     if (result.SearchError is { } error)
                     {
                         throw new IOException($"search failed: {error}");
@@ -1560,7 +1555,7 @@ public static class AgentCommands
                     }
                     var added = result.State.Items.Count(i => before?.Items.Any(b => b.Key == i.Key) != true);
                     var line = $"{result.State.Items.Count} item(s) from other people ({added} new, {result.State.Items.Count(i => i.IsFolder)} folder(s))";
-                    if (line != sharedProblem || added > 0 || recheck)
+                    if (line != sharedProblem || added > 0)
                     {
                         say($"Shared:     {line}, read in {watch.Elapsed.TotalSeconds:N1} s");
                     }
@@ -1590,47 +1585,9 @@ public static class AgentCommands
                 if (now - (keeper.Current.Shared?.RunAt ?? DateTimeOffset.MinValue) >= SharedListedAge
                     && now.UtcTicks - Volatile.Read(ref sharedTriedTicks) >= SharedListedAge.Ticks)
                 {
-                    _ = Task.Run(() => RefreshSharedAsync(recheck: false));
+                    _ = Task.Run(RefreshSharedAsync);
                 }
             };
-
-            DateTimeOffset LibrariesReadAt() => DiscoverySchedule.LibrariesReadAt(keeper.Current, settings.Scope);
-            string? RefreshBlocked() => RefreshRule.Blocked(DateTimeOffset.UtcNow, LibrariesReadAt(), DiscoveryStore.LastRefresh, refreshing);
-            string RefreshLabel() => RefreshRule.Label(DateTimeOffset.UtcNow, LibrariesReadAt(), DiscoveryStore.LastRefresh, refreshing);
-
-            // Refresh in the tray: every library's details and every folder are read again (folders when next opened), once a day at most;
-            // a refresh that fails doesn't count
-            void RefreshAll()
-            {
-                if (RefreshBlocked() is not null)
-                {
-                    return;
-                }
-                refreshing = true;
-                startupDiscovery.Cancel();
-                say("Refresh:    from the tray; libraries and folders are read again");
-                engine.ExpireListings();
-                tray?.SetStatus(UiText.Get("Status.Refreshing"), TrayState.Normal);
-                _ = Task.Run(async () =>
-                {
-                    try
-                    {
-                        if (await DiscoverAsync(everything: true) is { } failure)
-                        {
-                            tray?.Notify(UiText.Get("RefreshFailed.Title"), UiText.Get("RefreshFailed.Text", failure));
-                            return;
-                        }
-                        SaveQuietly("the Refresh time", () => DiscoveryStore.LastRefresh = DateTimeOffset.UtcNow);
-                        tray?.Notify(UiText.Get("Refreshed.Title"), settings.Scope == DriveScope.OneDrive
-                            ? UiText.Get("Refreshed.Folders")
-                            : UiText.Get("Refreshed.Libraries", keeper.Current.Libraries.Count));
-                    }
-                    finally
-                    {
-                        refreshing = false;
-                    }
-                });
-            }
 
             if (tray is not null)
             {
@@ -1640,9 +1597,6 @@ public static class AgentCommands
                     Retry = null,
                     ShowFiles = navigationPane ? $"shell:::{ExplorerLocation.Clsid}" : drive.DriveLetter is { } trayLetter ? trayLetter + "\\" : unc,
                     Restart = () => RestartAgent("from the tray"),
-                    Refresh = RefreshAll,
-                    RefreshBlocked = RefreshBlocked,
-                    RefreshLabel = RefreshLabel,
                 };
                 tray.SetStatus(UiText.Get("Status.UpToDate"), TrayState.Normal);
                 if (recovered > 0)
@@ -1892,19 +1846,12 @@ public static class AgentCommands
                     var wait = DiscoverySchedule.StartWait(recent, Random.Shared);
                     if (recent && settings.Scope != DriveScope.OneDrive)
                     {
-                        say($"Discovery:  in {wait.TotalMinutes:0} min; the libraries of the last run show until then (Refresh in the tray reads them now)");
+                        say($"Discovery:  in {wait.TotalMinutes:0} min; the libraries of the last run show until then");
                     }
                     _ = Task.Run(async () =>
                     {
-                        try
-                        {
-                            await Task.Delay(wait, startupDiscovery.Token);
-                        }
-                        catch (OperationCanceledException)
-                        {
-                            return; // a refresh from the tray ran instead
-                        }
-                        await DiscoverAsync(everything: false);
+                        await Task.Delay(wait);
+                        await DiscoverAsync();
                     });
                 }
 
@@ -1928,7 +1875,7 @@ public static class AgentCommands
                     }
                 }
                 Action saveDiscoveryState = keeper.SaveIfChanged; // made once: the tick allocates as little as it can
-                Func<Task> applyLayout = ApplyLayoutAsync, discover = () => DiscoverAsync(everything: false);
+                Func<Task> applyLayout = ApplyLayoutAsync, discover = DiscoverAsync;
                 Action checkDriveLetter = CheckDriveLetter, saveSnapshots = SaveSnapshotsIfChanged;
                 scheduler = Task.Run(async () =>
                 {
@@ -2045,7 +1992,6 @@ public static class AgentCommands
                                 tray.SetStatus(
                                     signIn ? UiText.Get("Status.SignIn")
                                         : offline ? waiting == 0 ? UiText.Get("Status.Offline") : UiText.Get("Status.OfflineWaiting", waiting)
-                                        : refreshing ? UiText.Get("Status.Refreshing")
                                         : waiting > 0 ? UiText.Get("Status.Waiting", waiting)
                                         : throttled ? UiText.Get("Status.Throttled")
                                         : UiText.Get("Status.UpToDate"),
@@ -2069,7 +2015,7 @@ public static class AgentCommands
                             {
                                 _ = Task.Run(applyLayout);
                             }
-                            if (now >= nextDiscovery && !refreshing)
+                            if (now >= nextDiscovery)
                             {
                                 // Daily, so a PC that sleeps instead of signing out still sees new and removed libraries
                                 nextDiscovery = DateTimeOffset.MaxValue;
