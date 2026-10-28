@@ -1278,5 +1278,9 @@ public sealed class WriteIntegrityTests : IDisposable
         catch (IOException)
         {
         }
+        catch (UnauthorizedAccessException)
+        {
+            // A file the engine's background work still has open (a cache adoption after the last save) holds its folder
+        }
     }
 }

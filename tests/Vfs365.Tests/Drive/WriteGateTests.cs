@@ -87,6 +87,26 @@ public sealed class WriteGateTests(ITestOutputHelper output) : IDisposable
 
     void Report(string what, TimeSpan time) => output.WriteLine($"{what}: {time.TotalMilliseconds:0} ms");
 
+    /// <summary>
+    /// Runs <paramref name="milliseconds"/> of slow network work and notes when, on the probe's clock: held under the gate, no create
+    /// could finish meanwhile. A busy runner (CI) only makes each create slower, so tests count those creates instead of timing them.
+    /// </summary>
+    sealed class SlowCall(Probe probe, int milliseconds)
+    {
+        public TimeSpan? From { get; private set; }
+        public TimeSpan? To { get; private set; }
+
+        public async Task RunAsync()
+        {
+            From = probe.Now;
+            await Slow(milliseconds);
+            To = probe.Now;
+        }
+
+        /// <summary>Creates that finished during the call; the first 20 ms are left out (a create that passed the gate just before the call took it may end then).</summary>
+        public int Finished => From is { } from && To is { } to ? probe.Finished.Count(t => t > from + TimeSpan.FromMilliseconds(20) && t < to) : 0;
+    }
+
     static Task Slow(int milliseconds) => Task.Delay(milliseconds);
 
     [Fact]
@@ -227,15 +247,16 @@ public sealed class WriteGateTests(ITestOutputHelper output) : IDisposable
     {
         api.Add("old", folder: true);
         var engine = await ReadyAsync();
-        api.BeforeDelete = () => Slow(500);
-
         var probe = new Probe(engine);
+        var delete = new SlowCall(probe, 500);
+        api.BeforeDelete = delete.RunAsync;
+
         await Task.Delay(20);
         await engine.DeleteAsync(Root + "old", default);
         var longest = await probe.StopAsync();
-        Report("longest create during a folder delete (500 ms)", longest);
+        Report($"longest create during a folder delete (500 ms, {delete.Finished} creates finished during it)", longest);
 
-        Assert.True(longest < Brief, $"a create waited {longest.TotalMilliseconds:0} ms");
+        Assert.True(delete.Finished > 0, $"no create finished during the folder delete (longest create {longest.TotalMilliseconds:0} ms)");
         Assert.Empty(api.Paths);
     }
 
@@ -245,15 +266,16 @@ public sealed class WriteGateTests(ITestOutputHelper output) : IDisposable
         api.Add("a", folder: true);
         api.Add("a/x.txt");
         var engine = await ReadyAsync();
-        api.BeforeMove = () => Slow(500);
-
         var probe = new Probe(engine);
+        var move = new SlowCall(probe, 500);
+        api.BeforeMove = move.RunAsync;
+
         await Task.Delay(20);
         await engine.RenameAsync(Root + "a", Root + "b", false, default);
         var longest = await probe.StopAsync();
-        Report("longest create during a folder rename (500 ms)", longest);
+        Report($"longest create during a folder rename (500 ms, {move.Finished} creates finished during it)", longest);
 
-        Assert.True(longest < Brief, $"a create waited {longest.TotalMilliseconds:0} ms");
+        Assert.True(move.Finished > 0, $"no create finished during the folder rename (longest create {longest.TotalMilliseconds:0} ms)");
         Assert.Equal(["b", "b/x.txt"], api.Paths);
     }
 
