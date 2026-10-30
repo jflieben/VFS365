@@ -90,7 +90,7 @@
       </Component>
     </StandardDirectory>
 
-    <!-- Shell extension vfs365shell.dll (src\Vfs365.Shell): overlay icons on the volume's items, five classes registered here, the x86
+    <!-- Shell extension vfs365shell.dll (src\Vfs365.Shell): overlay icons on the volume's items, four classes registered here, the x86
        build for 32-bit programs' file dialogs (its keys written straight into the 32-bit view, WOW6432Node). Its Windows 11 context menu class is registered per user by the package
        vfs365shell.msix (signed releases only; ShellPackage.cs), never here. The overlay identifiers' names start with one space:
        Explorer loads only the first 11 in name order (it keeps 4 of its 15 slots), and this puts the four right after OneDrive's

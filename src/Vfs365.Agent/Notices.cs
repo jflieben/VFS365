@@ -184,17 +184,21 @@ public sealed class NoticeBatcher(bool notifyUploads = true)
         {
             var items = batch.DistinctBy(n => NameOf(n.Notice), StringComparer.OrdinalIgnoreCase).ToList();
             var first = items[0].Notice;
-            var cause = PlainCause.Text(items.GroupBy(n => n.Cause).OrderByDescending(g => g.Count()).First().Key, culture);
+            var common = items.GroupBy(n => n.Cause).OrderByDescending(g => g.Count()).First().Key;
+            var cause = PlainCause.Text(common, culture);
+            // Refused for lack of access: not retried by itself (new files), so "keeps trying" would be wrong
+            var waiting = common == Cause.NoAccess ? "Waiting.Kept" : "Waiting";
             toasts.Add(kind switch
             {
                 NoticeKind.ConflictCopy => (UiText.Get(culture, "Copy.Title"),
                     items.Count > 1 ? UiText.Get(culture, "Copy.Many", items.Count)
+                    : first.Detail?.Contains('\\') == true ? UiText.Get(culture, "Copy.Folder", first.Name, first.Detail) // a path: its folder was gone
                     : first is { By: { } by, At: { } at } ? UiText.Get(culture, "Copy.By", first.Name, first.Detail, by, at.ToLocalTime().ToString("g", culture ?? CultureInfo.CurrentUICulture))
                     : UiText.Get(culture, "Copy.One", first.Name, first.Detail)),
                 NoticeKind.NotDeleted => (UiText.Get(culture, "NotDeleted.Title"),
                     items.Count == 1 ? UiText.Get(culture, "NotDeleted.One", first.Name, cause) : UiText.Get(culture, "NotDeleted.Many", items.Count)),
                 NoticeKind.UploadWaiting => (UiText.Get(culture, "Waiting.Title"),
-                    items.Count == 1 ? UiText.Get(culture, "Waiting.One", first.Name, cause) : UiText.Get(culture, "Waiting.Many", items.Count, cause)),
+                    items.Count == 1 ? UiText.Get(culture, $"{waiting}.One", first.Name, cause) : UiText.Get(culture, $"{waiting}.Many", items.Count, cause)),
                 _ => (UiText.Get(culture, "Uploaded.Title"),
                     items.Count == 1 ? UiText.Get(culture, "Uploaded.One", first.Name) : UiText.Get(culture, "Uploaded.Many", items.Count)),
             });

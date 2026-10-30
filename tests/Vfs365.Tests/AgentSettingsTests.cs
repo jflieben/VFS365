@@ -209,7 +209,7 @@ public sealed class AgentSettingsTests : IDisposable
         Assert.Equal("0 (off)", effective["ReadAheadFiles"].Value);
         Assert.StartsWith("contoso.table.core.windows.net", effective["MonitoringUrl"].Value);
         Assert.DoesNotContain(settings.Effective(), s => s.Value.Contains("secret123") || s.Value.Contains("sig="));
-        Assert.Equal(30, effective.Count);
+        Assert.Equal(33, effective.Count);
         Assert.Equal(AgentSettings.Names.Order(), effective.Keys.Order());
     }
 

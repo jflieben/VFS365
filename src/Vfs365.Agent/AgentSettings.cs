@@ -29,7 +29,7 @@ public sealed class AgentSettings
         "ClientId", "TenantId", "DriveLetter", "Label", "Scope", "IncludedSites", "ExcludedSites", "IncludedSiteTemplates", "ExcludedSiteTemplates",
         "PinnedLocations", "NavigationPane", "OverlayIcons", "CacheSizeMB", "TrayIcon", "NotifyUploads", "HelpUrl", "ChangeCheckSeconds", "ApiBudgetPerMinute",
         "ThrottlePauseMinutes", "WalkPrefetchFolders", "ReadAheadFiles", "BackgroundUploads", "RepeatSaveSeconds", "DatabaseFiles", "MonitoringUrl",
-        "MonitoringDetail", "FolderRedirection", "DriveMappings", "SharedWithMe", "ExplorerSearch",
+        "MonitoringDetail", "FolderRedirection", "DriveMappings", "SharedWithMe", "ExplorerSearch", "OfficeFiles", "OfficeFileTypes", "OfficeMissing",
     ];
 
     readonly List<(string Source, Func<string, object?> Read)> sources = [];
@@ -141,6 +141,15 @@ public sealed class AgentSettings
     /// <summary>A search in Explorer's search box on the drive: Browser (stopped and opened in Microsoft 365), Stop (only stopped) or Allow.</summary>
     public ExplorerSearchMode ExplorerSearch => Choice<ExplorerSearchMode>("ExplorerSearch") ?? ExplorerSearchMode.Browser;
 
+    /// <summary>A double-click on a listed Office file in the drive: DesktopApp (from Microsoft 365, co-authoring), Browser or Local.</summary>
+    public OfficeFilesMode OfficeFiles => Choice<OfficeFilesMode>("OfficeFiles") ?? OfficeFilesMode.DesktopApp;
+
+    /// <summary>The types OfficeFiles applies to, as ".docx"; types it can't apply to (templates, other types) are dropped.</summary>
+    public IReadOnlyList<string> OfficeFileTypes => List("OfficeFileTypes") is { } listed ? OfficeTypes.Normalize(listed, out _) : OfficeTypes.Defaults;
+
+    /// <summary>A listed type no app on the PC opens: Browser, Ask or Local (Windows asks which app).</summary>
+    public OfficeMissingMode OfficeMissing => Choice<OfficeMissingMode>("OfficeMissing") ?? OfficeMissingMode.Browser;
+
     public const string DefaultHelpUrl = "https://jsolve.nl";
 
     /// <summary>Where the tray's Help opens, for example the organisation's own instructions.</summary>
@@ -194,6 +203,9 @@ public sealed class AgentSettings
             ("RepeatSaveSeconds", RepeatSaveSeconds == 0 ? "0 (every close uploads)" : RepeatSaveSeconds.ToString(), From("RepeatSaveSeconds")),
             ("DatabaseFiles", DatabaseFiles.ToString(), From("DatabaseFiles")),
             ("ExplorerSearch", ExplorerSearch.ToString(), From("ExplorerSearch")),
+            ("OfficeFiles", OfficeFiles.ToString(), From("OfficeFiles")),
+            ("OfficeFileTypes", OfficeFileTypes.Count == 0 ? "none" : string.Join("; ", OfficeFileTypes), From("OfficeFileTypes")),
+            ("OfficeMissing", OfficeMissing.ToString(), From("OfficeMissing")),
             ("MonitoringUrl", monitoring is not null
                 ? $"{monitoring.Account}{(monitoring.Expires is { } expires ? $" (SAS valid until {expires.ToLocalTime():yyyy-MM-dd HH:mm})" : "")}"
                 : problem ?? "off", From("MonitoringUrl")),
@@ -238,13 +250,21 @@ public sealed class AgentSettings
         Unreadable("Scope", Choice<DriveScope>("Scope") is not null, "All, SharePoint or OneDrive", Scope.ToString());
         Unreadable("DatabaseFiles", Choice<DatabaseFilePolicy>("DatabaseFiles") is not null, "Allow, ReadOnly or Block", DatabaseFiles.ToString());
         Unreadable("ExplorerSearch", Choice<ExplorerSearchMode>("ExplorerSearch") is not null, "Browser, Stop or Allow", ExplorerSearch.ToString());
+        Unreadable("OfficeFiles", Choice<OfficeFilesMode>("OfficeFiles") is not null, "DesktopApp, Browser or Local", OfficeFiles.ToString());
+        Unreadable("OfficeMissing", Choice<OfficeMissingMode>("OfficeMissing") is not null, "Browser, Ask or Local", OfficeMissing.ToString());
+        if (List("OfficeFileTypes") is { } officeTypes && OfficeTypes.Normalize(officeTypes, out var ignored) is var kept && ignored.Count > 0)
+        {
+            adjusted.Add($"OfficeFileTypes {string.Join(", ", ignored.Select(i => $"'{i}'"))} ignored: not a Word, Excel, PowerPoint, OneNote or Visio document type" +
+                (kept.Count == 0 ? "; no type is left, so Office files open from the drive" : ""));
+        }
         Unreadable("MonitoringDetail", Choice<MonitoringDetail>("MonitoringDetail") is not null, "Full or NoPaths", MonitoringDetail.ToString());
         Unreadable("HelpUrl", ValidHelpUrl(Text("HelpUrl").Value) is not null, "an http or https address", DefaultHelpUrl);
         foreach (var name in new[] { "ClientId", "TenantId", "DriveLetter", "Label", "MonitoringUrl" })
         {
             Unreadable(name, Raw(name, out _) is string, "text", "the default");
         }
-        foreach (var name in new[] { "IncludedSites", "ExcludedSites", "IncludedSiteTemplates", "ExcludedSiteTemplates", "PinnedLocations", "FolderRedirection", "DriveMappings" })
+        foreach (var name in new[] { "IncludedSites", "ExcludedSites", "IncludedSiteTemplates", "ExcludedSiteTemplates", "PinnedLocations", "FolderRedirection", "DriveMappings",
+            "OfficeFileTypes" })
         {
             Unreadable(name, Raw(name, out _) is string or string[], "a list", "the default");
         }

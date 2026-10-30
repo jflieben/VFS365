@@ -223,7 +223,7 @@ public sealed class SupportBundle(string dataFolder, Func<AgentSettings> setting
             $"Device:     {(join is null ? "not joined or registered to Entra" : $"{join.Kind} to {join.TenantName ?? join.TenantId} ({join.TenantId}), device {join.DeviceId}")}",
             $"Signed in:  {(status?.User is { } user ? $"{user} (tenant {status.TenantId}), as of {status.UpdatedAt.ToLocalTime():yyyy-MM-dd HH:mm}" : "unknown (no status file with an account)")}",
             $"Sign-in:    {(status?.SignInProblem is { } code ? $"needed ({code})" : "no problem reported")}",
-            $"State:      {(state is null ? "no discovery state" : $"tenant {state.TenantId ?? "?"} ({state.TenantHint}), SharePoint {state.TenantRoot}, OneDrive {state.OneDrive?.WebUrl ?? "?"}")}",
+            $"State:      {(state is null ? "no discovery state" : $"tenant {state.TenantId ?? "?"} ({state.TenantHint}), SharePoint {state.TenantRoot}, OneDrive {state.OneDrive?.WebUrl ?? "none"}")}",
         ]);
     }
 

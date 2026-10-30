@@ -84,10 +84,11 @@ public sealed partial class DriveEngine
 
         /// <summary>
         /// Item ID to the path of the cached listing holding it, kept between reads under ApplyGate (it may be out of date: every use
-        /// checks the listing); Indexed is the listing version each listing was indexed at.
+        /// checks the listing); Indexed is the listing (by Serial) and version indexed at each path. Neither holds a listing: paths whose
+        /// listing left the cache leave both (<see cref="PruneHolders"/>).
         /// </summary>
         public Dictionary<string, string> Holders { get; } = new(StringComparer.Ordinal);
-        public Dictionary<Listing, int> Indexed { get; } = [];
+        public Dictionary<string, (long Serial, int Version)> Indexed { get; } = new(StringComparer.OrdinalIgnoreCase);
 
         /// <summary>Reads that failed in a row; no read before RetryAt. Problem is what the log last said about it.</summary>
         public int Failures { get; set; }
@@ -865,7 +866,8 @@ public sealed partial class DriveEngine
     /// <summary>
     /// Looks up the folders above a listed one that aren't cached, in the background (an app opening files by path lists only the
     /// folder it opens): one item read each instead of listing them, which can be pages for a big folder. Only with their IDs can the
-    /// change feed see a rename or move above it and keep the listing current without reading it again.
+    /// change feed see a rename or move above it and keep the listing current without reading it again. A folder known from before
+    /// the feed's baseline is looked up again: the feed doesn't cover it.
     /// </summary>
     void TrackAncestors(string driveId, string folderPath)
     {
@@ -873,11 +875,12 @@ public sealed partial class DriveEngine
         {
             return; // no feed to keep listings current
         }
+        var feed = feeds.GetValueOrDefault(driveId);
         for (var path = ParentOf(folderPath); path.Length > 0; path = ParentOf(path))
         {
             var key = Key(driveId, path);
-            if (listings.ContainsKey(key) || knownFolders.ContainsKey(key) || (unlisted.TryGetValue(key, out var failed) && Now - failed < UnlistedRetry)
-                || !tracking.TryAdd(key, 0))
+            if (listings.ContainsKey(key) || (knownFolders.TryGetValue(key, out var known) && !BeforeBaseline(feed, known.At))
+                || (unlisted.TryGetValue(key, out var failed) && Now - failed < UnlistedRetry) || !tracking.TryAdd(key, 0))
             {
                 continue;
             }
@@ -885,14 +888,22 @@ public sealed partial class DriveEngine
         }
     }
 
+    /// <summary>
+    /// Read before the feed's current baseline: a change between the two would be in neither, so the feed can't keep it current. Not
+    /// while there is no baseline (one read now would be just as old).
+    /// </summary>
+    static bool BeforeBaseline(Feed? feed, DateTimeOffset at) => feed is { DeltaLink: not null } && at < feed.BaselineAt;
+
     async Task TrackAsync(string driveId, string folderPath, string key)
     {
         await Task.Yield();
         RequestPriority.MarkBackground();
         try
         {
-            // A recent lookup of it (Explorer resolving each folder of the path) answers without a call
+            var feed = feeds.GetOrAdd(driveId, _ => NewFeed());
+            // A recent lookup of it (Explorer resolving each folder of the path) answers without a call, unless it is from before the baseline
             var (folder, at) = lookups.TryGetValue(key, out var looked) && looked.Item is { IsFolder: true, ParentId: not null } && Now - looked.At < options.LookupTtl
+                && !BeforeBaseline(feed, looked.At)
                 ? (looked.Item, looked.At)
                 : (await CallAsync(ct => api.GetItemAsync(driveId, folderPath, ct)), Now);
             if (folder is not { IsFolder: true })
@@ -900,7 +911,6 @@ public sealed partial class DriveEngine
                 unlisted[key] = Now;
                 return;
             }
-            var feed = feeds.GetOrAdd(driveId, _ => NewFeed());
             lock (feed.ApplyGate)
             {
                 // Not when something changed it or a folder above it since it was read, or what did may have been let go
@@ -1355,25 +1365,28 @@ public sealed partial class DriveEngine
     }
 
     /// <summary>
-    /// The drive's item ID to listing index, brought up to date for listings that changed since the last read (or are new). Entries
-    /// of listings that went may linger; each use checks the listing. Rebuilt when it holds far more than what is cached.
+    /// The drive's item ID to listing index, brought up to date for listings that changed since the last read (or are new, or replaced
+    /// one read again). Paths whose listing went leave it first; entries of items that left a listing may linger (each use checks the
+    /// listing). Rebuilt when it holds far more than what is cached.
     /// </summary>
     static Dictionary<string, string> HolderIndex(Feed feed, Dictionary<string, Listing> cached)
     {
+        PruneHolders(feed, path => cached.GetValueOrDefault(path));
         var total = 0;
         foreach (var listing in cached.Values)
         {
             total += listing.Items.Count;
         }
-        if (feed.Holders.Count > 2 * total + 1000 || feed.Indexed.Count > 2 * cached.Count + 100)
+        if (feed.Holders.Count > 2 * total + 1000)
         {
             feed.Holders.Clear();
+            feed.Holders.TrimExcess();
             feed.Indexed.Clear();
         }
         foreach (var (path, listing) in cached)
         {
-            var version = listing.Version;
-            if (feed.Indexed.TryGetValue(listing, out var indexed) && indexed == version)
+            var at = (listing.Serial, listing.Version);
+            if (feed.Indexed.TryGetValue(path, out var indexed) && indexed == at)
             {
                 continue;
             }
@@ -1381,9 +1394,44 @@ public sealed partial class DriveEngine
             {
                 feed.Holders[itemId] = path;
             }
-            feed.Indexed[listing] = version;
+            feed.Indexed[path] = at;
         }
         return feed.Holders;
+    }
+
+    /// <summary>
+    /// Takes paths without a loaded listing (dropped, evicted) out of the holder index, with the item IDs it had there: one pass over
+    /// the index, only when some went. Called under the feed's ApplyGate.
+    /// </summary>
+    static void PruneHolders(Feed feed, Func<string, Listing?> cachedAt)
+    {
+        HashSet<string>? gone = null;
+        foreach (var path in feed.Indexed.Keys)
+        {
+            if (cachedAt(path) is null)
+            {
+                (gone ??= new HashSet<string>(StringComparer.OrdinalIgnoreCase)).Add(path);
+            }
+        }
+        if (gone is null)
+        {
+            return;
+        }
+        foreach (var path in gone)
+        {
+            feed.Indexed.Remove(path);
+        }
+        foreach (var (itemId, path) in feed.Holders)
+        {
+            if (gone.Contains(path))
+            {
+                feed.Holders.Remove(itemId); // allowed while enumerating
+            }
+        }
+        if (feed.Holders.Count < feed.Holders.Capacity / 4)
+        {
+            feed.Holders.TrimExcess(); // its arrays don't shrink by themselves
+        }
     }
 
     /// <summary>
@@ -1457,7 +1505,7 @@ public sealed partial class DriveEngine
     /// Every 30 s (from <see cref="PollActiveAsync"/>): lookups past their TTL go, so do changes kept for replays past their time,
     /// entries kept for scans of folders not used lately, folders known by ID with nothing cached below them any more, and listings
     /// beyond MaxCachedItems, least recently used first (a folder counts as used when one below it is: the listings below rely on it
-    /// to be kept current).
+    /// to be kept current). Then what left the cache leaves the holder indexes, also of drives whose feed isn't read.
     /// </summary>
     void Maintain()
     {
@@ -1485,13 +1533,6 @@ public sealed partial class DriveEngine
             if (Now - failed.Value >= UnlistedRetry)
             {
                 unlisted.TryRemove(failed);
-            }
-        }
-        foreach (var feed in feeds.Values)
-        {
-            lock (feed.ApplyGate)
-            {
-                Trim(feed);
             }
         }
         if (!knownFolders.IsEmpty)
@@ -1527,10 +1568,23 @@ public sealed partial class DriveEngine
                 listing.DropEntries();
             }
         }
-        if (size <= options.MaxCachedItems)
+        if (size > options.MaxCachedItems)
         {
-            return;
+            Evict(size);
         }
+        foreach (var (driveId, feed) in feeds)
+        {
+            lock (feed.ApplyGate)
+            {
+                Trim(feed);
+                PruneHolders(feed, path => listings.GetValueOrDefault(Key(driveId, path)) is { IsLoaded: true } listing ? listing : null);
+            }
+        }
+    }
+
+    /// <summary>Evicts the least recently used listings until they hold 90% of MaxCachedItems.</summary>
+    void Evict(long size)
+    {
         var target = options.MaxCachedItems / 10 * 9;
         var evicted = 0;
         var loaded = listings.Where(l => l.Value.IsLoaded).ToList();
@@ -1739,8 +1793,8 @@ public sealed partial class DriveEngine
     }
 
     /// <summary>
-    /// Listings the change feeds keep current, with the links to continue from; per drive the most recently used first (a folder
-    /// before the ones below it, which rely on it). Drives no longer mounted are left out.
+    /// Listings the change feeds keep current, with the links to continue from and the folders known by ID since the baseline; per
+    /// drive the most recently used first (a folder before the ones below it, which rely on it). Drives no longer mounted are left out.
     /// </summary>
     public IReadOnlyList<DriveSnapshot> ExportSnapshots(int maxFoldersPerDrive)
     {
@@ -1763,7 +1817,7 @@ public sealed partial class DriveEngine
                 .ToList();
             if (folders.Count > 0)
             {
-                var ancestors = knownFolders.Where(k => k.Key.StartsWith(prefix, StringComparison.Ordinal))
+                var ancestors = knownFolders.Where(k => k.Key.StartsWith(prefix, StringComparison.Ordinal) && !BeforeBaseline(feed, k.Value.At))
                     .Select(k => new AncestorSnapshot(k.Key[prefix.Length..], k.Value.Id, k.Value.ParentId))
                     .ToList();
                 snapshots.Add(new DriveSnapshot(driveId, link, Now, folders, ancestors.Count > 0 ? ancestors : null));

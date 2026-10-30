@@ -10,6 +10,7 @@
   <ItemGroup>
     <PackageReference Include="winfsp.net" />
     <ProjectReference Include="..\Vfs365.Core\Vfs365.Core.csproj" />
+    <InternalsVisibleTo Include="Vfs365.Tests" />
   </ItemGroup>
 
 </Project>

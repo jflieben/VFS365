@@ -65,7 +65,7 @@ public sealed class SharedWithMeServiceTests
         Assert.All(result.State.Items, i => Assert.True(i.ReadOnly));
         Assert.True(result.State.Items[1].IsFolder);
         Assert.Equal(now, result.State.RunAt);
-        Assert.Equal((1, 2, 2), (api.Searches, api.Lookups, api.RightsChecks));
+        Assert.Equal((1, 2, 1), (api.Searches, api.Lookups, api.RightsChecks)); // rights only for the folder: a shared file shows read-only anyway
     }
 
     [Fact]

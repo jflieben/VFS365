@@ -203,6 +203,14 @@ public sealed partial class DriveEngine
         }
     }
 
+    /// <summary>
+    /// True while the file has content staged on this PC: open for writing, changed and not uploaded yet, uploading, failing or
+    /// refused. Microsoft 365 may not have what the drive shows then.
+    /// </summary>
+    public bool IsStaged(FsEntry entry) =>
+        entry.StagingPath is not null
+        || (entry.DriveId is { } driveId && overlay.GetValueOrDefault(Key(driveId, entry.DrivePath)) is PendingFile { IsLive: true });
+
     VolumeFileState[] CachedIn(string driveId, IReadOnlyList<string> folders, Listing listing)
     {
         List<VolumeFileState>? found = null;

@@ -13,17 +13,21 @@ public sealed record ExplorerSearch(string Terms, IReadOnlyList<string> Location
     /// The search a window shows, from what Shell Windows says about it; null when it shows none. Windows 11 25H2 names a search view
     /// "&lt;scope's display name&gt;&amp;&lt;words&gt;" ("Search Results in M:\Sites\Sales&amp;budget", the prefix localized) with the words as
     /// LocationName and no LocationURL (spike 15); other builds may give a search-ms: string. The location is where a root
-    /// (<paramref name="roots"/>: "M:\", "\\VFS365\ann\") starts in the name, else <paramref name="previous"/>, the folder the tab
-    /// showed before (a drive's top may be named "VFS365 (M:)").
+    /// (<paramref name="roots"/>: "M:\", "\\VFS365\ann\") starts in the name. A scope without a path (Explorer names This PC, Home or
+    /// Quick access by their display names) has none, unless its name is the display name of <paramref name="previous"/>, the folder
+    /// the tab showed before (<paramref name="previousName"/>, else its last path component; a drive's top may be named
+    /// "VFS365 (M:)"): a search names its own scope, so one elsewhere is never a search in the folder shown before.
     /// </summary>
-    public static ExplorerSearch? FromView(string? parsingName, string? locationUrl, string? locationName, IEnumerable<string> roots, string? previous)
+    public static ExplorerSearch? FromView(string? parsingName, string? locationUrl, string? locationName, IEnumerable<string> roots, string? previous,
+        string? previousName = null)
     {
         if ((Parse(parsingName) ?? Parse(locationUrl)) is { } classic)
         {
             return classic;
         }
         if (parsingName is not { Length: > 0 and <= MaxLength } || !string.IsNullOrEmpty(locationUrl) || parsingName.StartsWith("::", StringComparison.Ordinal)
-            || parsingName.StartsWith(@"\\", StringComparison.Ordinal) || parsingName.Length >= 2 && parsingName[1] == ':')
+            || parsingName.StartsWith(@"\\", StringComparison.Ordinal) || parsingName.Length >= 2 && parsingName[1] == ':'
+            || parsingName.StartsWith("shell:", StringComparison.OrdinalIgnoreCase))
         {
             return null;
         }
@@ -45,9 +49,24 @@ public sealed record ExplorerSearch(string Terms, IReadOnlyList<string> Location
                 start = at;
             }
         }
-        var location = start >= 0 ? head[start..] : previous;
+        var location = start >= 0 ? head[start..] : previous is not null && Scopes(head, previous, previousName) ? previous : null;
         return new ExplorerSearch(words.Trim(), location is null ? [] : [location], SearchTerms.Words(words).Any(SearchTerms.IsProperty));
     }
+
+    /// <summary>Whether the scope a search view names (the end of <paramref name="head"/>) is the folder <paramref name="folder"/>.</summary>
+    static bool Scopes(string head, string folder, string? folderName)
+    {
+        var scope = head.TrimEnd();
+        // A drive's display name ends in its letter: "VFS365 (M:)"
+        var bare = scope.EndsWith(":)", StringComparison.Ordinal) && scope.LastIndexOf(" (", StringComparison.Ordinal) is > 0 and var paren ? scope[..paren] : scope;
+        var path = folder.TrimEnd('\\');
+        var leaf = folder.StartsWith("::", StringComparison.Ordinal) ? "" : path[(path.LastIndexOf('\\') + 1)..];
+        return new[] { folderName ?? "", leaf }.Any(name => EndsWithName(scope, name) || EndsWithName(bare, name));
+    }
+
+    /// <summary>The display name ends the text, after the space that follows the localized "Search Results in" (a path has a backslash there).</summary>
+    static bool EndsWithName(string text, string name) =>
+        name.Length > 0 && text.EndsWith(name, StringComparison.OrdinalIgnoreCase) && (text.Length == name.Length || text[^(name.Length + 1)] == ' ');
 
     /// <summary>The search in a window's location; null for anything that isn't a search-ms: string.</summary>
     public static ExplorerSearch? Parse(string? location)

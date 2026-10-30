@@ -21,6 +21,58 @@ public sealed class SharePointDiscoveryApi(M365Client client) : ISharePointDisco
         return drive;
     }
 
+    /// <summary>
+    /// The user's OneDrive and the tenant's SharePoint root. A user without a OneDrive (<see cref="NoOneDrive"/>) gets the root from Graph's
+    /// root site instead, with no OneDrive; every other error, a passing one included, is an error as before.
+    /// </summary>
+    public async Task<MyHome> GetMyHomeAsync(CancellationToken ct)
+    {
+        try
+        {
+            return MyHome.Of(await GetMyDriveAsync(ct));
+        }
+        catch (M365RequestException e) when (NoOneDrive(e))
+        {
+            return new MyHome(null, await RootSiteAsync(e, ct));
+        }
+    }
+
+    /// <summary>
+    /// Whether /me/drive's error says the user has no OneDrive: 404 (Graph's documentation: the drive doesn't exist and can't be
+    /// provisioned for this user), or a 400, 403 or 409 whose text names the missing personal site or licence ("Unable to retrieve user's
+    /// mysite URL", "You do not have access to create this personal site or you do not have a valid license", "Tenant does not have a SPO
+    /// license"; seen in reports, not verified here). A plain 403, 401, 429, 5xx or no answer at all says nothing about the OneDrive.
+    /// </summary>
+    public static bool NoOneDrive(M365RequestException e) =>
+        e.Status == HttpStatusCode.NotFound
+        || (e.Status is HttpStatusCode.BadRequest or HttpStatusCode.Forbidden or HttpStatusCode.Conflict
+            && e.Error != Core.RemoteError.ReadOnly
+            && new[] { "mysite", "personal site", "SPO license" }.Any(text => e.Message.Contains(text, StringComparison.OrdinalIgnoreCase)));
+
+    /// <summary>
+    /// The tenant's SharePoint root from the root site's address (Sites.Read.All, no OneDrive needed). When the root site can't be read
+    /// either (404, 403), the user has nothing in SharePoint: the /me/drive error stays the error.
+    /// </summary>
+    async Task<string> RootSiteAsync(M365RequestException noOneDrive, CancellationToken ct)
+    {
+        string? webUrl;
+        try
+        {
+            using var doc = await RequiredAsync(new Uri($"{M365Client.GraphResource}/v1.0/sites/root?$select=webUrl"), ct);
+            webUrl = Str(doc.RootElement, "webUrl");
+        }
+        catch (M365RequestException e) when (e.Status is HttpStatusCode.NotFound or HttpStatusCode.Forbidden)
+        {
+            throw noOneDrive;
+        }
+        if (!Uri.TryCreate(webUrl, UriKind.Absolute, out var root) || root.Scheme != Uri.UriSchemeHttps || !root.Host.EndsWith(".sharepoint.com", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidDataException($"Graph's root site has no SharePoint address: {webUrl ?? "(none)"}");
+        }
+        client.TenantRootHost ??= root.Host;
+        return $"https://{root.Host}";
+    }
+
     public async Task<SearchPage> SearchDocumentLibrariesAsync(string tenantRoot, long afterDocId, int startRow, int rowLimit, CancellationToken ct)
     {
         using var doc = await RequiredAsync(SearchUri(tenantRoot, afterDocId, startRow, rowLimit), ct);

@@ -302,11 +302,11 @@ public static class AgentCommands
                     error.WriteLine($"Sign-in: {tokens.SignInProblemText}");
                     return 1;
                 }
-                var me = await api.GetMyDriveAsync(default);
+                var me = await api.GetMyHomeAsync(default);
                 Say($"User:       {tokens.LastResult?.Username}");
                 Say($"Signed in:  tenant {tokens.LastResult?.TenantId}");
-                Say($"OneDrive:   {me.WebUrl}");
-                Say($"SharePoint: {SharePointUrls.TenantRootFromOneDriveUrl(me.WebUrl)}");
+                Say($"OneDrive:   {me.OneDrive?.WebUrl ?? "none (no licence, personal sites blocked or not provisioned)"}");
+                Say($"SharePoint: {me.TenantRoot}");
                 return 0;
             }
 
@@ -529,17 +529,21 @@ public static class AgentCommands
     /// <summary>An engine without a mount, for the diagnostic commands: OneDrive plus the libraries and shared items of the last discovery.</summary>
     internal static async Task<(DriveEngine Engine, DriveApi DriveApi)> ToolEngineAsync(AgentSettings settings, SharePointDiscoveryApi api, M365Client client)
     {
-        var oneDrive = await api.GetMyDriveAsync(default);
+        var home = await api.GetMyHomeAsync(default);
         var driveApi = new DriveApi(client);
         var state = DiscoveryStore.Load();
         var engine = new DriveEngine(
-            DriveNamespace.Build(oneDrive, state?.Libraries ?? [], api.GetLibraryDriveIdAsync, settings.Scope,
+            DriveNamespace.Build(home.OneDrive, state?.Libraries ?? [], api.GetLibraryDriveIdAsync, settings.Scope,
                 shared: settings.SharedWithMe ? state?.Shared?.Items ?? [] : null),
             driveApi,
             new ContentCache(Path.Combine(Path.GetTempPath(), $"vfs365-tool-{Environment.ProcessId}"), driveApi),
             new DriveEngineOptions { StagingDirectory = Path.Combine(Path.GetTempPath(), $"vfs365-tool-{Environment.ProcessId}", "staging") });
         return (engine, driveApi);
     }
+
+    /// <summary>Why the account's OneDrive differs from the mounted one when it isn't another account's (both have one): it appeared or went.</summary>
+    static string? OneDriveChange(MyDrive? mounted, MyDrive? now) =>
+        mounted is null ? "this account has a OneDrive now" : now is null ? "this account has no OneDrive now" : null;
 
     /// <summary>Prints push notifications for the drive holding a folder, until the time is up or Ctrl+C.</summary>
     static async Task<int> WatchAsync(AgentSettings settings, SharePointDiscoveryApi api, M365Client client, string folder, int seconds, Action<string>? trace,
@@ -617,10 +621,10 @@ public static class AgentCommands
     static async Task<int> SharedAsync(AgentSettings settings, SharePointDiscoveryApi api, M365Client client, WamTokenSource tokens, bool json,
         Action<string> say, TextWriter output)
     {
-        var me = await api.GetMyDriveAsync(default);
+        var me = await api.GetMyHomeAsync(default);
         var user = tokens.LastResult?.Username ?? throw new IOException("The signed-in account's name is unknown");
         var sharedApi = new SharedWithMeApi(client);
-        var result = await new SharedWithMeService(sharedApi).RunAsync(user, me.DriveId, null, recheck: true, default);
+        var result = await new SharedWithMeService(sharedApi).RunAsync(user, me.OneDrive?.DriveId ?? "", null, recheck: true, default);
         var names = DriveNamespace.SharedNames(result.State.Items);
         if (json)
         {
@@ -937,7 +941,7 @@ public static class AgentCommands
                         wipe = false;
                         saved = null;
                     }
-                    usable = saved is { OneDrive: not null } && saved.TenantHint == tenantHint;
+                    usable = DiscoverySchedule.Usable(saved, tenantHint);
                     if (saved is not null && !usable)
                     {
                         // Another tenant than last time: what was cached belongs to the other account
@@ -956,12 +960,12 @@ public static class AgentCommands
             }
             // The last run's folder listings are read and decrypted meanwhile (about a second for a large one), imported before the mount
             var snapshots = usable ? Task.Run(() => MetadataStore.Load(key)) : null;
-            MyDrive oneDrive;
-            MyDrive? justRead = null; // this start's /me/drive answer, which the first discovery then needn't ask for again
+            MyHome home;
+            MyHome? justRead = null; // this start's /me/drive answer, which the first discovery then needn't ask for again
             if (usable)
             {
-                oneDrive = saved!.OneDrive!;
-                client.TenantRootHost = new Uri(saved.TenantRoot).Host; // tokens only for this tenant's SharePoint (set by GetMyDriveAsync otherwise)
+                home = new MyHome(saved!.OneDrive, saved.TenantRoot);
+                client.TenantRootHost = new Uri(saved.TenantRoot).Host; // tokens only for this tenant's SharePoint (set by GetMyHomeAsync otherwise)
             }
             else
             {
@@ -972,7 +976,7 @@ public static class AgentCommands
                 {
                     try
                     {
-                        oneDrive = justRead = await api.GetMyDriveAsync(default);
+                        home = justRead = await api.GetMyHomeAsync(default);
                         break;
                     }
                     catch (Exception e) when (background)
@@ -985,7 +989,8 @@ public static class AgentCommands
                 }
                 tokens.PromptWhenNeeded = !background;
             }
-            var keeper = new DiscoveryStateKeeper(usable ? saved! : DiscoverySchedule.Placeholder(oneDrive, tenantHint, settings.Scope, DateTimeOffset.UtcNow));
+            var oneDrive = home.OneDrive; // null: this account has no OneDrive
+            var keeper = new DiscoveryStateKeeper(usable ? saved! : DiscoverySchedule.Placeholder(home, tenantHint, settings.Scope, DateTimeOffset.UtcNow));
             if (!usable)
             {
                 keeper.Touch(); // the next start mounts at once, also in OneDrive scope (which has no discovery to save it)
@@ -1422,21 +1427,22 @@ public static class AgentCommands
                 });
             }
 
-            // Another account signed in than the one whose OneDrive this engine shows: start again cleanly; its cache goes at unmount
-            void AccountChanged()
+            // Another account signed in than the one whose OneDrive this engine shows (or the account's OneDrive appeared or went): start
+            // again cleanly; its cache goes at unmount
+            void AccountChanged(string? reason = null)
             {
                 if (accountChanged)
                 {
                     return;
                 }
                 accountChanged = true;
-                say("OneDrive:   the signed-in account changed; cached content is wiped and the drive starts again for the new account");
+                say($"OneDrive:   {reason ?? "the signed-in account changed"}; cached content is wiped and the drive starts again{(reason is null ? " for the new account" : "")}");
                 if (!RestartAgent("for the new account"))
                 {
                     stop.Set(); // never the old account's drive with the new account's tokens
                 }
             }
-            accountSwitchedNow = AccountChanged; // Sign in with another account: at once, not only at the next discovery
+            accountSwitchedNow = () => AccountChanged(); // Sign in with another account: at once, not only at the next discovery
             if (accountSwitched)
             {
                 AccountChanged();
@@ -1468,12 +1474,12 @@ public static class AgentCommands
                 {
                     if (settings.Scope == DriveScope.OneDrive)
                     {
-                        var me = await api.GetMyDriveAsync(default);
+                        var me = (await api.GetMyHomeAsync(default)).OneDrive;
                         keeper.Replace(keeper.Current with { RunAt = DateTimeOffset.UtcNow, OneDrive = me, TenantHint = tenantHint });
                         log($"discovery: OneDrive checked in {watch.Elapsed.TotalSeconds:N1} s");
-                        if (me.DriveId != oneDrive.DriveId)
+                        if (me?.DriveId != oneDrive?.DriveId)
                         {
-                            AccountChanged();
+                            AccountChanged(OneDriveChange(oneDrive, me));
                         }
                     }
                     else
@@ -1484,9 +1490,9 @@ public static class AgentCommands
                         // A failed search keeps the libraries (nothing is hidden) but not the time: the next start doesn't take it as recent
                         keeper.Replace(DiscoverySchedule.Keep(result, before) with { TenantHint = tenantHint });
                         SaveQuietly("the discovery report", () => DiscoveryReport.Record(result, before)); // for 'vfs365 why' and support bundles
-                        if (result.OneDrive.DriveId != oneDrive.DriveId)
+                        if (result.OneDrive?.DriveId != oneDrive?.DriveId)
                         {
-                            AccountChanged();
+                            AccountChanged(OneDriveChange(oneDrive, result.OneDrive));
                             return;
                         }
                         engine.SetLibraries(keeper.Current.Libraries);
@@ -1542,7 +1548,7 @@ public static class AgentCommands
                     }
                     var user = tokens.LastResult?.Username ?? throw new IOException("the signed-in account's name is unknown");
                     var before = keeper.Current.Shared;
-                    var result = await new SharedWithMeService(new SharedWithMeApi(client)).RunAsync(user, oneDrive.DriveId, before, recheck: false, default);
+                    var result = await new SharedWithMeService(new SharedWithMeApi(client)).RunAsync(user, oneDrive?.DriveId ?? "", before, recheck: false, default);
                     if (result.SearchError is { } error)
                     {
                         throw new IOException($"search failed: {error}");
@@ -1554,7 +1560,8 @@ public static class AgentCommands
                         cache.ForgetDrive(gone); // no longer shown anywhere: its cached content goes
                     }
                     var added = result.State.Items.Count(i => before?.Items.Any(b => b.Key == i.Key) != true);
-                    var line = $"{result.State.Items.Count} item(s) from other people ({added} new, {result.State.Items.Count(i => i.IsFolder)} folder(s))";
+                    var line = $"{result.State.Items.Count} item(s) from other people ({added} new, {result.State.Items.Count(i => i.IsFolder)} folder(s))" +
+                        (result.Deferred > 0 ? $", {result.Deferred} more to look up at later runs" : "");
                     if (line != sharedProblem || added > 0)
                     {
                         say($"Shared:     {line}, read in {watch.Elapsed.TotalSeconds:N1} s");
@@ -1603,6 +1610,15 @@ public static class AgentCommands
                 {
                     tray.Notify(UiText.Get("Recovered.Title"), UiText.Get("Recovered.Text", recovered));
                 }
+                if (oneDrive is null && settings.Scope == DriveScope.OneDrive)
+                {
+                    tray.Notify(UiText.Get("NoOneDrive.Title"), UiText.Get("NoOneDrive.Text"));
+                }
+            }
+            if (oneDrive is null)
+            {
+                say("OneDrive:   none for this account (no licence, personal sites blocked or not provisioned); " +
+                    (settings.Scope == DriveScope.OneDrive ? "the drive is empty, Scope SharePoint or All shows the sites" : "the sites show without it"));
             }
             var statistics = monitoring is null ? null : UsageStatistics.Load();
             DateTime? statisticsDue = null;
@@ -1683,11 +1699,11 @@ public static class AgentCommands
                 string? DriveVolumePath(string path) => ExplorerVerbs.VolumePath(
                     ExplorerSearch.Unshell(path, ExplorerLocation.Clsid, drive.DriveLetter is { } navLetter ? navLetter + "\\" : unc),
                     unc, drive.DriveLetter, driveLetters?.Folders() ?? new Dictionary<string, string>());
-                var search = new SearchActions(engine, driveApi.GetLinksAsync, DriveVolumePath, oneDrive, AskWindow.AskAsync, ExplorerMenu.Shell,
+                var search = new SearchActions(engine, driveApi.GetLinksAsync, DriveVolumePath, oneDrive, home.TenantRoot, AskWindow.AskAsync, ExplorerMenu.Shell,
                     (title, text, problem) => VerbPipe.Tell(tray, title, text, problem), log);
                 // The VFS365 menu on the drive's files and folders and the shell section for overlay icons (ExplorerMenu.cs); removed and
                 // cleared when this block ends at the stop
-                using var explorerMenu = ExplorerMenu.Start(engine, driveApi, unc, drive.DriveLetter, driveLetters, settings.OverlayIcons, search.AskAndSearchAsync,
+                using var explorerMenu = ExplorerMenu.Start(engine, driveApi, unc, drive.DriveLetter, driveLetters, settings.OverlayIcons, OfficeSettings.From(settings), search.AskAndSearchAsync,
                     (title, text, problem) => VerbPipe.Tell(tray, title, text, problem), say, log);
                 _ = shellPackage.ContinueWith(_ => explorerMenu?.Update(), TaskScheduler.Default); // legacy verbs go once the package is there
                 using var searchWatcher = ExplorerSearchWatcher.Start(engine, settings.ExplorerSearch,

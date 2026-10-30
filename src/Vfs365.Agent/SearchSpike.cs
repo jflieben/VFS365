@@ -92,8 +92,7 @@ internal static class SearchSpike
             say(Usage);
             return 2;
         }
-        var me = await api.GetMyDriveAsync(default);
-        var root = SharePointUrls.TenantRootFromOneDriveUrl(me.WebUrl);
+        var root = (await api.GetMyHomeAsync(default)).TenantRoot;
         say($"KQL:        {kql}");
         try
         {
@@ -467,15 +466,15 @@ internal static class SearchSpike
             return 1;
         }
         var terms = SearchTerms.Clean(string.Join(' ', words));
-        var me = await api.GetMyDriveAsync(default);
-        var tenantRoot = SharePointUrls.TenantRootFromOneDriveUrl(me.WebUrl);
+        var me = await api.GetMyHomeAsync(default);
+        var tenantRoot = me.TenantRoot;
         var (engine, driveApi) = await AgentCommands.ToolEngineAsync(settings, api, client);
         if (await engine.GetEntryAsync(volumePath, default) is not { IsDirectory: true } entry)
         {
             say($"Not a folder on the drive: {volumePath}");
             return 1;
         }
-        var scope = await SearchActions.ScopeAsync(entry, engine, driveApi.GetLinksAsync, me.DriveId, tenantRoot, default);
+        var scope = await SearchActions.ScopeAsync(entry, engine, driveApi.GetLinksAsync, me.OneDrive?.DriveId ?? "", tenantRoot, default);
         say($"Folder:     {volumePath}");
         say($"Area:       {scope.Area}");
         say($"Site:       {scope.SiteUrl ?? "-"}");

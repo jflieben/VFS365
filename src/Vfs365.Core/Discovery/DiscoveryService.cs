@@ -16,15 +16,15 @@ public sealed class DiscoveryService(ISharePointDiscoveryApi api, DiscoveryOptio
         public List<DiscoveredLibrary> Fresh { get; } = [];
     }
 
-    /// <param name="oneDrive">The user's OneDrive when the caller has just read it (a first start); read here otherwise.</param>
+    /// <param name="home">The user's OneDrive (if any) and the tenant's SharePoint root when the caller has just read them (a first start); read here otherwise.</param>
     /// <param name="tenantId">
     /// The signed-in tenant's ID. With it, the last run's state stays when the SharePoint host changed but the tenant didn't (a user
     /// moved to another geo); without it, the host decides.
     /// </param>
-    public async Task<DiscoveryResult> RunAsync(DiscoveryState? previous, CancellationToken ct = default, MyDrive? oneDrive = null, string? tenantId = null)
+    public async Task<DiscoveryResult> RunAsync(DiscoveryState? previous, CancellationToken ct = default, MyHome? home = null, string? tenantId = null)
     {
-        oneDrive ??= await api.GetMyDriveAsync(ct);
-        var tenantRoot = SharePointUrls.TenantRootFromOneDriveUrl(oneDrive.WebUrl);
+        home ??= await api.GetMyHomeAsync(ct);
+        var (oneDrive, tenantRoot) = (home.OneDrive, home.TenantRoot);
         if (previous is not null && !SameTenant(previous, tenantRoot, tenantId))
         {
             previous = null;
@@ -382,16 +382,8 @@ public sealed class DiscoveryService(ISharePointDiscoveryApi api, DiscoveryOptio
             ? string.Equals(previous.TenantId, tenantId, StringComparison.OrdinalIgnoreCase)
             : string.Equals(previous.TenantRoot, tenantRoot, StringComparison.OrdinalIgnoreCase);
 
-    /// <summary>A fixed share of <see cref="DiscoveryOptions.FirstReadJitter"/> per library key (FNV-1a), so runs are repeatable.</summary>
-    TimeSpan FirstReadOffset(string key)
-    {
-        var hash = 2166136261u;
-        foreach (var c in key.ToLowerInvariant())
-        {
-            hash = (hash ^ c) * 16777619u;
-        }
-        return options.FirstReadJitter * (hash / 4294967296.0);
-    }
+    /// <summary>A fixed share of <see cref="DiscoveryOptions.FirstReadJitter"/> per library key, so runs are repeatable.</summary>
+    TimeSpan FirstReadOffset(string key) => options.FirstReadJitter * KeySpread.Share(key);
 
     /// <summary>
     /// All pages, in DocId order: each page starts after the last DocId of the one before (Microsoft's advice for deep paging; stable

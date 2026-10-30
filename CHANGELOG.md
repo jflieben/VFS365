@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.8.0
+
+- Office files open as Microsoft 365 documents: Word, Excel or PowerPoint file open in its desktop app from Microsoft 365, with co-authoring and AutoSave. IF M365 doesn't answer, the file is new or VFS365 is offline, the file still opens. Office's own File > Open, keep opening the copy on the drive. File associations don't change, and another default app (e.g. LibreOffice) is respected.
+- Policy `OfficeFiles`: `DesktopApp` (default), `Browser` (Office for the web) or `Local` (as before). Policy `OfficeFileTypes` (default `.docx .xlsx .pptx`; also macro-enabled and older formats, OneNote `.one`, Visio `.vsdx` `.vsdm`). Policy `OfficeMissing` (`Browser`, `Ask`, `Local`) for listed types no app on the PC opens. Uninstall and the logon cleanup remove the Explorer verb `VFS365.Open`.
+- Saves by Word, Excel and other programs that save by renaming no longer overwrite a colleague's newer version
+- A new file saved into a folder that was renamed or moved in Microsoft 365 before it uploaded now follows the folder
+- A new file refused with "no access" is no longer retried every 15 minutes: it shows a problem icon
+- Two programs listing the same large folder at once (Explorer and a copy or sync tool) could miss files or see one twice while the folder loaded or had just changed. Fixed.
+- A read, write or folder listing that hit an unexpected error could hang that file for every program until the drive stopped; it now fails with an error.
+- Folder listings that were read again or left the cache stayed in memory (hundreds of MB per user over a day in big folders); they are freed now.
+- A folder opened by its full path right after a library was first used (address bar, Quick Access, a recent file, an Office dialog, a mapped letter) is kept current by the change feed
+- Shared with me no longer re-checks every shared item at once each week: re-checks spread over the week, at most 100 items are looked up per run, and items that can't be found are tried again later instead of at every run.
+- Users without a OneDrive (no licence, personal sites blocked) now get their SharePoint sites only
+- A search in This PC, Home, Quick access or a local folder is left alone; it could be taken for a search in the VFS365 folder shown before and pull you back into the drive. The search watcher reads only the Explorer tab that navigated and releases what it reads.
+
 ## 0.7.3
 
 - The tray menu no longer has Refresh. Discovery still runs at each start and daily, and folders stay current through the change feeds.

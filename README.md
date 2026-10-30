@@ -87,6 +87,8 @@ Idle drives make no calls. Discovery and change checks yield to what users open 
 
 Right-click a file or folder in the drive (on Windows 11 under "Show more options"), then VFS365: Open in browser, Open in desktop app (Word, Excel, PowerPoint, co-authoring included), Copy link (for people who already have access; no sharing link is made), Version history, and Share in browser (opens the item in the browser, where its Share button is). On a conflict copy also Keep this version (the copy becomes a new version of the original; the other version stays in its version history) and Compare with the original.
 
+A double-click on a Word, Excel or PowerPoint file in the drive opens it from Microsoft 365, with co-authoring and AutoSave, unless the copy on the drive has changes that aren't uploaded yet (policy `OfficeFiles`: desktop app, browser or the copy on the drive).
+
 ### Tray
 
 The tray icon follows the taskbar theme and shows whether everything is saved (plain), something is waiting to upload (amber) or needs attention (red). Its menu has Show files, Show log, Collect diagnostics (one zip for the helpdesk, tokens removed), Restart, Sign in when needed, and Help (your own service desk page by policy). English or Dutch, by the Windows display language.
@@ -158,7 +160,7 @@ See [Monitoring in DEPLOYMENT.md](docs/DEPLOYMENT.md#monitoring) for every colum
 
 - Discovery uses SharePoint Search: sites excluded from search and Restricted Content Discovery sites aren't found. Pinned locations (policy, or `vfs365 pin` per user) fill the gap.
 - Byte-range locks don't cross machines: multi-user Access, QuickBooks and SQLite files are unsafe. The `DatabaseFiles` policy makes them read-only or blocks them if you want / expect concurrent use
-- No Office co-authoring from the drive; that works only through Microsoft's own client. Right-click a Word, Excel or PowerPoint file, VFS365, Open in desktop app to open it from Microsoft 365 instead, where co-authoring works.
+- Office co-authors only files it opens from Microsoft 365. A double-click in Explorer does that; Office's own File > Open, its Recent list, the command line and other programs open the copy on the drive, without co-authoring.
 - While a user's drive isn't running, `\\VFS365` is an ordinary server name to Windows. Turn off LLMNR and NetBIOS name resolution and own the DNS name, as in [The name VFS365 on the network](docs/DEPLOYMENT.md#the-name-vfs365-on-the-network).
 - x64 apps on ARM64 devices can't resolve typed `\\VFS365` paths in their file dialogs (files open and save normally); see [Known limitations](docs/DEPLOYMENT.md#known-limitations).
 

@@ -203,8 +203,8 @@ public sealed class VerbActions(DriveEngine engine, Func<string, string, Cancell
 
 /// <summary>
 /// The running agent's side of Explorer's VFS365 menu: writes the verbs for the volume's current roots (the drive's letter, its UNC path
-/// and the letters for folders, checked every 30 s, written when they change), answers the verb pipe and removes the verbs when
-/// disposed (a clean stop).
+/// and the letters for folders, checked every 30 s, written when they change), and the Office verb (<see cref="OfficeVerbs"/>), answers
+/// the verb pipe and removes the verbs when disposed (a clean stop).
 /// </summary>
 public sealed class ExplorerMenu : IDisposable
 {
@@ -212,6 +212,7 @@ public sealed class ExplorerMenu : IDisposable
     readonly string? letter;
     readonly SessionDriveLetters? folders;
     readonly ShellPublisher? shell;
+    readonly OfficeVerbs office;
     readonly Action<string> log;
     readonly CancellationTokenSource stop = new();
     readonly Timer timer;
@@ -219,10 +220,10 @@ public sealed class ExplorerMenu : IDisposable
     readonly Lock gate = new();
     bool disposed;
 
-    ExplorerMenu(string exe, string unc, string? letter, SessionDriveLetters? folders, ShellPublisher? shell, VerbActions actions,
-        Func<string, CancellationToken, Task>? search, Action<string> log)
+    ExplorerMenu(string exe, string unc, string? letter, SessionDriveLetters? folders, ShellPublisher? shell, VerbActions actions, OfficeVerbs office,
+        OfficeOpen opener, Func<string, CancellationToken, Task>? search, Action<string> log)
     {
-        (this.exe, this.unc, this.letter, this.folders, this.shell, this.log) = (exe, unc, letter, folders, shell, log);
+        (this.exe, this.unc, this.letter, this.folders, this.shell, this.office, this.log) = (exe, unc, letter, folders, shell, office, log);
         Update();
         timer = new Timer(_ => Update(), null, TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(30));
         serving = Task.Run(async () =>
@@ -231,11 +232,16 @@ public sealed class ExplorerMenu : IDisposable
             {
                 await VerbPipe.ServeAsync(VerbPipe.CurrentName(), (verb, path) =>
                 {
-                    if (!ExplorerVerbs.IsVerb(verb) || path.Length is 0 or > 32767)
+                    if (!(ExplorerVerbs.IsVerb(verb) || verb == OfficeOpen.Verb) || path.Length is 0 or > 32767)
                     {
                         return "unknown request";
                     }
-                    _ = Task.Run(() => verb == "search" && search is not null ? search(path, stop.Token) : actions.RunAsync(verb, path, stop.Token));
+                    _ = Task.Run(() => verb switch
+                    {
+                        OfficeOpen.Verb => opener.RunAsync(path, stop.Token),
+                        "search" when search is not null => search(path, stop.Token),
+                        _ => actions.RunAsync(verb, path, stop.Token),
+                    });
                     return null;
                 }, log, stop.Token);
             }
@@ -252,10 +258,10 @@ public sealed class ExplorerMenu : IDisposable
     /// <summary>
     /// Starts the menu for a mounted drive; null (and said why) when vfs365-agent.exe isn't next to this program (a development build of
     /// vfs365.exe) or the registry refuses it. The shell section (overlay icons, the Windows 11 menu) starts with it; without
-    /// <paramref name="overlays"/> (policy OverlayIcons) it says there are none.
+    /// <paramref name="overlays"/> (policy OverlayIcons) it says there are none. The Office verb follows <paramref name="officeFiles"/>.
     /// </summary>
     public static ExplorerMenu? Start(DriveEngine engine, DriveApi api, string unc, string? letter, SessionDriveLetters? folders, bool overlays,
-        Func<string, CancellationToken, Task>? search, Action<string, string, bool> notify, Action<string> say, Action<string> log)
+        OfficeSettings officeFiles, Func<string, CancellationToken, Task>? search, Action<string, string, bool> notify, Action<string> say, Action<string> log)
     {
         var exe = Path.Combine(AppContext.BaseDirectory, "vfs365-agent.exe");
         if (!File.Exists(exe))
@@ -263,22 +269,44 @@ public sealed class ExplorerMenu : IDisposable
             say($"Explorer:   no VFS365 menu, {exe} is missing");
             return null;
         }
-        var actions = new VerbActions(engine, api.GetLinksAsync,
-            path => ExplorerVerbs.VolumePath(path, unc, letter, folders?.Folders() ?? new Dictionary<string, string>()),
-            Shell, Clipboard.SetText, notify, log);
+        string? VolumePath(string path) => ExplorerVerbs.VolumePath(path, unc, letter, folders?.Folders() ?? new Dictionary<string, string>());
+        var actions = new VerbActions(engine, api.GetLinksAsync, VolumePath, Shell, Clipboard.SetText, notify, log);
+        var office = new OfficeVerbs(Registry.CurrentUser, exe, officeFiles, OfficeAssociations.Of);
+        var opener = new OfficeOpen(engine, api.GetLinksAsync, VolumePath, officeFiles, OfficeAssociations.Of, Shell,
+            (path, chooseApp) => LocalOpen.OpenAsync(path, chooseApp).ContinueWith(t => log($"Office open: Windows didn't open it: {t.Exception!.InnerException!.Message}"),
+                CancellationToken.None, TaskContinuationOptions.OnlyOnFaulted, TaskScheduler.Default),
+            AskMissingAsync, log);
+        say(officeFiles switch
+        {
+            { Mode: OfficeFilesMode.Local } => "Office:     files open from the drive (policy OfficeFiles Local)",
+            { Types.Count: 0 } => "Office:     files open from the drive (no type in policy OfficeFileTypes)",
+            var listed => $"Office:     {string.Join(" ", listed.Types)} open {(listed.Mode == OfficeFilesMode.Browser ? "in the browser" : "in their desktop app from Microsoft 365")} " +
+                $"on a double-click on the drive; without an app: {listed.Missing}",
+        });
         var shell = StartShell(engine, overlays, say, log);
         try
         {
-            return new ExplorerMenu(exe, unc, letter, folders, shell, actions, search, log);
+            return new ExplorerMenu(exe, unc, letter, folders, shell, actions, office, opener, search, log);
         }
         catch (Exception e) when (e is IOException or UnauthorizedAccessException or System.Security.SecurityException)
         {
             say($"Warning:    could not add the VFS365 menu in Explorer: {e.Message}");
             shell?.Dispose();
             ExplorerVerbs.Remove(Registry.CurrentUser);
+            OfficeVerbs.RemoveAll(Registry.CurrentUser);
             return null;
         }
     }
+
+    /// <summary>A listed type without an app (policy OfficeMissing Ask): the browser, an app on this PC, or nothing.</summary>
+    static async Task<MissingChoice> AskMissingAsync(string app, string name, CancellationToken ct) =>
+        await AskWindow.ChooseAsync(UiText.Get("Office.Ask.Title"), UiText.Get("Office.Ask.Text", app, name), UiText.Get("Office.Ask.Browser"),
+            UiText.Get("Office.Ask.App"), UiText.Get("Office.Ask.Cancel"), ct) switch
+        {
+            1 => MissingChoice.Browser,
+            2 => MissingChoice.ThisPc,
+            _ => MissingChoice.Cancel,
+        };
 
     static ShellPublisher? StartShell(DriveEngine engine, bool overlays, Action<string> say, Action<string> log)
     {
@@ -357,6 +385,19 @@ public sealed class ExplorerMenu : IDisposable
             {
                 log($"Explorer menu: could not write it: {e.Message}");
             }
+            // The Office verb isn't part of the Windows 11 menu package: written either way
+            try
+            {
+                if (office.Update(Roots(unc, letter, folders?.Folders().Keys ?? [])))
+                {
+                    ExplorerLocation.Refresh(); // Explorer reads associations again
+                    log($"Explorer menu: Office files: {office.Summary()}");
+                }
+            }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException or System.Security.SecurityException)
+            {
+                log($"Explorer menu: could not write the Office verb: {e.Message}");
+            }
             shell?.SetRoots(ShellRoots(unc, letter, folders?.Folders() ?? new Dictionary<string, string>()));
         }
     }
@@ -377,6 +418,10 @@ public sealed class ExplorerMenu : IDisposable
         try
         {
             ExplorerVerbs.Remove(Registry.CurrentUser);
+            if (office.Remove())
+            {
+                ExplorerLocation.Refresh();
+            }
         }
         catch (Exception e) when (e is IOException or UnauthorizedAccessException or System.Security.SecurityException)
         {

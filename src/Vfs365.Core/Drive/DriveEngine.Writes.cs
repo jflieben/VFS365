@@ -125,8 +125,15 @@ public sealed partial class DriveEngine
                     return ItemEntry(target.Resolved.Path, target.Drive, target.DriveId, target.DrivePath, folder);
                 }
 
-                // A file created where one was just deleted takes over that item. Its journal isn't forced to disk: nothing is acknowledged yet.
-                created = new PendingFile(target.DriveId, target.DrivePath, staging!, (local as GoneItem)?.Item, Now) { Dirty = true, Writers = 1, Creator = creator };
+                // A file created where one was just deleted takes over that item (as the version its app had open). Its journal isn't
+                // forced to disk: nothing is acknowledged yet.
+                created = new PendingFile(target.DriveId, target.DrivePath, staging!, local is GoneItem gone ? gone.Opened ?? gone.Item : null, Now)
+                {
+                    Dirty = true,
+                    Writers = 1,
+                    Creator = creator,
+                    Folder = FolderOf(target.DriveId, ParentOf(target.DrivePath)),
+                };
                 overlay[key] = created;
                 JournalLater(created);
                 return PendingEntry(target.Resolved.Path, target.Drive, created);
@@ -218,7 +225,13 @@ public sealed partial class DriveEngine
                     throw;
                 }
             }
-            var staged = new PendingFile(target.DriveId, target.DrivePath, staging, item, Now) { Dirty = truncate, Alias = alias, Writers = 1 };
+            var staged = new PendingFile(target.DriveId, target.DrivePath, staging, item, Now)
+            {
+                Dirty = truncate,
+                Alias = alias,
+                Writers = 1,
+                Folder = FolderOf(target.DriveId, ParentOf(target.DrivePath)),
+            };
             overlay[key] = staged;
             if (truncate)
             {
@@ -237,15 +250,132 @@ public sealed partial class DriveEngine
     /// version (If-Match), so the newer one ends the save in a conflict copy. The eTag is known for versions this engine saved; else
     /// the cTag stands in for it (<see cref="StandInETag"/>) and the upload compares cTags first (<see cref="UploadIntoAsync"/>).
     /// </summary>
-    DriveItemInfo AsRead(DriveItemInfo current, FsEntry read)
+    DriveItemInfo AsRead(DriveItemInfo current, FsEntry read) => AsRead(current, read.ContentTag!, read.Size);
+
+    DriveItemInfo AsRead(DriveItemInfo current, string tag, long size)
     {
-        var tag = read.ContentTag!;
         var eTag = saved.TryGetValue(current.Id, out var known) && (known.Item.CTag ?? known.Item.ETag) == tag ? known.Item.ETag : tag;
-        return current.CTag is null ? current with { ETag = tag, Size = read.Size } : current with { ETag = eTag, CTag = tag, Size = read.Size };
+        return current.CTag is null ? current with { ETag = tag, Size = size } : current with { ETag = eTag, CTag = tag, Size = size };
     }
 
     /// <summary>A base from <see cref="AsRead"/> whose eTag isn't known: never sent as If-Match.</summary>
     static bool StandInETag(DriveItemInfo item) => item.CTag is not null && item.ETag == item.CTag;
+
+    /// <summary>
+    /// The versions open handles opened, by item ID, with who opened them (the front end's opener, a process). A save that renames onto
+    /// an item names the oldest older version its app has open (<see cref="OlderOpened"/>). Handles on a version this engine's save
+    /// replaced count as on the save.
+    /// </summary>
+    readonly ConcurrentDictionary<string, List<OpenVersion>> openVersions = new(StringComparer.Ordinal);
+
+    /// <summary>A handle's version of an item, from its open until it is disposed. Tag and Size change under the list's lock.</summary>
+    sealed class OpenVersion(DriveEngine engine, string itemId, object? opener, string tag, long size, DateTimeOffset at) : IDisposable
+    {
+        int closed;
+
+        public string ItemId => itemId;
+        public object? Opener => opener;
+        public string Tag { get; set; } = tag;
+        public long Size { get; set; } = size;
+        public DateTimeOffset At => at;
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref closed, 1) == 0)
+            {
+                engine.Closed(this);
+            }
+        }
+    }
+
+    /// <summary>
+    /// A handle was opened on <paramref name="entry"/> by <paramref name="opener"/> (as the front end tells apps apart: a process). Until
+    /// the returned token is disposed (the handle's close), a rename-based save of that opener onto the item names the version it opened
+    /// when a newer one came meanwhile (<see cref="OlderOpened"/>). Null for folders and content not uploaded yet.
+    /// </summary>
+    public IDisposable? Opened(FsEntry entry, object? opener)
+    {
+        if (entry.IsDirectory || entry.ItemId is not { } id || entry.ContentTag is not { } tag || entry.StagingPath is not null)
+        {
+            return null;
+        }
+        var version = new OpenVersion(this, id, opener, tag, entry.Size, Now);
+        while (true)
+        {
+            var list = openVersions.GetOrAdd(id, _ => []);
+            lock (list)
+            {
+                // A list emptied meanwhile is out of the map: a new one is taken
+                if (openVersions.TryGetValue(id, out var current) && ReferenceEquals(current, list))
+                {
+                    list.Add(version);
+                    return version;
+                }
+            }
+        }
+    }
+
+    void Closed(OpenVersion version)
+    {
+        if (openVersions.TryGetValue(version.ItemId, out var list))
+        {
+            lock (list)
+            {
+                if (list.Remove(version) && list.Count == 0)
+                {
+                    openVersions.TryRemove(new KeyValuePair<string, List<OpenVersion>>(version.ItemId, list));
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// The item as the oldest version <paramref name="opener"/> has open, when that is another one than <paramref name="item"/> (the
+    /// item as known now) holds: a newer one came since, a colleague's save. A save into it then names that version (If-Match), as a
+    /// write in place does (<see cref="AsRead"/>), so the newer one ends the save instead of being replaced unseen. Null when there is
+    /// none, without an opener, and for an item that stands for a version read already.
+    /// </summary>
+    DriveItemInfo? OlderOpened(DriveItemInfo item, object? opener)
+    {
+        if (opener is null || item.IsFolder || StandInETag(item) || !openVersions.TryGetValue(item.Id, out var list))
+        {
+            return null;
+        }
+        var current = item.CTag ?? item.ETag;
+        // A handle opened on a version this engine's save replaced, after that save moved the others along (Reopened), is on the save too
+        var replaced = saved.TryGetValue(item.Id, out var own) && (own.Item.CTag ?? own.Item.ETag) == current ? own.Replaced : [];
+        OpenVersion? oldest = null;
+        string? tag = null;
+        long size = 0;
+        lock (list)
+        {
+            foreach (var version in list)
+            {
+                if (Equals(version.Opener, opener) && version.Tag != current && !replaced.Contains(version.Tag) && (oldest is null || version.At < oldest.At))
+                {
+                    (oldest, tag, size) = (version, version.Tag, version.Size);
+                }
+            }
+        }
+        return tag is null ? null : AsRead(item, tag, size);
+    }
+
+    /// <summary>Handles on the version a save of this engine replaced now count as on the save, as reads follow it (<see cref="Follow"/>).</summary>
+    void Reopened(DriveItemInfo item, DriveItemInfo replaced)
+    {
+        if ((replaced.CTag ?? replaced.ETag) is not { } before || (item.CTag ?? item.ETag) is not { } after || !openVersions.TryGetValue(item.Id, out var list))
+        {
+            return;
+        }
+        lock (list)
+        {
+            foreach (var version in list.Where(v => v.Tag == before))
+            {
+                version.Tag = after;
+                version.Size = item.Size;
+            }
+        }
+    }
 
     /// <summary>
     /// What an entry handed out earlier refers to now, for a handle that keeps it. A staged entry follows its content through renames
@@ -324,6 +454,7 @@ public sealed partial class DriveEngine
         if (replaced?.Id == item.Id)
         {
             before.AddRange(new[] { replaced.CTag, replaced.ETag }.OfType<string>());
+            Reopened(item, replaced);
         }
         var now = item.CTag ?? item.ETag;
         saved[item.Id] = new SavedItem(item, Now, [.. before.Where(tag => tag != now).Distinct(StringComparer.Ordinal)]);
@@ -779,9 +910,9 @@ public sealed partial class DriveEngine
 
     /// <summary>
     /// Folders go at once (without the write gate; operations below them wait); files are hidden now and deleted after the settle window
-    /// unless a save claims them.
+    /// unless a save claims them. <paramref name="opener"/>: the app deleting (<see cref="Opened"/>), whose save may claim the file.
     /// </summary>
-    public async Task DeleteAsync(string path, CancellationToken ct)
+    public async Task DeleteAsync(string path, CancellationToken ct, object? opener = null)
     {
         var target = await DeletableAsync(path, ct);
         await LookAheadAsync(target.DriveId, target.DrivePath, ct);
@@ -831,7 +962,7 @@ public sealed partial class DriveEngine
                 Log($"deleted folder {target.DrivePath}");
                 return;
             }
-            overlay[key] = new GoneItem(target.DriveId, target.DrivePath, item, Now + options.SettleWindow, deleteOnExpiry: true);
+            overlay[key] = new GoneItem(target.DriveId, target.DrivePath, item, Now + options.SettleWindow, deleteOnExpiry: true) { Opened = OlderOpened(item, opener) };
         }
         finally
         {
@@ -839,7 +970,11 @@ public sealed partial class DriveEngine
         }
     }
 
-    public async Task RenameAsync(string source, string destination, bool replace, CancellationToken ct)
+    /// <summary>
+    /// Renames or moves a file or folder; onto a file, with <paramref name="replace"/>, a save into that item. <paramref name="opener"/>:
+    /// the app renaming (<see cref="Opened"/>): a save of its into an item it has an older version of open names that version.
+    /// </summary>
+    public async Task RenameAsync(string source, string destination, bool replace, CancellationToken ct, object? opener = null)
     {
         var from = await WritableAsync(source, ct);
         var to = ns.Resolve(destination);
@@ -889,12 +1024,13 @@ public sealed partial class DriveEngine
                 fromLocal = overlay.GetValueOrDefault(fromKey);
                 toLocal = sameName ? null : overlay.GetValueOrDefault(toKey);
                 toRemote = sameName || toLocal is not null ? null : await LookupAsync(driveId, to.DrivePath, ct);
+                // As the version the app had open, when a newer one came since (staged content names the version its writer read)
                 toItem = toLocal switch
                 {
-                    GoneItem gone => gone.Item,
+                    GoneItem gone => gone.Opened ?? gone.Item,
                     PendingFile pending => pending.Base,
-                    AliasItem alias => alias.Item,
-                    _ => toRemote,
+                    AliasItem alias => OlderOpened(alias.Item, opener) ?? alias.Item,
+                    _ => toRemote is null ? null : OlderOpened(toRemote, opener) ?? toRemote,
                 };
                 if (toItem is not null && Blocking([fromKey], null) is not null)
                 {
@@ -938,9 +1074,10 @@ public sealed partial class DriveEngine
             var item = await LookupAsync(driveId, from.DrivePath, ct) ?? throw new FsException(FsError.NotFound, source);
             if (!item.IsFolder && !sameName && toTemp && !onServer)
             {
-                // Saving: the original steps aside under a temp name. Kept local; restored unless new content claims it.
+                // Saving: the original steps aside under a temp name. Kept local; restored unless new content claims it, which names
+                // the version the app had open
                 DropLocal(toLocal);
-                overlay[fromKey] = new GoneItem(driveId, from.DrivePath, item, Now + options.SettleWindow, deleteOnExpiry: false);
+                overlay[fromKey] = new GoneItem(driveId, from.DrivePath, item, Now + options.SettleWindow, deleteOnExpiry: false) { Opened = OlderOpened(item, opener) };
                 overlay[toKey] = new AliasItem(driveId, to.DrivePath, item, from.DrivePath, Now + options.SettleWindow);
                 return;
             }
@@ -1039,6 +1176,13 @@ public sealed partial class DriveEngine
         {
             uploading.ServerPath = Moved(uploading.ServerPath!);
         }
+        foreach (var waiting in overlay.Values.OfType<PendingFile>().ToList())
+        {
+            if (waiting.DriveId == driveId && waiting.Folder is { } known && (known.Path.Equals(from, StringComparison.OrdinalIgnoreCase) || Below(known.Path)))
+            {
+                waiting.Folder = known with { Path = Moved(known.Path) }; // the same folders, by ID
+            }
+        }
         var count = 0;
         foreach (var local in overlay.Values.Where(l => l.Key.StartsWith(below, StringComparison.OrdinalIgnoreCase)).ToList())
         {
@@ -1060,8 +1204,33 @@ public sealed partial class DriveEngine
         overlay[local.Key] = local;
         if (local is PendingFile pending)
         {
+            NoteFolder(pending);
             JournalLater(pending);
         }
+    }
+
+    /// <summary>A pending file is in another folder now: that folder's item ID, as far as cached here, is its <see cref="PendingFile.Folder"/>.</summary>
+    void NoteFolder(PendingFile pending)
+    {
+        if (pending.Folder?.Path.Equals(ParentOf(pending.DrivePath), StringComparison.OrdinalIgnoreCase) != true)
+        {
+            pending.Folder = FolderOf(pending.DriveId, ParentOf(pending.DrivePath));
+        }
+    }
+
+    /// <summary>A folder's item ID as cached here (its listing, its parent's, a lookup), with its path; null for the drive's root and when unknown.</summary>
+    FolderRef? FolderOf(string driveId, string folderPath)
+    {
+        if (folderPath.Length == 0)
+        {
+            return null;
+        }
+        var id = listings.TryGetValue(Key(driveId, folderPath), out var listing) && listing.FolderId is { } listed ? listed
+            : listings.TryGetValue(Key(driveId, ParentOf(folderPath)), out var parent) && parent.Items.TryGetValue(NameOf(folderPath), out var child) && child.IsFolder ? child.Id
+            : lookups.TryGetValue(Key(driveId, folderPath), out var looked) && looked.Item is { IsFolder: true } found ? found.Id
+            : knownFolders.TryGetValue(Key(driveId, folderPath), out var known) ? known.Id
+            : null;
+        return id is null ? null : new FolderRef(folderPath, id);
     }
 
     /// <summary>
@@ -1155,7 +1324,7 @@ public sealed partial class DriveEngine
                 }
                 if (pending.RetryAt is { } retryAt)
                 {
-                    if (all || retryAt <= Now)
+                    if (all || retryAt <= Now || FolderGoneHere(pending))
                     {
                         pending.RetryAt = null;
                         pending.Queued = true;
@@ -1270,24 +1439,26 @@ public sealed partial class DriveEngine
     }
 
     /// <summary>
-    /// A due delete, with If-Match: the version the user deleted. Changed since in its metadata only (412, same cTag), the item is
-    /// deleted as it is now; with new content it is kept (Kept: the item now), so a colleague's newer version never goes by accident.
+    /// A due delete, with If-Match: the version the user deleted (the one its app had open, <see cref="GoneItem.Opened"/>). Changed
+    /// since in its metadata only (412, same cTag), the item is deleted as it is now; with new content it is kept (Kept: the item now),
+    /// so a colleague's newer version never goes by accident.
     /// </summary>
     async Task<(Exception? Failure, DriveItemInfo? Kept)> DeleteDueAsync(GoneItem gone)
     {
+        var deleted = gone.Opened ?? gone.Item;
         try
         {
             try
             {
-                await api.DeleteAsync(gone.DriveId, gone.Item.Id, gone.Item.ETag, CancellationToken.None);
+                await api.DeleteAsync(gone.DriveId, deleted.Id, deleted.ETag, CancellationToken.None);
             }
             catch (RemoteException e) when (e.Error == RemoteError.Conflict)
             {
-                if (await api.GetItemByIdAsync(gone.DriveId, gone.Item.Id, CancellationToken.None) is not { } current)
+                if (await api.GetItemByIdAsync(gone.DriveId, deleted.Id, CancellationToken.None) is not { } current)
                 {
                     return (null, null);
                 }
-                if (current.CTag is null || current.CTag != gone.Item.CTag)
+                if (current.CTag is null || current.CTag != deleted.CTag)
                 {
                     return (new RemoteException(RemoteError.Conflict, $"412 {gone.Name} changed in Microsoft 365 after it was deleted here, so it is kept"), current);
                 }
@@ -1433,6 +1604,7 @@ public sealed partial class DriveEngine
         pending.Unconfirmed = null;
         UploadTarget? sent = null;
         DriveItemInfo? uploaded = null;
+        RemoteException? refused = null;
         DriveItemInfo item;
         try
         {
@@ -1466,6 +1638,14 @@ public sealed partial class DriveEngine
                         sent = await NewTargetAsync(driveId, ParentOf(to), NameOf(to), ct);
                         return await api.UploadAsync(driveId, sent, pending.StagingPath, ct);
                     }
+                    catch (RemoteException e) when (e.Error == RemoteError.Conflict && TempLike(pending))
+                    {
+                        // A newer version than the app had (a colleague's save): the save fails, so the app says so, and the content is
+                        // kept next to the file as a conflict copy, since an app drops its temp file when it gives up
+                        sent = null;
+                        refused = e;
+                        return (await CopyAsync(pending, ConflictName, UploadKind.ConflictCopy, e, ct, ParentOf(to), NameOf(to))).Item!;
+                    }
                 }
                 return toItem is null ? await api.MoveAsync(driveId, uploaded!.Id, await FolderIdAsync(driveId, ParentOf(to), ct), NameOf(to), ct) : uploaded!;
             }, pending.Key, Key(driveId, to));
@@ -1483,6 +1663,11 @@ public sealed partial class DriveEngine
             // No answer: it may have gone through, which the next attempt looks up before it sends the file again
             pending.Unconfirmed = new UnconfirmedUpload(sent, writes);
             throw;
+        }
+        if (refused is not null)
+        {
+            KeptAsCopy(pending, item, to, writes, refused);
+            throw refused;
         }
         if (toItem is null && originalBase is not null)
         {
@@ -1505,6 +1690,7 @@ public sealed partial class DriveEngine
                 pending.Base = item;
                 pending.Alias = null;
                 overlay[pending.Key] = pending;
+                NoteFolder(pending);
                 Claimed(driveId, item);
                 Saved(item, into);
                 Upsert(driveId, to, item);
@@ -1533,6 +1719,37 @@ public sealed partial class DriveEngine
         }
         Log($"saved {to} into {item.Id} (from {NameOf(from)})");
         return (null, false);
+    }
+
+    /// <summary>
+    /// A save renamed onto <paramref name="to"/> was refused for a newer version there (<paramref name="refused"/>): its content went into
+    /// <paramref name="copy"/> next to it. The temp file it came from goes, unless it was written meanwhile, so retries of the rename don't
+    /// make more copies. Called with the write gate held; the caller then fails the rename.
+    /// </summary>
+    void KeptAsCopy(PendingFile pending, DriveItemInfo copy, string to, int writes, RemoteException refused)
+    {
+        var driveId = pending.DriveId;
+        var copyPath = JoinDrivePath(ParentOf(to), copy.Name);
+        pending.Writing.EnterWriteLock();
+        try
+        {
+            if (pending.Writes == writes)
+            {
+                Uploaded(pending, copy, copyPath, null);
+            }
+            else
+            {
+                Upsert(driveId, copyPath, copy);
+            }
+        }
+        finally
+        {
+            pending.Writing.ExitWriteLock();
+        }
+        Invalidate(driveId, to);
+        ConflictCopyMade(driveId, copy, refused.Current);
+        Log($"{to} changed in Microsoft 365 since it was opened here: the save into it is refused, its content is kept as {copy.Name}");
+        Notify(NoticeKind.ConflictCopy, driveId, to, copy.Name, refused.Current);
     }
 
     async Task RenameAliasAsync(AliasItem alias, string to, DriveItemInfo? toItem, LocalState? toLocal, bool onServer, CancellationToken ct)
@@ -1650,11 +1867,17 @@ public sealed partial class DriveEngine
 
     /// <summary>
     /// What became of an upload: the item the content went into, at which path and how, or the failure. Unconfirmed: the target of an
-    /// upload that failed without an answer and couldn't be looked up, checked before the next attempt.
+    /// upload that failed without an answer and couldn't be looked up, checked before the next attempt. Permanent: a failure that
+    /// retrying on a timer can't fix. FolderMoved: nothing sent yet, the file's folder (Item) is elsewhere now, DrivePath is the file there.
+    /// SoughtFolder: the file's folder was looked for by ID (<see cref="FolderGoneAsync"/>).
     /// </summary>
-    sealed record UploadOutcome(DriveItemInfo? Item, string DrivePath, UploadKind Kind, Exception? Cause, UploadTarget? Unconfirmed = null);
+    sealed record UploadOutcome(DriveItemInfo? Item, string DrivePath, UploadKind Kind, Exception? Cause, UploadTarget? Unconfirmed = null)
+    {
+        public bool Permanent { get; init; }
+        public bool SoughtFolder { get; init; }
+    }
 
-    enum UploadKind { Saved, AsNew, ConflictCopy, Recovered, Failed }
+    enum UploadKind { Saved, AsNew, ConflictCopy, Recovered, FolderMoved, FolderGone, Failed }
 
     /// <summary>
     /// Uploads a pending file. Called with the write gate held; lets it go during the transfer, so other files go on meanwhile, and
@@ -1725,6 +1948,11 @@ public sealed partial class DriveEngine
             }
             var target = TargetOf(pending);
             outcome = await TransferAsync(() => SendAsync(pending, target, writes, ct), new Transfer { Upload = pending }, [pending.Key]);
+            pending.FolderSought |= outcome.SoughtFolder;
+            if (outcome.Kind == UploadKind.FolderMoved)
+            {
+                outcome = await FollowFolderAsync(pending, outcome, writes, ct);
+            }
         }
         if (outcome.Kind is UploadKind.Saved or UploadKind.AsNew && ReferenceEquals(overlay.GetValueOrDefault(pending.Key), pending))
         {
@@ -1738,9 +1966,10 @@ public sealed partial class DriveEngine
             {
                 pending.Unconfirmed = new UnconfirmedUpload(sent, writes);
             }
-            if (cause is RemoteException { Error: RemoteError.Rejected })
+            var permanent = outcome.Permanent || Refused(cause, isNew);
+            if (permanent)
             {
-                // Retrying can't help: stays here, and in "Not saved", until it is saved or renamed again
+                // Retrying can't help: stays here, and in "Not saved", until it is saved or renamed again (or the agent starts again)
                 pending.Rejected = true;
                 pending.RetryAt = null;
                 Log($"error: upload of {pending.DrivePath} refused by Microsoft 365, it stays on this PC until it is renamed or saved again: {Short(cause)}");
@@ -1750,7 +1979,7 @@ public sealed partial class DriveEngine
                 pending.RetryAt = Now + RetryDelay(++pending.Failures);
                 Log($"upload of {pending.DrivePath} failed, retrying in {RetryDelay(pending.Failures).TotalMinutes:0.#} min: {Short(cause)}");
             }
-            if (!pending.Waiting)
+            if (!pending.Waiting || permanent) // once per file while retried; a refusal at each attempt the user asked for
             {
                 pending.Waiting = true;
                 Notify(NoticeKind.UploadWaiting, pending.DriveId, pending.DrivePath, Short(cause));
@@ -1763,7 +1992,7 @@ public sealed partial class DriveEngine
         pending.Writing.EnterWriteLock();
         try
         {
-            if (outcome.Kind is UploadKind.ConflictCopy or UploadKind.Recovered)
+            if (outcome.Kind is UploadKind.ConflictCopy or UploadKind.Recovered or UploadKind.FolderGone)
             {
                 // The content lives on in the copy; the original shows the server's version again
                 Invalidate(pending.DriveId, original);
@@ -1776,6 +2005,7 @@ public sealed partial class DriveEngine
                     overlay.TryRemove(pending.Key, out _);
                     pending.DrivePath = outcome.DrivePath;
                     overlay[pending.Key] = pending;
+                    NoteFolder(pending);
                 }
                 pending.Base = item;
                 pending.ServerPath = null;
@@ -1815,6 +2045,11 @@ public sealed partial class DriveEngine
                 Log($"{original} was still being written when the PC or the agent stopped: saved next to it as {item.Name}, the file itself is unchanged");
                 Notify(NoticeKind.ConflictCopy, pending.DriveId, original, item.Name);
                 break;
+            case UploadKind.FolderGone:
+                // Saved in another folder: the notice names the whole path
+                Log($"the folder of {original} was moved or deleted in Microsoft 365 before it uploaded: saved as {outcome.DrivePath}");
+                Notify(NoticeKind.ConflictCopy, pending.DriveId, original, VolumePath(pending.DriveId, outcome.DrivePath) ?? outcome.DrivePath);
+                break;
             case UploadKind.AsNew:
                 Log($"{original} was deleted on the server while it was changed here: saved as a new file");
                 goto default;
@@ -1825,6 +2060,56 @@ public sealed partial class DriveEngine
                 }
                 break;
         }
+    }
+
+    /// <summary>
+    /// The file's folder was renamed or moved in Microsoft 365 before the file uploaded (<see cref="FolderGoneAsync"/>): the files waiting
+    /// in it here move along, so they show where it is now, and this one is sent there. Called with the write gate held.
+    /// </summary>
+    async Task<UploadOutcome> FollowFolderAsync(PendingFile pending, UploadOutcome moved, int writes, CancellationToken ct)
+    {
+        if (!ReferenceEquals(overlay.GetValueOrDefault(pending.Key), pending))
+        {
+            return moved with { Kind = UploadKind.Failed }; // renamed or deleted meanwhile: tried again from where it is
+        }
+        var folder = moved.Item!;
+        var driveId = pending.DriveId;
+        var from = ParentOf(pending.DrivePath);
+        var to = ParentOf(moved.DrivePath);
+        lookups[Key(driveId, to)] = (folder, Now);
+        if (!from.Equals(to, StringComparison.OrdinalIgnoreCase))
+        {
+            var below = Key(driveId, from + "/");
+            foreach (var waiting in overlay.Values.OfType<PendingFile>()
+                .Where(p => p.IsLive && p.Alias is null && p.Key.StartsWith(below, StringComparison.OrdinalIgnoreCase)
+                    && (ReferenceEquals(p, pending) || !transfers.ContainsKey(p.Key)))
+                .ToList())
+            {
+                var path = to + waiting.DrivePath[from.Length..];
+                for (var attempt = 1; overlay.ContainsKey(Key(driveId, path)) && attempt < 10; attempt++)
+                {
+                    path = JoinDrivePath(ParentOf(path), ConflictName(waiting.Name, attempt)); // a file of that name waits there too
+                }
+                if (overlay.ContainsKey(Key(driveId, path)))
+                {
+                    continue;
+                }
+                if (waiting.Folder is { } known
+                    && (known.Path.Equals(from, StringComparison.OrdinalIgnoreCase) || known.Path.StartsWith(from + "/", StringComparison.OrdinalIgnoreCase)))
+                {
+                    waiting.Folder = known with { Path = to + known.Path[from.Length..] };
+                }
+                Log($"{waiting.DrivePath}: its folder is {to} in Microsoft 365 now, it waits to upload there");
+                Move(waiting, path);
+                Report(driveId, path, ChangeKind.Added, false);
+            }
+        }
+        if (pending.ServerPath is not null)
+        {
+            pending.ServerPath = pending.DrivePath;
+        }
+        var target = TargetOf(pending);
+        return await TransferAsync(() => SendAsync(pending, target, writes, ct, followFolder: false), new Transfer { Upload = pending }, [pending.Key]);
     }
 
     /// <summary>
@@ -1880,11 +2165,13 @@ public sealed partial class DriveEngine
     /// <summary>
     /// The transfer of <see cref="UploadPendingAsync"/>, without the write gate: into the item, else as a new file under its name when
     /// the item was deleted on the server, else as a conflict copy next to it. Content recovered without a flush goes only into a
-    /// "(recovered)" copy. A failure without an answer is looked up at once: it may have gone through.
+    /// "(recovered)" copy. A failure without an answer is looked up at once: it may have gone through. A new file's folder that isn't
+    /// at its path any more is looked for by ID (<see cref="FolderGoneAsync"/>), unless <paramref name="followFolder"/> is false.
     /// </summary>
-    async Task<UploadOutcome> SendAsync(PendingFile pending, UploadTarget target, int writes, CancellationToken ct)
+    async Task<UploadOutcome> SendAsync(PendingFile pending, UploadTarget target, int writes, CancellationToken ct, bool followFolder = true)
     {
         UploadTarget? sent = null;
+        var folder = target.ParentPath ?? ParentOf(pending.DrivePath);
         try
         {
             if (pending.Recovered)
@@ -1936,6 +2223,12 @@ public sealed partial class DriveEngine
                 return await CopyAsync(pending, ConflictName, UploadKind.ConflictCopy, e, ct);
             }
         }
+        catch (Exception e) when (followFolder && !ct.IsCancellationRequested
+            && e is FsException { Error: FsError.NotFound } or RemoteException { Error: RemoteError.NotFound or RemoteError.Gone })
+        {
+            // Out here only from a new file's upload (items are uploaded into by ID, above): its folder isn't where its path says
+            return await FolderGoneAsync(pending, folder, e, ct);
+        }
         catch (Exception e) when (sent is not null && !ct.IsCancellationRequested && MayHaveLanded(e) && pending.Writes == writes)
         {
             try
@@ -1957,6 +2250,14 @@ public sealed partial class DriveEngine
             return new(null, pending.DrivePath, UploadKind.Failed, e);
         }
     }
+
+    /// <summary>
+    /// Retrying on a timer can't help: a name or request SharePoint refuses (400), or a new file in a folder the user may not add to
+    /// (403; a 401 that outlived a new token is a sign-in problem, and passes).
+    /// </summary>
+    static bool Refused(Exception e, bool isNew) =>
+        e is RemoteException { Error: RemoteError.Rejected }
+        || isNew && e is RemoteException { Error: RemoteError.AccessDenied } denied && denied.Message.StartsWith("403", StringComparison.Ordinal);
 
     /// <summary>A failure that doesn't tell whether a write reached Microsoft 365: no answer (network, timeout) or a server error.</summary>
     static bool MayHaveLanded(Exception e) =>
@@ -1998,6 +2299,111 @@ public sealed partial class DriveEngine
     }
 
     /// <summary>
+    /// A new file's folder isn't at <paramref name="folderPath"/> in Microsoft 365 any more: renamed, moved or deleted there before the
+    /// file uploaded. Found by its last known ID (<see cref="PendingFile.Folder"/>), the file follows it: FolderMoved, and the caller
+    /// moves it there and sends it again. Deleted (or not to be placed), the content goes into the nearest folder above that is still
+    /// there as a "(recovered)" copy. A failure that may pass (no network) is retried as usual; another one is permanent.
+    /// </summary>
+    async Task<UploadOutcome> FolderGoneAsync(PendingFile pending, string folderPath, Exception cause, CancellationToken ct)
+    {
+        try
+        {
+            if (pending.Folder is { } known && known.Path.Equals(folderPath, StringComparison.OrdinalIgnoreCase)
+                && await api.GetItemByIdAsync(pending.DriveId, known.Id, ct) is { IsFolder: true } folder
+                && await PathOfAsync(pending.DriveId, folder, ct) is { } path)
+            {
+                Log($"{pending.DrivePath}: its folder {folderPath} is {path} in Microsoft 365 now");
+                return new(folder, JoinDrivePath(path, pending.Name), UploadKind.FolderMoved, cause) { SoughtFolder = true };
+            }
+            var above = await NearestFolderAsync(pending.DriveId, ParentOf(folderPath), ct);
+            return await CopyAsync(pending, RecoveredName, UploadKind.FolderGone, cause, ct, above) with { SoughtFolder = true };
+        }
+        catch (Exception e) when (!ct.IsCancellationRequested && (IsTransient(e) || e is FsException { Error: FsError.NotFound }))
+        {
+            return new(null, pending.DrivePath, UploadKind.Failed, e) { SoughtFolder = true };
+        }
+        catch (Exception e) when (!ct.IsCancellationRequested)
+        {
+            var why = new RemoteException(RemoteError.NotFound, $"404 its folder {folderPath} was moved or deleted in Microsoft 365, and saving it elsewhere failed: {Short(e)}");
+            return new(null, pending.DrivePath, UploadKind.Failed, why) { Permanent = true, SoughtFolder = true };
+        }
+    }
+
+    /// <summary>
+    /// A file waiting to retry whose folder is gone here (the change feed applied a rename, move or delete): it looks for the folder
+    /// at once, so it shows where the folder is now, and only once (a retry that still fails backs off as before).
+    /// </summary>
+    bool FolderGoneHere(PendingFile pending) =>
+        !pending.FolderSought && pending.Folder is { } known && known.Path.Equals(ParentOf(pending.DrivePath), StringComparison.OrdinalIgnoreCase)
+        && !listings.ContainsKey(Key(pending.DriveId, known.Path)) && AboveIsMissing(pending.DriveId, pending.DrivePath);
+
+    /// <summary>
+    /// Where a folder is now: up its parents to the drive's root, or to a folder whose current listing places it. Null when that can't
+    /// be told (a folder above can't be read).
+    /// </summary>
+    async Task<string?> PathOfAsync(string driveId, DriveItemInfo folder, CancellationToken ct)
+    {
+        var root = await FolderIdAsync(driveId, "", ct);
+        var path = folder.Name;
+        var at = folder;
+        for (var depth = 0; depth < 64; depth++)
+        {
+            if (at.ParentId is not { } parentId)
+            {
+                return null;
+            }
+            if ((parentId == root ? "" : CurrentPathOf(driveId, parentId)) is { } above)
+            {
+                return JoinDrivePath(above, path);
+            }
+            try
+            {
+                if (await api.GetItemByIdAsync(driveId, parentId, ct) is not { IsFolder: true } parent)
+                {
+                    return null;
+                }
+                at = parent;
+            }
+            catch (RemoteException e) when (!IsTransient(e))
+            {
+                return null;
+            }
+            path = at.Name + "/" + path;
+        }
+        return null;
+    }
+
+    /// <summary>The path of a folder by its ID, where a current listing of it knows it.</summary>
+    string? CurrentPathOf(string driveId, string folderId)
+    {
+        var prefix = driveId + "|";
+        foreach (var (key, listing) in listings)
+        {
+            if (listing.FolderId == folderId && key.StartsWith(prefix, StringComparison.Ordinal) && CurrencyOf(driveId, key[prefix.Length..], out _) == Currency.Current)
+            {
+                return key[prefix.Length..];
+            }
+        }
+        return null;
+    }
+
+    /// <summary>The nearest folder at or above <paramref name="folderPath"/> that is there now ("" for the drive's root). Throws when none shows on the drive.</summary>
+    async Task<string> NearestFolderAsync(string driveId, string folderPath, CancellationToken ct)
+    {
+        for (var path = folderPath; ; path = ParentOf(path))
+        {
+            if (VolumePath(driveId, path) is null)
+            {
+                throw new RemoteException(RemoteError.NotFound, $"404 no folder above {folderPath} shows on the drive");
+            }
+            if (path.Length == 0 || await LookupAsync(driveId, path, ct, refreshParent: false) is { IsFolder: true })
+            {
+                return path;
+            }
+        }
+    }
+
+    /// <summary>
     /// Uploads into an existing item with If-Match. A 412 while the item still has the same content (its cTag: only a column, a label or
     /// the Document ID changed) is tried once more with the item's eTag now, so a metadata change doesn't end a save in a conflict copy.
     /// </summary>
@@ -2028,15 +2434,19 @@ public sealed partial class DriveEngine
         }
     }
 
-    /// <summary>Uploads the staged content next to the file under a copy's name; under another one when that is taken too.</summary>
-    async Task<UploadOutcome> CopyAsync(PendingFile pending, Func<string, int, string> name, UploadKind kind, Exception? cause, CancellationToken ct)
+    /// <summary>
+    /// Uploads the staged content next to the file (or into <paramref name="folder"/>) under a copy's name of it (or of
+    /// <paramref name="of"/>); under another one when that is taken too.
+    /// </summary>
+    async Task<UploadOutcome> CopyAsync(PendingFile pending, Func<string, int, string> name, UploadKind kind, Exception? cause, CancellationToken ct,
+        string? folder = null, string? of = null)
     {
-        var parent = ParentOf(pending.DrivePath);
+        var parent = folder ?? ParentOf(pending.DrivePath);
         for (var attempt = 1; ; attempt++)
         {
             try
             {
-                var copy = await api.UploadAsync(pending.DriveId, await NewTargetAsync(pending.DriveId, parent, name(pending.Name, attempt), ct), pending.StagingPath, ct);
+                var copy = await api.UploadAsync(pending.DriveId, await NewTargetAsync(pending.DriveId, parent, name(of ?? pending.Name, attempt), ct), pending.StagingPath, ct);
                 return new(copy, JoinDrivePath(parent, copy.Name), kind, cause);
             }
             catch (RemoteException e) when (e.Error == RemoteError.Conflict && attempt < 10)

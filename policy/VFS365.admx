@@ -216,6 +216,35 @@
         </enum>
       </elements>
     </policy>
+    <policy name="OfficeFiles" class="Both" displayName="$(string.OfficeFiles)" explainText="$(string.OfficeFiles_Help)" presentation="$(presentation.OfficeFiles)" key="Software\Policies\JSolve\VFS365">
+      <parentCategory ref="VFS365" />
+      <supportedOn ref="SUPPORTED_Windows11" />
+      <elements>
+        <enum id="OfficeFiles" valueName="OfficeFiles" required="true">
+          <item displayName="$(string.OfficeFiles_DesktopApp)"><value><string>DesktopApp</string></value></item>
+          <item displayName="$(string.OfficeFiles_Browser)"><value><string>Browser</string></value></item>
+          <item displayName="$(string.OfficeFiles_Local)"><value><string>Local</string></value></item>
+        </enum>
+      </elements>
+    </policy>
+    <policy name="OfficeFileTypes" class="Both" displayName="$(string.OfficeFileTypes)" explainText="$(string.OfficeFileTypes_Help)" presentation="$(presentation.OfficeFileTypes)" key="Software\Policies\JSolve\VFS365">
+      <parentCategory ref="VFS365" />
+      <supportedOn ref="SUPPORTED_Windows11" />
+      <elements>
+        <multiText id="OfficeFileTypes" valueName="OfficeFileTypes" />
+      </elements>
+    </policy>
+    <policy name="OfficeMissing" class="Both" displayName="$(string.OfficeMissing)" explainText="$(string.OfficeMissing_Help)" presentation="$(presentation.OfficeMissing)" key="Software\Policies\JSolve\VFS365">
+      <parentCategory ref="VFS365" />
+      <supportedOn ref="SUPPORTED_Windows11" />
+      <elements>
+        <enum id="OfficeMissing" valueName="OfficeMissing" required="true">
+          <item displayName="$(string.OfficeMissing_Browser)"><value><string>Browser</string></value></item>
+          <item displayName="$(string.OfficeMissing_Ask)"><value><string>Ask</string></value></item>
+          <item displayName="$(string.OfficeMissing_Local)"><value><string>Local</string></value></item>
+        </enum>
+      </elements>
+    </policy>
     <policy name="HelpUrl" class="Both" displayName="$(string.HelpUrl)" explainText="$(string.HelpUrl_Help)" presentation="$(presentation.HelpUrl)" key="Software\Policies\JSolve\VFS365">
       <parentCategory ref="VFS365" />
       <supportedOn ref="SUPPORTED_Windows11" />

@@ -113,12 +113,54 @@ public sealed class ExplorerSearchTests
     }
 
     [Fact]
-    public void A_search_without_a_root_in_its_name_uses_the_folder_the_tab_showed()
+    public void A_search_without_a_root_in_its_name_uses_the_folder_the_tab_showed_when_the_name_is_that_folder()
     {
-        Assert.Equal([@"M:\"], ExplorerSearch.FromView("Search Results in VFS365 (M:)&plan", null, "plan", Roots, @"M:\")!.Locations);
+        // A drive's top: LocationName says "VFS365" (spike 15), the drive's display name "VFS365 (M:)"
+        Assert.Equal([@"M:\"], ExplorerSearch.FromView("Search Results in VFS365 (M:)&plan", null, "plan", Roots, @"M:\", "VFS365")!.Locations);
+        Assert.Equal([@"M:\"], ExplorerSearch.FromView("Search Results in VFS365&plan", null, "plan", Roots, @"M:\", "VFS365")!.Locations);
+        Assert.Equal([@"M:\"], ExplorerSearch.FromView("Zoekresultaten in VFS365 (M:)&plan", null, "plan", Roots, @"M:\", "vfs365")!.Locations);
+        // Without a display name the folder's last path component stands in for it
+        Assert.Equal([@"M:\Sites\X"], ExplorerSearch.FromView("Search Results in X&plan", null, "plan", Roots, @"M:\Sites\X")!.Locations);
+        Assert.Equal([@"M:\Sites\X"], ExplorerSearch.FromView("Search Results in Team X&plan", null, "plan", Roots, @"M:\Sites\X", "Team X")!.Locations);
+        Assert.Equal([@"M:\Sites\X"], ExplorerSearch.FromView("Search Results in X", null, "Search Results in X", Roots, @"M:\Sites\X", "X")!.Locations);
         Assert.Equal([@"::{20D04FE0-3AEA-1069-A2D8-08002B30309D}"],
-            ExplorerSearch.FromView("Search Results in This PC&tessa", null, "tessa", Roots, "::{20D04FE0-3AEA-1069-A2D8-08002B30309D}")!.Locations);
+            ExplorerSearch.FromView("Search Results in This PC&tessa", null, "tessa", Roots, "::{20D04FE0-3AEA-1069-A2D8-08002B30309D}", "This PC")!.Locations);
         Assert.Empty(ExplorerSearch.FromView("Search Results in This PC&tessa", null, "tessa", Roots, null)!.Locations);
+    }
+
+    [Theory]
+    [InlineData("Search Results in This PC&tessa")]
+    [InlineData("Search Results in Home&tessa")]
+    [InlineData("Search Results in Quick access&tessa")]
+    [InlineData("Zoekresultaten in Documenten&tessa")]
+    [InlineData("Search Results in Libraries&tessa")]
+    [InlineData(@"Search Results in C:\Users\jos\X&tessa")]
+    [InlineData(@"Search Results in \\other\share\X&tessa")]
+    [InlineData("Search Results in MyX&tessa")]
+    [InlineData("Search Results in X Y&tessa")]
+    public void A_search_elsewhere_is_no_search_in_the_folder_the_tab_showed_before(string parsing)
+    {
+        var search = ExplorerSearch.FromView(parsing, null, "tessa", Roots, @"M:\Sites\X", "X");
+
+        Assert.NotNull(search);
+        Assert.Equal("tessa", search.Terms);
+        Assert.Empty(search.Locations);
+        Assert.Empty(ExplorerSearch.FromView(parsing, null, "tessa", Roots, @"M:\Sites\X")!.Locations); // nor by its path alone
+    }
+
+    [Fact]
+    public void A_search_in_a_place_with_a_path_names_that_path_whatever_the_tab_showed_before()
+    {
+        // The root in the name wins: the scope can be another folder of the drive than the one shown before
+        Assert.Equal([@"M:\Sites\Y"], ExplorerSearch.FromView(@"Search Results in M:\Sites\Y&plan", null, "plan", Roots, @"M:\Sites\X", "X")!.Locations);
+        Assert.Equal([@"M:\Sites\Y"], ExplorerSearch.FromView(@"Search Results in M:\Sites\Y&plan", null, "plan", Roots, "::{F874310E-B6B7-47DC-BC84-B9E6B38F5903}", "Home")!.Locations);
+    }
+
+    [Fact]
+    public void Shell_names_are_no_search_views()
+    {
+        Assert.Null(ExplorerSearch.FromView("shell:::{F874310E-B6B7-47DC-BC84-B9E6B38F5903}", "", "Home", Roots, @"M:\Sites\X", "X"));
+        Assert.Null(ExplorerSearch.FromView("SHELL:Libraries", "", "Libraries", Roots, @"M:\Sites\X", "X"));
     }
 
     [Theory]

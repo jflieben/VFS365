@@ -105,7 +105,8 @@ static unsafe class WinFspNative
 
     /// <summary>
     /// Sets VolumeParams.IrpTimeout (milliseconds; WinFsp accepts 1 to 10 minutes, otherwise uses its default), which the .NET layer
-    /// doesn't expose. Before mounting; false when this winfsp.net build has no such field.
+    /// doesn't expose. It bounds only a request's wait for a dispatcher thread. Before mounting; false when this winfsp.net build has
+    /// no such field.
     /// </summary>
     public static bool SetIrpTimeout(FileSystemHost host, TimeSpan timeout)
     {

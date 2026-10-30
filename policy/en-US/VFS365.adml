@@ -132,6 +132,39 @@ No paths: every file and folder path becomes a short code ([path 1a2b3c4d], the 
       <string id="ExplorerSearch_Stop">Stop</string>
       <string id="ExplorerSearch_Allow">Allow</string>
 
+      <string id="OfficeFiles">Office files from Microsoft 365</string>
+      <string id="OfficeFiles_Help">What a double-click (or Enter) in Explorer on the drive does with Word, Excel and PowerPoint files and the other types in "Office file types".
+
+Desktop app (the default): the Office app opens the file from Microsoft 365, as when it is opened from OneDrive or SharePoint: co-authoring, AutoSave, comments and version history work, and saves go straight to Microsoft 365.
+Browser: the file opens in Office for the web.
+Local: the copy on the drive opens, as in versions before this setting.
+
+The copy on the drive opens anyway when it has changes that aren't uploaded yet, when the file is new or empty (Explorer's New menu), and when Microsoft 365 doesn't answer within 4 seconds (offline, signed out, throttled).
+
+Only a double-click and Enter in Explorer change. Office's own File > Open and Recent list, the command line and other programs keep opening the copy on the drive, and so does Open in the right-click menu. A type for which the user chose another default app (LibreOffice, for example) keeps opening in that app. VFS365 adds an entry under the user's Office file type (HKCU) that applies on the drive only; it changes no file associations.</string>
+      <string id="OfficeFiles_DesktopApp">Desktop app</string>
+      <string id="OfficeFiles_Browser">Browser</string>
+      <string id="OfficeFiles_Local">Local</string>
+
+      <string id="OfficeFileTypes">Office file types</string>
+      <string id="OfficeFileTypes_Help">The file types "Office files from Microsoft 365" applies to, one per line, with or without the dot. Not configured: .docx, .xlsx and .pptx.
+
+Also possible: macro-enabled and older Word, Excel and PowerPoint files (.docm, .xlsm, .xlsb, .pptm, .ppsx, .doc, .xls, .ppt), OneNote sections (.one) and Visio drawings (.vsdx, .vsdm). Templates, database files and other types are ignored.
+
+Macros in a file opened from Microsoft 365 see its web address as the file's folder (ThisWorkbook.Path in Excel). Older formats (.doc, .xls, .ppt) can't be co-authored.</string>
+
+      <string id="OfficeMissing">Office file types without an app</string>
+      <string id="OfficeMissing_Help">What a double-click in Explorer on the drive does with a type in "Office file types" that no app on the PC opens (no Office, or no Visio, for example), where Windows would ask which app to use.
+
+Browser (the default): the file opens in Office for the web.
+Ask: a short question: open it in the browser, or choose an app on this PC. The answer counts for that type until VFS365 restarts.
+Local: Windows asks which app to use, as before.
+
+Only when "Office files from Microsoft 365" isn't Local. A type whose default app is another program (LibreOffice, for example) always opens in that program.</string>
+      <string id="OfficeMissing_Browser">Browser</string>
+      <string id="OfficeMissing_Ask">Ask</string>
+      <string id="OfficeMissing_Local">Local</string>
+
       <string id="HelpUrl">Help link</string>
       <string id="HelpUrl_Help">Web page the tray icon's Help opens, for example your organisation's own instructions. An http or https address. Default: https://jsolve.nl.</string>
 
@@ -141,7 +174,7 @@ No paths: every file and folder path becomes a short code ([path 1a2b3c4d], the 
 Disabled: no entry. With a drive letter (see "Drive letter") the drive shows under This PC with that letter only. Without a drive letter only the UNC path \\VFS365\&lt;user name&gt; is left.</string>
 
       <string id="OverlayIcons">Show file status icons</string>
-      <string id="OverlayIcons_Help">Enabled (the default): Explorer shows a small icon on the drive's files: online only, on this device, uploading, downloading, or a problem (an upload or delete Microsoft 365 refused or that keeps failing). Folders show uploading or a problem when a file in them does.
+      <string id="OverlayIcons_Help">Enabled (the default): Explorer shows a small icon on the drive's files: online only (also while a file downloads), on this device, uploading, or a problem (an upload or delete Microsoft 365 refused or that keeps failing). Folders show uploading or a problem when a file in them does. Explorer loads only 11 overlay handlers in name order; VFS365's four come right after OneDrive's seven, so another program with overlay icons can push the last ones out.
 
 Disabled: no status icons. The VFS365 menu in Explorer stays.</string>
 
@@ -173,6 +206,9 @@ Disabled: no such folder.</string>
       <presentation id="MonitoringDetail"><dropdownList refId="MonitoringDetail" defaultItem="0">Error rows contain</dropdownList></presentation>
       <presentation id="DatabaseFiles"><dropdownList refId="DatabaseFiles" defaultItem="0">Database files</dropdownList></presentation>
       <presentation id="ExplorerSearch"><dropdownList refId="ExplorerSearch" defaultItem="0">Searching in Explorer</dropdownList></presentation>
+      <presentation id="OfficeFiles"><dropdownList refId="OfficeFiles" defaultItem="0">Office files open in</dropdownList></presentation>
+      <presentation id="OfficeFileTypes"><multiTextBox refId="OfficeFileTypes">File types, one per line</multiTextBox></presentation>
+      <presentation id="OfficeMissing"><dropdownList refId="OfficeMissing" defaultItem="0">Without an app</dropdownList></presentation>
       <presentation id="HelpUrl"><textBox refId="HelpUrl"><label>Address</label><defaultValue>https://jsolve.nl</defaultValue></textBox></presentation>
       <presentation id="ExcludedSites"><multiTextBox refId="ExcludedSites">Site URL patterns, one per line</multiTextBox></presentation>
       <presentation id="IncludedSiteTemplates"><multiTextBox refId="IncludedSiteTemplates">Site templates, one per line</multiTextBox></presentation>

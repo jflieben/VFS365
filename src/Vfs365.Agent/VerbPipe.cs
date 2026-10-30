@@ -118,10 +118,15 @@ public static class VerbPipe
 
     /// <summary>
     /// "vfs365-agent.exe verb &lt;name&gt; &lt;path&gt;", run by Explorer: hands the request to this session's agent and ends. Shows a short
-    /// message when no agent answers or it refuses. No window otherwise, no log.
+    /// message when no agent answers or it refuses. No window otherwise, no log. "open" (the Office verb) opens the file itself instead.
     /// </summary>
     public static int RunClient(string[] args)
     {
+        if (args is [_, OfficeOpen.Verb, var file])
+        {
+            return OfficeOpen.RunClient(PathArgument(file), path => Send(CurrentName(), OfficeOpen.Verb, path, OfficeOpen.ClientTimeout, out _),
+                OfficeAssociations.Of, (path, chooseApp) => LocalOpen.OpenAsync(path, chooseApp).GetAwaiter().GetResult());
+        }
         if (args.Length != 3 || !ExplorerVerbs.IsVerb(args[1]))
         {
             return 2;

@@ -15,12 +15,19 @@ public static class DiscoverySchedule
     public static readonly TimeSpan Daily = TimeSpan.FromDays(1), RecentState = TimeSpan.FromDays(7);
 
     /// <summary>
-    /// A first start's state before any discovery: the OneDrive it just read. In OneDrive scope that is all discovery reads; with sites
-    /// RunAt is MinValue (never discovered), so a start after an interrupted first run discovers at once.
+    /// A first start's state before any discovery: the OneDrive (if the user has one) and tenant root it just read. In OneDrive scope that
+    /// is all discovery reads; with sites RunAt is MinValue (never discovered), so a start after an interrupted first run discovers at once.
     /// </summary>
-    public static DiscoveryState Placeholder(MyDrive oneDrive, string tenantHint, DriveScope scope, DateTimeOffset now) =>
-        new(scope == DriveScope.OneDrive ? now : DateTimeOffset.MinValue, SharePointUrls.TenantRootFromOneDriveUrl(oneDrive.WebUrl), [],
-            new Dictionary<string, string>(), LibraryRules.Version, oneDrive, default, tenantHint);
+    public static DiscoveryState Placeholder(MyHome home, string tenantHint, DriveScope scope, DateTimeOffset now) =>
+        new(scope == DriveScope.OneDrive ? now : DateTimeOffset.MinValue, home.TenantRoot, [],
+            new Dictionary<string, string>(), LibraryRules.Version, home.OneDrive, default, tenantHint);
+
+    /// <summary>
+    /// Whether a saved state can be shown at the start: it holds the tenant's SharePoint root and, unless the user has no OneDrive, their
+    /// OneDrive. A user without a OneDrive is a state with a root and no OneDrive (earlier versions always saved one).
+    /// </summary>
+    public static bool Usable(DiscoveryState? saved, string tenantHint) =>
+        saved is { } && (saved.OneDrive is not null || !string.IsNullOrEmpty(saved.TenantRoot)) && saved.TenantHint == tenantHint;
 
     /// <summary>A state the start may show a while before discovering: under a week old and, unless only the OneDrive shows, with libraries.</summary>
     public static bool Recent(DiscoveryState state, DriveScope scope, DateTimeOffset now) =>

@@ -20,6 +20,17 @@ public sealed record SearchPage(IReadOnlyList<DiscoveredLibrary> Libraries, int 
 
 public sealed record MyDrive(string DriveId, string WebUrl);
 
+/// <summary>
+/// Where the signed-in user lives in the tenant: their OneDrive and the tenant's SharePoint root. OneDrive is null for a user without
+/// one (no licence, personal site creation blocked, not provisioned); the root then comes from Graph's root site, not a OneDrive URL.
+/// </summary>
+public sealed record MyHome(MyDrive? OneDrive, string TenantRoot)
+{
+    public static MyHome Of(MyDrive oneDrive) => new(oneDrive, SharePointUrls.TenantRootFromOneDriveUrl(oneDrive.WebUrl));
+
+    public static implicit operator MyHome(MyDrive oneDrive) => Of(oneDrive);
+}
+
 public sealed record SiteMetadata(bool ReadOnly, bool WriteLocked);
 
 public sealed record ListMetadata(
@@ -72,7 +83,8 @@ public sealed record CheckedExclusion(string Reason, DateTimeOffset CheckedAt);
 /// Kept between runs: the visible set (for the hiding safety check and to mount before discovery runs), libraries that never need
 /// another lookup, and the oldest time a shown library's metadata was read (the fallback for entries without CheckedAt).
 /// RunAt: when the last run whose search completed ended; a run whose search failed keeps the time before it (MinValue for none).
-/// TenantId: the signed-in tenant, when the caller passed it. Misses: shown libraries search didn't return, with the number of runs in
+/// OneDrive: null for a user who has none (TenantRoot then comes from Graph's root site). TenantId: the signed-in tenant, when the
+/// caller passed it. Misses: shown libraries search didn't return, with the number of runs in
 /// a row (hidden at the second, or the third while the set shrank by more than the safety ratio). Exclusions: libraries left out for a
 /// reason that can change (hidden, offline clients excluded). EmptyPins: pinned URLs where nothing was found or nothing is shown.
 /// Shared: what other people shared with the user, for the Shared with me folder (<see cref="SharedWithMeService"/>).
@@ -98,7 +110,7 @@ public sealed record DiscoveryState(
 /// last run stay. SearchNote: how search paged when DocId order didn't hold, for diagnostics.
 /// </summary>
 public sealed record DiscoveryResult(
-    MyDrive OneDrive,
+    MyDrive? OneDrive,
     string TenantRoot,
     IReadOnlyList<LibraryEntry> Libraries,
     IReadOnlyList<SkippedLibrary> Skipped,

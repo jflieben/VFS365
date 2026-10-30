@@ -95,7 +95,7 @@ public sealed class DriveNamespace
     readonly DriveScope scope;
     readonly Func<LibraryEntry, CancellationToken, Task<string>> resolveDriveId;
     readonly Action<LibraryEntry, string>? driveResolved;
-    readonly DriveMount oneDriveMount;
+    readonly DriveMount? oneDriveMount;
     readonly Lock gate = new();
     Dictionary<string, DriveMount> mounts = new(StringComparer.OrdinalIgnoreCase);
     Dictionary<string, DriveMount> sharedMounts = new(StringComparer.Ordinal);
@@ -111,19 +111,20 @@ public sealed class DriveNamespace
 
     Layout layout;
 
-    DriveNamespace(MyDrive oneDrive, DriveScope scope, Func<LibraryEntry, CancellationToken, Task<string>> resolveDriveId,
+    DriveNamespace(MyDrive? oneDrive, DriveScope scope, Func<LibraryEntry, CancellationToken, Task<string>> resolveDriveId,
         Action<LibraryEntry, string>? driveResolved)
     {
         (this.scope, this.resolveDriveId, this.driveResolved) = (scope, resolveDriveId, driveResolved);
-        oneDriveMount = new DriveMount(_ => Task.FromResult(oneDrive.DriveId), false, oneDrive.DriveId);
+        oneDriveMount = oneDrive is null ? null : new DriveMount(_ => Task.FromResult(oneDrive.DriveId), false, oneDrive.DriveId);
         layout = new Layout(new VirtualFolder(""), []);
     }
 
     internal VirtualFolder Root => Volatile.Read(ref layout).Root;
 
+    /// <param name="oneDrive">The user's OneDrive; null for a user without one: no OneDrive folder (Scope All), an empty root (Scope OneDrive).</param>
     /// <param name="driveResolved">Called when a library's drive ID was looked up, so it can be kept for the next start.</param>
     /// <param name="shared">What others shared with the user, for the Shared with me folder (Scope All only); null: no such folder.</param>
-    public static DriveNamespace Build(MyDrive oneDrive, IReadOnlyList<LibraryEntry> libraries, Func<LibraryEntry, CancellationToken, Task<string>> resolveDriveId,
+    public static DriveNamespace Build(MyDrive? oneDrive, IReadOnlyList<LibraryEntry> libraries, Func<LibraryEntry, CancellationToken, Task<string>> resolveDriveId,
         DriveScope scope = DriveScope.All, Action<LibraryEntry, string>? driveResolved = null, IReadOnlyList<SharedItem>? shared = null)
     {
         var ns = new DriveNamespace(oneDrive, scope, resolveDriveId, driveResolved);
@@ -172,7 +173,10 @@ public sealed class DriveNamespace
         if (scope == DriveScope.OneDrive)
         {
             newRoot = new VirtualFolder("", oneDriveMount);
-            mounted.Add((oneDriveMount, "\\"));
+            if (oneDriveMount is not null)
+            {
+                mounted.Add((oneDriveMount, "\\"));
+            }
         }
         else
         {
@@ -181,8 +185,11 @@ public sealed class DriveNamespace
             var sitesPath = "";
             if (scope == DriveScope.All)
             {
-                newRoot.Add(new VirtualFolder("OneDrive", oneDriveMount));
-                mounted.Add((oneDriveMount, "\\OneDrive"));
+                if (oneDriveMount is not null)
+                {
+                    newRoot.Add(new VirtualFolder("OneDrive", oneDriveMount));
+                    mounted.Add((oneDriveMount, "\\OneDrive"));
+                }
                 sites = newRoot.Add(new VirtualFolder("Sites"));
                 sitesPath = "\\Sites";
             }

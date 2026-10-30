@@ -11,10 +11,8 @@ namespace Vfs365.Agent;
 /// tray) and opening the page. The words are never logged: logs go into support bundles.
 /// </summary>
 public sealed class SearchActions(DriveEngine engine, Func<string, string, CancellationToken, Task<ItemLinks?>> links, Func<string, string?> volumePath,
-    MyDrive oneDrive, Func<string, CancellationToken, Task<string?>> ask, Action<string> open, Action<string, string, bool> notify, Action<string> log)
+    MyDrive? oneDrive, string tenantRoot, Func<string, CancellationToken, Task<string?>> ask, Action<string> open, Action<string, string, bool> notify, Action<string> log)
 {
-    readonly string tenantRoot = SharePointUrls.TenantRootFromOneDriveUrl(oneDrive.WebUrl);
-
     /// <summary>The verb on a folder: asks for words and opens the folder's search.</summary>
     public async Task AskAndSearchAsync(string windowsPath, CancellationToken ct)
     {
@@ -95,7 +93,7 @@ public sealed class SearchActions(DriveEngine engine, Func<string, string, Cance
     }
 
     async Task<bool> OpenAsync(FsEntry folder, string words, string from, CancellationToken ct, Func<string, bool>? throughExplorer = null) =>
-        Open(await ScopeAsync(folder, engine, links, oneDrive.DriveId, tenantRoot, ct), words, from, folder.Path, throughExplorer);
+        Open(await ScopeAsync(folder, engine, links, oneDrive?.DriveId ?? "", tenantRoot, ct), words, from, folder.Path, throughExplorer);
 
     bool Open(SearchScope scope, string words, string from, string where, Func<string, bool>? throughExplorer = null)
     {

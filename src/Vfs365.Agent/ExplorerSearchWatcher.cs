@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using Microsoft.CSharp.RuntimeBinder;
@@ -12,8 +13,9 @@ public enum ExplorerSearchMode { Browser, Stop, Allow }
 /// Hands searches in Explorer's search box on the drive to Microsoft 365 (decision 48, spike 15). Explorer searches a folder by listing
 /// every folder below it, so when a tab shows a search on the drive the watcher waits until the words stop changing (Explorer searches
 /// as you type), sends the tab back to the folder, which ends the crawl, and opens SharePoint search with the same words. Mode Stop only
-/// stops it and says how to search instead. Woken by the tabs' navigation events and the drive's folder listings, idle otherwise; all
-/// COM calls on its own thread. Never throws: problems are logged once.
+/// stops it and says how to search instead. Woken by the tabs' navigation events (which tab navigated tells it what to read), the
+/// opening and closing of tabs and the drive's folder listings, idle otherwise; all COM calls on its own thread, every wrapper released
+/// after use. Never throws: problems are logged once.
 /// </summary>
 internal sealed partial class ExplorerSearchWatcher : IDisposable
 {
@@ -23,32 +25,37 @@ internal sealed partial class ExplorerSearchWatcher : IDisposable
     readonly DriveEngine engine;
     readonly ExplorerSearchMode mode;
     readonly Func<IReadOnlyList<string>> roots;
-    readonly Func<string, string?> volumePath;
     readonly Func<string, string, Func<string, bool>?, CancellationToken, Task<string?>> handOff;
     readonly Action<string, string> notify;
     readonly Action<string> log;
+    readonly SearchTracker tracker;
     readonly AutoResetEvent wake = new(false);
     readonly CancellationTokenSource stop = new();
     readonly Thread thread;
     readonly HashSet<string> logged = [];
     readonly Queue<long> opens = new();
     readonly uint session = (uint)Process.GetCurrentProcess().SessionId;
-    /// <summary>Searches already showing at the first look (windows Explorer restored at sign-in): stopped, never opened.</summary>
-    readonly HashSet<(long Tab, string Key)> restored = [];
-    long lastActivity, lastHint = -HintGap;
-    int explorerSignalled;
+    /// <summary>Tabs that navigated since the last pass (identities; the event sinks add, the watcher thread takes).</summary>
+    readonly ConcurrentDictionary<long, byte> navigated = new();
+    /// <summary>The File Explorer tabs of this session that are connected, by identity (the watcher thread only).</summary>
+    readonly Dictionary<long, Tab> tabs = [];
+    object? shell;
+    IDisposable? shellEvents;
+    long lastActivity, lastListing = -AwakeFor, lastHint = -HintGap;
+    int refreshSignalled;
     uint watcherThread;
     Timer? watchdog;
 
     ExplorerSearchWatcher(DriveEngine engine, ExplorerSearchMode mode, Func<IReadOnlyList<string>> roots, Func<string, string?> volumePath,
         Func<string, string, Func<string, bool>?, CancellationToken, Task<string?>> handOff, Action<string, string> notify, Action<string> log)
     {
-        (this.engine, this.mode, this.roots, this.volumePath, this.handOff, this.notify, this.log) = (engine, mode, roots, volumePath, handOff, notify, log);
+        (this.engine, this.mode, this.roots, this.handOff, this.notify, this.log) = (engine, mode, roots, handOff, notify, log);
+        tracker = new SearchTracker(volumePath);
         engine.FolderListed += Woken;
         thread = new Thread(Run) { IsBackground = true, Name = "VFS365 Explorer search" };
         thread.SetApartmentState(ApartmentState.MTA); // calls into explorer.exe and its events need no message loop here
         thread.Start();
-        WokenByExplorer(); // a first look now, so searches typed later are told apart from restored ones
+        WokenByExplorer(0); // a first look now, so searches typed later are told apart from restored ones
     }
 
     /// <summary>Starts watching; null for mode Allow.</summary>
@@ -56,31 +63,35 @@ internal sealed partial class ExplorerSearchWatcher : IDisposable
         Func<string, string, Func<string, bool>?, CancellationToken, Task<string?>> handOff, Action<string, string> notify, Action<string> log) =>
         mode == ExplorerSearchMode.Allow ? null : new ExplorerSearchWatcher(engine, mode, roots, volumePath, handOff, notify, log);
 
-    /// <summary>A folder listing on the drive: polls at most once per <see cref="ListingPollGap"/> ms (a copy lists many).</summary>
+    /// <summary>A folder listing on the drive: looks at every tab, at most once per <see cref="ListingPollGap"/> ms (a copy lists many).</summary>
     void Woken()
     {
+        Volatile.Write(ref lastListing, Environment.TickCount64);
         Volatile.Write(ref lastActivity, Environment.TickCount64);
         wake.Set();
     }
 
-    /// <summary>An Explorer event (navigation, a tab opened or closed): polls at once.</summary>
-    void WokenByExplorer()
+    /// <summary>An Explorer event: the tab with this identity navigated, or (0) a tab was opened or closed. Polls at once.</summary>
+    void WokenByExplorer(long tab)
     {
-        Volatile.Write(ref explorerSignalled, 1);
-        Woken();
+        if (tab == 0)
+        {
+            Volatile.Write(ref refreshSignalled, 1);
+        }
+        else
+        {
+            navigated[tab] = 0;
+        }
+        Volatile.Write(ref lastActivity, Environment.TickCount64);
+        wake.Set();
     }
 
     void Run()
     {
-        object? shell = null;
-        var connections = new Dictionary<long, IDisposable>();
-        var previous = new Dictionary<long, string>();
-        var settle = new SearchSettle();
-        var sink = new WakeSink(WokenByExplorer);
-        long lastPoll = 0, restUntil = 0;
+        long lastPoll = 0, lastSweep = 0, restUntil = 0;
         var failures = 0;
         var looked = false;
-        // A hung Explorer must not keep this thread in a call: the watchdog cancels a poll's call after CallLimit ms
+        // A hung Explorer must not keep this thread in a call: the watchdog cancels a call after CallLimit ms
         _ = CoEnableCallCancellation(IntPtr.Zero);
         watcherThread = GetCurrentThreadId();
         using var watchdog = this.watchdog = new Timer(_ =>
@@ -89,34 +100,16 @@ internal sealed partial class ExplorerSearchWatcher : IDisposable
             Once($"Explorer search: Explorer didn't answer within {CallLimit / 1000} s; the call was cancelled");
         });
 
-        void Reset()
-        {
-            foreach (var connection in connections.Values)
-            {
-                connection.Dispose();
-            }
-            connections.Clear();
-            if (shell is not null)
-            {
-                try
-                {
-                    Marshal.FinalReleaseComObject(shell);
-                }
-                catch (ArgumentException)
-                {
-                }
-            }
-            shell = null;
-        }
-
         while (!stop.IsCancellationRequested)
         {
             var now = Environment.TickCount64;
-            var awake = settle.Pending || now - Volatile.Read(ref lastActivity) < AwakeFor;
+            var awake = tracker.Pending || now - Volatile.Read(ref lastActivity) < AwakeFor;
             wake.WaitOne(awake ? PollGap : Timeout.Infinite);
             now = Environment.TickCount64;
-            var byExplorer = Interlocked.Exchange(ref explorerSignalled, 0) == 1;
-            if (stop.IsCancellationRequested || now < restUntil || !byExplorer && !settle.Pending && now - lastPoll < ListingPollGap)
+            var refresh = Interlocked.Exchange(ref refreshSignalled, 0) == 1;
+            // The drive lists folders: look at every tab now and then, in case an event was missed
+            var sweep = now - lastSweep >= ListingPollGap && now - Volatile.Read(ref lastListing) < AwakeFor;
+            if (stop.IsCancellationRequested || now < restUntil || !refresh && !sweep && navigated.IsEmpty && !tracker.Pending)
             {
                 continue;
             }
@@ -129,62 +122,43 @@ internal sealed partial class ExplorerSearchWatcher : IDisposable
             try
             {
                 var connecting = shell is null;
+                // Never start Explorer (a RemoteApp session has none): only connect to one that runs in this session
+                if (connecting && !ExplorerRunsHere())
+                {
+                    continue;
+                }
+                if (sweep)
+                {
+                    lastSweep = now;
+                }
+                var added = connecting || refresh || sweep ? Refresh(connecting, now) : [];
                 if (connecting)
                 {
-                    // Never start Explorer (a RemoteApp session has none): only connect to one that runs in this session
-                    var running = Process.GetProcessesByName("explorer");
-                    var here = running.Any(p => (uint)p.SessionId == session);
-                    foreach (var process in running)
+                    log($"Explorer search: watching Explorer ({tabs.Count} window(s) or tab(s))");
+                }
+                // Only the tabs that navigated, the new ones and those with a search settling; all of them on a sweep or at the start
+                var look = new HashSet<long>(added.Select(t => t.Identity));
+                look.UnionWith(tracker.PendingTabs);
+                foreach (var id in navigated.Keys.ToList())
+                {
+                    navigated.TryRemove(id, out _);
+                    look.Add(id);
+                }
+                if (connecting || sweep)
+                {
+                    look.UnionWith(tabs.Keys);
+                }
+                var places = look.Count > 0 ? roots() : [];
+                foreach (var id in look)
+                {
+                    if (tabs.TryGetValue(id, out var tab))
                     {
-                        process.Dispose();
+                        Look(tab, places, now, initial: !looked);
                     }
-                    if (!here)
+                    else
                     {
-                        continue;
+                        tracker.Gone(id, now); // closed since
                     }
-                }
-                watchdog.Change(CallLimit, Timeout.Infinite);
-                List<ExplorerWindows.Window> windows;
-                try
-                {
-                    if (connecting)
-                    {
-                        shell = ExplorerWindows.Open();
-                        connections[0] = ExplorerWindows.Connect<DShellWindowsEvents>(shell, sink);
-                    }
-                    windows = ExplorerWindows.List(shell!, MaxWindows).Where(w => w.SessionId == session).ToList();
-                }
-                finally
-                {
-                    watchdog.Change(Timeout.Infinite, Timeout.Infinite);
-                }
-                if (connecting)
-                {
-                    log($"Explorer search: watching Explorer ({windows.Count} window(s) or tab(s))");
-                }
-                foreach (var gone in connections.Keys.Where(k => k != 0 && windows.All(w => w.Identity != k)).ToList())
-                {
-                    connections[gone].Dispose();
-                    connections.Remove(gone);
-                    previous.Remove(gone);
-                    settle.See(gone, null, now);
-                    restored.RemoveWhere(r => r.Tab == gone);
-                }
-                foreach (var window in windows)
-                {
-                    if (!connections.ContainsKey(window.Identity))
-                    {
-                        watchdog.Change(CallLimit, Timeout.Infinite);
-                        try
-                        {
-                            connections[window.Identity] = ExplorerWindows.Connect<DWebBrowserEvents2>(window.Browser, sink);
-                        }
-                        finally
-                        {
-                            watchdog.Change(Timeout.Infinite, Timeout.Infinite);
-                        }
-                    }
-                    Check(window, settle, previous, now, initial: !looked);
                 }
                 looked = true;
                 failures = 0;
@@ -203,42 +177,169 @@ internal sealed partial class ExplorerSearchWatcher : IDisposable
         Reset();
     }
 
+    bool ExplorerRunsHere()
+    {
+        var running = Process.GetProcessesByName("explorer");
+        var here = running.Any(p => (uint)p.SessionId == session);
+        foreach (var process in running)
+        {
+            process.Dispose();
+        }
+        return here;
+    }
+
+    /// <summary>
+    /// Compares Explorer's windows and tabs with the connected ones: connects the new tabs (File Explorer windows of this session), drops
+    /// the closed ones. Opens the Shell Windows object first when <paramref name="connecting"/>. Returns the new tabs.
+    /// </summary>
+    List<Tab> Refresh(bool connecting, long now)
+    {
+        if (connecting)
+        {
+            Guarded(() =>
+            {
+                shell = ExplorerWindows.Open();
+                shellEvents = ExplorerWindows.Connect<DShellWindowsEvents>(shell, new WakeSink(0, WokenByExplorer));
+            });
+        }
+        var added = new List<Tab>();
+        var present = new HashSet<long>();
+        var items = Guarded(() => ExplorerWindows.Items(shell!, MaxWindows, line => Once($"Explorer search: {line}")));
+        var next = 0;
+        try
+        {
+            while (next < items.Count)
+            {
+                var item = items[next++];
+                var kept = false;
+                try
+                {
+                    var id = ExplorerWindows.IdentityOf(item);
+                    present.Add(id);
+                    if (tabs.ContainsKey(id))
+                    {
+                        continue;
+                    }
+                    var info = Guarded(() => ExplorerWindows.Identify(item));
+                    if (info.SessionId != session || !ExplorerWindows.IsFileExplorer(info.ClassName))
+                    {
+                        continue;
+                    }
+                    var connection = Guarded(() => ExplorerWindows.Connect<DWebBrowserEvents2>(item, new WakeSink(id, WokenByExplorer)));
+                    var tab = new Tab(item, id, connection);
+                    tabs[id] = tab;
+                    added.Add(tab);
+                    kept = true;
+                }
+                catch (Exception e) when (TabFailed(e))
+                {
+                    Once($"Explorer search: couldn't connect to a tab ({e.Message})");
+                }
+                finally
+                {
+                    if (!kept)
+                    {
+                        ExplorerWindows.Release(item);
+                    }
+                }
+            }
+        }
+        finally
+        {
+            for (; next < items.Count; next++)
+            {
+                ExplorerWindows.Release(items[next]);
+            }
+        }
+        foreach (var gone in tabs.Values.Where(t => !present.Contains(t.Identity)).ToList())
+        {
+            Drop(gone, now);
+        }
+        return added;
+    }
+
+    /// <summary>
+    /// A failed call into one tab, other than a call the watchdog cancelled (Explorer hanging: the caller resets): the tab closed, or
+    /// belongs to a window this process may not use.
+    /// </summary>
+    static bool TabFailed(Exception e) =>
+        e is COMException or InvalidCastException or RuntimeBinderException or InvalidComObjectException or UnauthorizedAccessException
+        && !ExplorerWindows.Cancelled(e);
+
+    /// <summary>A call into Explorer under the watchdog: cancelled when Explorer doesn't answer within <see cref="CallLimit"/> ms.</summary>
+    T Guarded<T>(Func<T> call)
+    {
+        watchdog?.Change(CallLimit, Timeout.Infinite);
+        try
+        {
+            return call();
+        }
+        finally
+        {
+            watchdog?.Change(Timeout.Infinite, Timeout.Infinite);
+        }
+    }
+
+    void Guarded(Action call) => Guarded(() =>
+    {
+        call();
+        return 0;
+    });
+
+    /// <summary>Disconnects and releases every tab and the Shell Windows object.</summary>
+    void Reset()
+    {
+        shellEvents?.Dispose();
+        shellEvents = null;
+        foreach (var tab in tabs.Values.ToList())
+        {
+            Drop(tab, Environment.TickCount64);
+        }
+        ExplorerWindows.ReleaseAll(shell);
+        shell = null;
+    }
+
+    void Drop(Tab tab, long now)
+    {
+        tabs.Remove(tab.Identity);
+        tracker.Gone(tab.Identity, now);
+        tab.Dispose();
+    }
+
     /// <summary>
     /// One tab: remembers the folder it shows, or acts on a search on the drive once its words settled. <paramref name="initial"/>: the
     /// first look after the start, whose searches were restored by Explorer, not typed.
     /// </summary>
-    void Check(ExplorerWindows.Window window, SearchSettle settle, Dictionary<long, string> previous, long now, bool initial)
+    void Look(Tab tab, IReadOnlyList<string> places, long now, bool initial)
     {
-        var search = ExplorerSearch.FromView(window.ParsingName, window.LocationUrl, window.LocationName, roots(), previous.GetValueOrDefault(window.Identity));
-        var location = search?.Locations.Count == 1 ? search.Locations[0] : null;
-        var volume = location is null ? null : volumePath(location);
-        if (search is null || location is null || volume is null || search.Terms.Length == 0)
+        ExplorerWindows.View view;
+        try
         {
-            if (search is null && window.ParsingName is { } shown && !shown.StartsWith("::", StringComparison.Ordinal))
-            {
-                previous[window.Identity] = shown;
-            }
-            settle.See(window.Identity, null, now); // no search, elsewhere, or the box was cleared
-            restored.RemoveWhere(r => r.Tab == window.Identity);
+            view = Guarded(() => ExplorerWindows.ReadView(tab.Browser));
+        }
+        catch (Exception e) when (TabFailed(e))
+        {
+            Once($"Explorer search: couldn't read a tab ({e.Message})");
+            Volatile.Write(ref refreshSignalled, 1); // it probably closed
             return;
         }
-        var key = $"{volume}|{search.Terms}";
-        if (initial)
+        if (tracker.Look(tab.Identity, view, places, now, initial) is not { } hit)
         {
-            restored.Add((window.Identity, key));
+            return;
         }
-        switch (settle.See(window.Identity, key, now))
+        var volume = hit.Volume;
+        switch (hit.Verdict)
         {
             case SearchSettle.Verdict.Act:
-                var open = mode == ExplorerSearchMode.Browser && !restored.Contains((window.Identity, key)) && MayOpen(now);
-                StopTab(window, location, first: true);
-                log($"Explorer search: stopped a search in {volume} ({search.Terms.Length} characters){(open ? ", opening it in Microsoft 365" : "")}");
+                var open = mode == ExplorerSearchMode.Browser && !hit.Restored && MayOpen(now);
+                StopTab(tab.Browser, hit.Location, first: true);
+                log($"Explorer search: stopped a search in {volume} ({hit.Terms.Length} characters){(open ? ", opening it in Microsoft 365" : "")}");
                 if (open)
                 {
-                    var browser = window.Browser;
+                    var browser = tab.Browser;
                     _ = Task.Run(async () =>
                     {
-                        if (await handOff(volume, search.Terms, url => OpenThroughExplorer(browser, url), stop.Token).ConfigureAwait(false) is { } words)
+                        if (await handOff(volume, hit.Terms, url => OpenThroughExplorer(browser, url), stop.Token).ConfigureAwait(false) is { } words)
                         {
                             notify(UiText.Get("Search.HandedOff.Title"), UiText.Get("Search.HandedOff", words));
                         }
@@ -251,31 +352,31 @@ internal sealed partial class ExplorerSearchWatcher : IDisposable
                 }
                 break;
             case SearchSettle.Verdict.StopAgain:
-                StopTab(window, location, first: false);
+                StopTab(tab.Browser, hit.Location, first: false);
                 log($"Explorer search: the search in {volume} still showed, stopped it again");
                 break;
         }
     }
 
     /// <summary>Back to the folder searched (which ends Explorer's crawl); again: back in its history, then stop.</summary>
-    void StopTab(ExplorerWindows.Window window, string location, bool first)
+    void StopTab(object browser, string location, bool first)
     {
         watchdog?.Change(CallLimit, Timeout.Infinite);
         try
         {
             if (first)
             {
-                ExplorerWindows.Navigate(window.Browser, location);
+                ExplorerWindows.Navigate(browser, location);
                 return;
             }
-            ExplorerWindows.GoBack(window.Browser);
+            ExplorerWindows.GoBack(browser);
         }
         catch (Exception e) when (e is COMException or RuntimeBinderException)
         {
             Once($"Explorer search: couldn't send a tab back ({e.Message})");
             try
             {
-                ExplorerWindows.Stop(window.Browser);
+                ExplorerWindows.Stop(browser);
             }
             catch (Exception again) when (again is COMException or RuntimeBinderException)
             {
@@ -354,19 +455,113 @@ internal sealed partial class ExplorerSearchWatcher : IDisposable
     [LibraryImport("kernel32.dll")]
     private static partial uint GetCurrentThreadId();
 
-    /// <summary>Explorer's events only wake the watcher; it reads the tabs itself.</summary>
-    [ComVisible(true), ClassInterface(ClassInterfaceType.None)]
-    public sealed class WakeSink(Action woken) : DShellWindowsEvents, DWebBrowserEvents2
+    /// <summary>A connected tab: its IWebBrowser2 wrapper and the connection of its events. Dispose ends both.</summary>
+    sealed class Tab(object browser, long identity, IDisposable connection) : IDisposable
     {
-        public void WindowRegistered(int cookie) => woken();
+        public object Browser { get; } = browser;
 
-        public void WindowRevoked(int cookie) => woken();
+        public long Identity { get; } = identity;
 
-        public void BeforeNavigate2(object browser, ref object url, ref object flags, ref object frame, ref object postData, ref object headers, ref bool cancel) => woken();
+        public void Dispose()
+        {
+            try
+            {
+                connection.Dispose();
+            }
+            finally
+            {
+                ExplorerWindows.ReleaseAll(Browser);
+            }
+        }
+    }
 
-        public void NavigateComplete2(object browser, ref object url) => woken();
+    /// <summary>
+    /// Explorer's events only wake the watcher; it reads the tabs itself. <paramref name="tab"/>: the identity of the tab the events come
+    /// from (0: the Shell Windows object). Each event passes the browser it concerns, a new reference to a wrapper that is released here.
+    /// </summary>
+    [ComVisible(true), ClassInterface(ClassInterfaceType.None)]
+    public sealed class WakeSink(long tab, Action<long> woken) : DShellWindowsEvents, DWebBrowserEvents2
+    {
+        public void WindowRegistered(int cookie) => woken(tab);
 
-        public void DocumentComplete(object browser, ref object url) => woken();
+        public void WindowRevoked(int cookie) => woken(tab);
+
+        // Navigate events come in threes; the other two follow once the new folder shows, so this one needs no read
+        public void BeforeNavigate2(object browser, ref object url, ref object flags, ref object frame, ref object postData, ref object headers, ref bool cancel) =>
+            ExplorerWindows.Release(browser);
+
+        public void NavigateComplete2(object browser, ref object url)
+        {
+            woken(tab);
+            ExplorerWindows.Release(browser);
+        }
+
+        public void DocumentComplete(object browser, ref object url)
+        {
+            woken(tab);
+            ExplorerWindows.Release(browser);
+        }
+    }
+}
+
+/// <summary>A search to act on: the tab's search view settled (<see cref="SearchSettle.Verdict.Act"/>) or still shows (StopAgain).</summary>
+internal sealed record SearchHit(SearchSettle.Verdict Verdict, string Volume, string Location, string Terms, bool Restored);
+
+/// <summary>
+/// What each tab shows, remembered tab by tab, and when a search on the drive is acted on. A search view names its own scope (see
+/// <see cref="ExplorerSearch.FromView"/>); the folder the tab showed before only completes a name that is that folder's display name,
+/// so a search in This PC, Home or Quick access is never taken for one in the folder shown before them. No Explorer calls.
+/// </summary>
+internal sealed class SearchTracker(Func<string, string?> volumePath)
+{
+    readonly SearchSettle settle = new();
+    /// <summary>The last folder each tab showed (not a search): its parsing name and display name.</summary>
+    readonly Dictionary<long, (string? Parsing, string? Name)> shown = [];
+    /// <summary>Searches already showing at the first look (windows Explorer restored at sign-in): stopped, never opened.</summary>
+    readonly HashSet<(long Tab, string Key)> restored = [];
+
+    public bool Pending => settle.Pending;
+
+    /// <summary>The tabs with a search settling.</summary>
+    public IReadOnlyList<long> PendingTabs => [.. settle.PendingTabs];
+
+    /// <summary>
+    /// One look at a tab: remembers the folder it shows, or tells what to do about a search on the drive. Null: nothing yet.
+    /// <paramref name="roots"/>: the drive's roots. <paramref name="initial"/>: the first look after the start.
+    /// </summary>
+    public SearchHit? Look(long tab, ExplorerWindows.View view, IEnumerable<string> roots, long now, bool initial)
+    {
+        shown.TryGetValue(tab, out var before);
+        var search = ExplorerSearch.FromView(view.ParsingName, view.LocationUrl, view.LocationName, roots, before.Parsing, before.Name);
+        var location = search?.Locations.Count == 1 ? search.Locations[0] : null;
+        var volume = location is null ? null : volumePath(location);
+        if (search is null || location is null || volume is null || search.Terms.Length == 0)
+        {
+            if (search is null && view.ParsingName is { } folder)
+            {
+                shown[tab] = (folder, view.LocationName);
+            }
+            settle.See(tab, null, now); // no search, elsewhere, or the box was cleared
+            restored.RemoveWhere(r => r.Tab == tab);
+            return null;
+        }
+        var key = $"{volume}|{search.Terms}";
+        if (initial)
+        {
+            restored.Add((tab, key));
+        }
+        var verdict = settle.See(tab, key, now);
+        return verdict is SearchSettle.Verdict.Act or SearchSettle.Verdict.StopAgain
+            ? new SearchHit(verdict, volume, location, search.Terms, restored.Contains((tab, key)))
+            : null;
+    }
+
+    /// <summary>The tab closed (or was dropped): forgets it.</summary>
+    public void Gone(long tab, long now)
+    {
+        shown.Remove(tab);
+        settle.See(tab, null, now);
+        restored.RemoveWhere(r => r.Tab == tab);
     }
 }
 
@@ -386,6 +581,9 @@ internal sealed class SearchSettle
     readonly Dictionary<(long Tab, string Key), long> done = [];
 
     public bool Pending => tabs.Count > 0;
+
+    /// <summary>The tabs whose search is still settling.</summary>
+    public IEnumerable<long> PendingTabs => tabs.Keys;
 
     /// <summary>What a tab shows now: a search's key (folder and words), or null for anything else.</summary>
     public Verdict See(long tab, string? key, long now)

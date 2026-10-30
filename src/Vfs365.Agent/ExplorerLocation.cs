@@ -59,14 +59,15 @@ static class ExplorerLocation
     public static void Unregister() => Unregister(Registry.CurrentUser, includeDriveLabels: false);
 
     /// <summary>
-    /// Removes the navigation pane entry from a user's hive, and with <paramref name="includeDriveLabels"/> the drive names and the
-    /// VFS365 menu (<see cref="ExplorerVerbs"/>) too (uninstall).
+    /// Removes the navigation pane entry from a user's hive, and with <paramref name="includeDriveLabels"/> the drive names, the VFS365
+    /// menu (<see cref="ExplorerVerbs"/>) and the Office verb (<see cref="OfficeVerbs"/>) too (uninstall).
     /// </summary>
     public static void Unregister(RegistryKey hive, bool includeDriveLabels)
     {
         if (includeDriveLabels)
         {
             ExplorerVerbs.Remove(hive);
+            OfficeVerbs.RemoveAll(hive);
         }
         hive.DeleteSubKeyTree($@"{Classes}\CLSID\{Clsid}", false);
         hive.DeleteSubKeyTree($@"{Classes}\WOW6432Node\CLSID\{Clsid}", false);
@@ -90,7 +91,7 @@ static class ExplorerLocation
     {
         using var nameSpace = hive.OpenSubKey(NameSpace);
         using var mountPoints = hive.OpenSubKey($@"{Explorer}\MountPoints2");
-        return nameSpace is not null || DriveLabelKeys(mountPoints).Any() || ExplorerVerbs.IsRegistered(hive);
+        return nameSpace is not null || DriveLabelKeys(mountPoints).Any() || ExplorerVerbs.IsRegistered(hive) || OfficeVerbs.IsRegistered(hive);
     }
 
     static IEnumerable<string> DriveLabelKeys(RegistryKey? mountPoints) =>

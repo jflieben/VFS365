@@ -14,9 +14,10 @@ public sealed partial class DriveEngine
     /// <summary>
     /// Flushed: the staging file was forced to disk after its last write; null in journals before 0.5.0, which flushed at every close,
     /// so their records count as flushed. OriginalPath: renamed away from there to a temp name (<see cref="PendingFile.Alias"/>), so it
-    /// goes back there unless a save claims its item.
+    /// goes back there unless a save claims its item. FolderPath and FolderId: <see cref="PendingFile.Folder"/>.
     /// </summary>
-    sealed record JournalRecord(string DriveId, string DrivePath, DriveItemInfo? Base, DateTimeOffset Modified, bool? Flushed = null, string? OriginalPath = null);
+    sealed record JournalRecord(string DriveId, string DrivePath, DriveItemInfo? Base, DateTimeOffset Modified, bool? Flushed = null, string? OriginalPath = null,
+        string? FolderPath = null, string? FolderId = null);
 
     static string JournalOf(string stagingPath) => stagingPath + ".json";
 
@@ -47,7 +48,8 @@ public sealed partial class DriveEngine
             var durable = pending.Journaled || pending.Flushed;
             using (var file = new FileStream(path + ".tmp", FileMode.Create, FileAccess.Write, FileShare.None))
             {
-                JsonSerializer.Serialize(file, new JournalRecord(pending.DriveId, pending.DrivePath, pending.Base, pending.Modified, pending.Flushed, pending.Alias?.OriginalPath));
+                JsonSerializer.Serialize(file, new JournalRecord(pending.DriveId, pending.DrivePath, pending.Base, pending.Modified, pending.Flushed, pending.Alias?.OriginalPath,
+                    pending.Folder?.Path, pending.Folder?.Id));
                 if (durable)
                 {
                     file.Flush(flushToDisk: true);
@@ -167,6 +169,7 @@ public sealed partial class DriveEngine
                         TempSince = Now,
                         Alias = record.OriginalPath is { } original && record.Base is { } item
                             ? new AliasItem(record.DriveId, record.DrivePath, item, original, Now + options.SettleWindow) : null,
+                        Folder = record.FolderPath is { } folderPath && record.FolderId is { } folderId ? new FolderRef(folderPath, folderId) : null,
                     };
                     overlay[pending.Key] = pending;
                     recovered++;

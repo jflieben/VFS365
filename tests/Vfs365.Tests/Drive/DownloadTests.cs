@@ -161,8 +161,9 @@ public sealed class DownloadTests : IDisposable
     {
         // SharePoint writes properties into Office files as it serves them: the served length isn't the listed size
         var cipher = new CacheCipher(System.Security.Cryptography.RandomNumberGenerator.GetBytes(32));
+        ContentCache? cache = null;
         DriveEngine Start() => new(DriveNamespace.Build(new MyDrive("b!me", "https://x-my.sharepoint.com/personal/u"), [], (_, _) => Task.FromResult("b!x")),
-            api, new ContentCache(Path.Combine(directory, "sealed"), api, new ContentCacheOptions { Cipher = cipher }),
+            api, cache = new ContentCache(Path.Combine(directory, "sealed"), api, new ContentCacheOptions { Cipher = cipher }),
             new DriveEngineOptions { StagingDirectory = Path.Combine(directory, "staging") });
         api.Add("plan.docx", Data(200_000));
         var first = Start();
@@ -175,6 +176,9 @@ public sealed class DownloadTests : IDisposable
         }
         Assert.Equal(served, await ReadAllAsync(first, "\\OneDrive\\plan.docx"));
         var downloads = api.Downloads;
+        // The download is put in place just after its last byte was read: under load, a restart could come first
+        var item = api.ItemAt("plan.docx")!;
+        await ReadPathTesting.Eventually(() => cache!.LengthOf("b!me", item.Id, item.CTag ?? item.ETag) is not null);
 
         var second = Start(); // Graph lists the item with its own size again
         var again = (await second.GetEntryAsync("\\OneDrive\\plan.docx", default))!;

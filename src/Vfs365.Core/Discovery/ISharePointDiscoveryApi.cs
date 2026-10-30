@@ -6,6 +6,12 @@ public interface ISharePointDiscoveryApi
     Task<MyDrive> GetMyDriveAsync(CancellationToken ct);
 
     /// <summary>
+    /// The user's OneDrive (null when they have none) and the tenant's SharePoint root. Here through <see cref="GetMyDriveAsync"/>, where
+    /// a user without a OneDrive is an error; the Graph implementation falls back to the tenant's root site.
+    /// </summary>
+    async Task<MyHome> GetMyHomeAsync(CancellationToken ct) => MyHome.Of(await GetMyDriveAsync(ct));
+
+    /// <summary>
     /// One page of SharePoint Search for document libraries, security-trimmed to the user, in DocId order: rows with a DocId above
     /// <paramref name="afterDocId"/> (0: from the start), skipping the first <paramref name="startRow"/> of those.
     /// </summary>

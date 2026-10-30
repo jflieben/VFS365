@@ -332,12 +332,17 @@ public sealed class ExplorerVerbsTests : IDisposable
     public void Dispose()
     {
         Registry.CurrentUser.DeleteSubKeyTree(keyPath, throwOnMissingSubKey: false);
-        using (var tests = Registry.CurrentUser.OpenSubKey(@"Software\VFS365-tests", writable: true))
+        try
         {
+            using var tests = Registry.CurrentUser.OpenSubKey(@"Software\VFS365-tests", writable: true);
             if (tests is not null && tests.SubKeyCount == 0 && tests.ValueCount == 0)
             {
                 Registry.CurrentUser.DeleteSubKey(@"Software\VFS365-tests", throwOnMissingSubKey: false);
             }
+        }
+        catch (IOException)
+        {
+            // Another test class removed it meanwhile (marked for deletion)
         }
         hive.Dispose();
         try

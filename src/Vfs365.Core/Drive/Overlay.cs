@@ -75,6 +75,15 @@ internal sealed class PendingFile(string driveId, string drivePath, string stagi
     /// <summary>An upload that failed without an answer (it may have gone through): checked before this content is sent again.</summary>
     public UnconfirmedUpload? Unconfirmed { get; set; }
 
+    /// <summary>
+    /// Its folder's item ID as last known, with that folder's path here (moved along with folder moves here): an upload that finds no
+    /// folder at the path looks the folder up by this ID (renamed, moved or deleted in Microsoft 365).
+    /// </summary>
+    public FolderRef? Folder { get; set; }
+
+    /// <summary>An upload looked for its folder by ID: a folder gone here no longer brings its retry forward.</summary>
+    public bool FolderSought { get; set; }
+
     /// <summary>The item this content went into (a conflict copy included) and its path, once uploaded. Handles follow it.</summary>
     public DriveItemInfo? Result { get; private set; }
     public string? ResultPath { get; private set; }
@@ -105,6 +114,9 @@ internal sealed class PendingFile(string driveId, string drivePath, string stagi
 
 /// <summary>Where an upload without an answer went, and the pending file's write count then: unchanged, the content is what it sent.</summary>
 internal sealed record UnconfirmedUpload(UploadTarget Target, int Writes);
+
+/// <summary>A folder's item ID and its path here when it was recorded.</summary>
+internal sealed record FolderRef(string Path, string Id);
 
 /// <summary>An upload that runs while the file is being written. Fragments go only once every byte before them is written.</summary>
 internal sealed class ProgressiveUpload(long size, string drivePath)
@@ -168,6 +180,12 @@ internal sealed class GoneItem(string driveId, string drivePath, DriveItemInfo i
     public DriveItemInfo Item { get; } = item;
     public DateTimeOffset Deadline { get; set; } = deadline;
     public bool DeleteOnExpiry { get; set; } = deleteOnExpiry;
+
+    /// <summary>
+    /// The item as the older version the app that hid it had open, when a newer one came since: a save that claims the item, and the
+    /// delete, name that version (If-Match), so neither replaces nor deletes the newer one unseen.
+    /// </summary>
+    public DriveItemInfo? Opened { get; init; }
 }
 
 /// <summary>A remote item shown under a temp name (Word renames the original away while saving). Claimed once new content went into it.</summary>

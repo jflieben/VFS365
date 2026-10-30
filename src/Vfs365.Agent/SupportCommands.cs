@@ -105,7 +105,7 @@ static class SupportCommands
         var tenantRoot = state?.TenantRoot;
         if (tenantRoot is null)
         {
-            tenantRoot = SharePointUrls.TenantRootFromOneDriveUrl((await api.GetMyDriveAsync(default)).WebUrl);
+            tenantRoot = (await api.GetMyHomeAsync(default)).TenantRoot;
         }
         client.TenantRootHost ??= new Uri(tenantRoot).Host;
         var location = $"https://{uri.Host}{LocationExplainer.SharePointPath(uri)}";

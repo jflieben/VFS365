@@ -472,9 +472,9 @@ public static class MachineCleanup
     public static string ActiveSetupVersion(DateTime utc) => $"{utc.Year},{utc.Month * 100 + utc.Day},{utc.Hour * 100 + utc.Minute},{utc.Second}";
 
     /// <summary>
-    /// What ExplorerLocation.Unregister removes, every drive name (##VFS365#... in MountPoints2: the drive's and DriveMappings'), and each
-    /// User Shell Folders value left on \\VFS365\ or on <paramref name="letters"/> ("M:") reset to Windows' default; with built-in tools
-    /// only (VFS365 is gone by then). <paramref name="root"/>: the hive (HKCU; a key of their own for tests).
+    /// What ExplorerLocation.Unregister removes (the Office verbs found by name), every drive name (##VFS365#... in MountPoints2: the
+    /// drive's and DriveMappings'), and each User Shell Folders value left on \\VFS365\ or on <paramref name="letters"/> ("M:") reset to
+    /// Windows' default; with built-in tools only (VFS365 is gone by then). <paramref name="root"/>: the hive (HKCU; a key of their own for tests).
     /// </summary>
     public static string LogonCleanupCommand(IReadOnlyCollection<string> letters, string root = "HKCU")
     {
@@ -494,6 +494,8 @@ public static class MachineCleanup
             $@"""{reg}"" delete ""{explorer}\Desktop\NameSpace\{clsid}"" /f >nul 2>&1",
             $@"""{reg}"" delete ""{explorer}\HideDesktopIcons\NewStartPanel"" /v ""{clsid}"" /f >nul 2>&1",
             $@"(for /f ""delims="" %k in ('{reg} query ""{explorer}\MountPoints2"" /f ##VFS365# /k 2^>nul ^| {findstr} /i /c:""\##VFS365#""') do ""{reg}"" delete ""%k"" /f >nul 2>&1)",
+            // The Office verb (OfficeVerbs): <ProgID>\shell\VFS365.Open and SystemFileAssociations\<ext>\shell\VFS365.Open
+            $@"(for /f ""delims="" %k in ('{reg} query ""{root}\Software\Classes"" /s /k /f {OfficeVerbs.VerbName} /e 2^>nul ^| {findstr} /i /e /c:""\shell\{OfficeVerbs.VerbName}""') do ""{reg}"" delete ""%k"" /f >nul 2>&1)",
             // %^USERPROFILE% outside quotes: cmd removes the caret but doesn't expand it, so the value says %USERPROFILE% as Windows' own do
             $@"(for %v in ({defaults}) do for /f ""tokens=1,2 delims=="" %a in (%v) do (""{reg}"" query ""{explorer}\User Shell Folders"" /v ""%a"" 2>nul | " +
                 $@"""{findstr}"" /i /r{inVfs365} >nul && ""{reg}"" add ""{explorer}\User Shell Folders"" /v ""%a"" /t REG_EXPAND_SZ /d %^USERPROFILE%""\%b"" /f >nul 2>&1))",

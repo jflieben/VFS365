@@ -15,8 +15,9 @@ public sealed class DriveHost : IDisposable
     const int FileExists = unchecked((int)0x80070050);
 
     /// <summary>
-    /// How long a request may take before WinFsp cancels it: WinFsp's maximum, up from its default 5 minutes, so a save that uploads on
-    /// close over a slow line isn't failed while its upload goes on.
+    /// How long a request may wait for a free dispatcher thread before WinFsp fails it: WinFsp's maximum, up from its default 5 minutes.
+    /// Once a thread took a request WinFsp neither cancels nor times it out (only the unmount does), so it doesn't bound an upload on
+    /// close or rename, or any other callback: the engine's own timeouts do (no answer from Microsoft 365, a transfer without progress).
     /// </summary>
     static readonly TimeSpan IrpTimeout = TimeSpan.FromMinutes(10);
 
