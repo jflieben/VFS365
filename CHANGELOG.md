@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.8.1
+
+- Fixed: an Explorer window that stopped answering (seen after sleep) crashed the agent through the search watcher, again at every restart, until the tray's Retry. That window is now skipped, and an unexpected error in the search watcher only stops the watcher, never the drive.
+
 ## 0.8.0
 
 - Office files open as Microsoft 365 documents: Word, Excel or PowerPoint file open in its desktop app from Microsoft 365, with co-authoring and AutoSave. IF M365 doesn't answer, the file is new or VFS365 is offline, the file still opens. Office's own File > Open, keep opening the copy on the drive. File associations don't change, and another default app (e.g. LibreOffice) is respected.

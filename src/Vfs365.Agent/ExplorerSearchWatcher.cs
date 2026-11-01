@@ -1,7 +1,6 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
-using Microsoft.CSharp.RuntimeBinder;
 using Vfs365.Core.Drive;
 
 namespace Vfs365.Agent;
@@ -86,7 +85,31 @@ internal sealed partial class ExplorerSearchWatcher : IDisposable
         wake.Set();
     }
 
+    /// <summary>
+    /// The thread: an error no handler expected ends the watcher, never the agent (an unhandled exception on this thread would stop the
+    /// drive). Searches on the drive then crawl like on any network drive until the next start.
+    /// </summary>
     void Run()
+    {
+        try
+        {
+            Watch();
+        }
+        catch (Exception e)
+        {
+            log($"Explorer search: stopped after an unexpected error ({e.GetType().Name}: {e.Message}); searches on the drive aren't handed to Microsoft 365 until the next start");
+            try
+            {
+                Reset();
+            }
+            catch (Exception)
+            {
+                // Explorer's wrappers may be broken as well; they go with the process
+            }
+        }
+    }
+
+    void Watch()
     {
         long lastPoll = 0, lastSweep = 0, restUntil = 0;
         var failures = 0;
@@ -163,7 +186,7 @@ internal sealed partial class ExplorerSearchWatcher : IDisposable
                 looked = true;
                 failures = 0;
             }
-            catch (Exception e) when (e is COMException or InvalidCastException or RuntimeBinderException or InvalidComObjectException or ArgumentException)
+            catch (Exception e) when (ExplorerWindows.CallFailed(e) || e is ArgumentException)
             {
                 Once($"Explorer search: Explorer didn't answer ({e.Message}); trying again when the drive is used");
                 Reset();
@@ -263,8 +286,7 @@ internal sealed partial class ExplorerSearchWatcher : IDisposable
     /// belongs to a window this process may not use.
     /// </summary>
     static bool TabFailed(Exception e) =>
-        e is COMException or InvalidCastException or RuntimeBinderException or InvalidComObjectException or UnauthorizedAccessException
-        && !ExplorerWindows.Cancelled(e);
+        ExplorerWindows.CallFailed(e) && !ExplorerWindows.Cancelled(e);
 
     /// <summary>A call into Explorer under the watchdog: cancelled when Explorer doesn't answer within <see cref="CallLimit"/> ms.</summary>
     T Guarded<T>(Func<T> call)
@@ -371,14 +393,14 @@ internal sealed partial class ExplorerSearchWatcher : IDisposable
             }
             ExplorerWindows.GoBack(browser);
         }
-        catch (Exception e) when (e is COMException or RuntimeBinderException)
+        catch (Exception e) when (ExplorerWindows.CallFailed(e))
         {
             Once($"Explorer search: couldn't send a tab back ({e.Message})");
             try
             {
                 ExplorerWindows.Stop(browser);
             }
-            catch (Exception again) when (again is COMException or RuntimeBinderException)
+            catch (Exception again) when (ExplorerWindows.CallFailed(again))
             {
             }
         }
@@ -419,7 +441,7 @@ internal sealed partial class ExplorerSearchWatcher : IDisposable
             }
             Once("Explorer search: Explorer didn't open the page in time; it opens without coming to the front");
         }
-        catch (AggregateException e) when (e.InnerException is COMException or RuntimeBinderException or InvalidComObjectException or InvalidCastException)
+        catch (AggregateException e) when (e.InnerException is { } inner && ExplorerWindows.CallFailed(inner))
         {
             Once($"Explorer search: Explorer couldn't open the page ({e.InnerException.Message}); it opens without coming to the front");
         }

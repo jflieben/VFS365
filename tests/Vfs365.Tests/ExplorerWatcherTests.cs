@@ -242,6 +242,42 @@ public sealed class ExplorerWatcherTests
         Assert.Contains("gone", problems[0]);
     }
 
+    /// <summary>What the binder throws when a window can't look up a member name (RPC_E_SYS_CALL_FAILED after sleep, 2026-10-31 crash).</summary>
+    static MissingMemberException NoDispatchId() => new("Could not get dispatch ID for HWND (error: 0x80010100)).");
+
+    public sealed class BrokenBrowser
+    {
+        public string? LocationURL => throw NoDispatchId();
+
+        public string? LocationName => throw NoDispatchId();
+
+        public long HWND => throw NoDispatchId();
+    }
+
+    [Fact]
+    public void A_window_that_cant_look_up_a_member_is_left_out_instead_of_stopping_the_agent()
+    {
+        var one = new object();
+        var problems = new List<string>();
+
+        var items = ExplorerWindows.Items(new FakeShellWindows(NoDispatchId(), one), 64, problems.Add);
+
+        Assert.Equal([one], items);
+        Assert.Contains("0x80010100", Assert.Single(problems));
+        Assert.True(ExplorerWindows.CallFailed(NoDispatchId())); // what Refresh and Look catch for a tab
+        Assert.Throws<MissingMemberException>(() => ExplorerWindows.Identify(new BrokenBrowser()));
+        Assert.False(ExplorerWindows.CallFailed(new NullReferenceException()));
+    }
+
+    [Fact]
+    public void A_tab_that_cant_look_up_its_location_reads_as_nowhere()
+    {
+        var view = ExplorerWindows.ReadView(new BrokenBrowser());
+
+        Assert.Null(view.LocationUrl);
+        Assert.Null(view.LocationName);
+    }
+
     [Fact]
     public void A_tab_is_read_for_its_location_alone_when_it_has_no_shell_view()
     {

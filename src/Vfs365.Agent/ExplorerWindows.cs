@@ -49,7 +49,7 @@ internal static partial class ExplorerWindows
             {
                 list.Add(Describe(browser));
             }
-            catch (Exception e) when (e is COMException or InvalidCastException or Microsoft.CSharp.RuntimeBinder.RuntimeBinderException)
+            catch (Exception e) when (CallFailed(e))
             {
                 Release(browser);
                 problem?.Invoke($"window: {e.Message}");
@@ -77,7 +77,7 @@ internal static partial class ExplorerWindows
                     list.Add(browser);
                 }
             }
-            catch (Exception e) when (e is COMException or InvalidCastException or Microsoft.CSharp.RuntimeBinder.RuntimeBinderException)
+            catch (Exception e) when (CallFailed(e))
             {
                 problem?.Invoke($"window {i}: {e.Message}");
             }
@@ -122,11 +122,18 @@ internal static partial class ExplorerWindows
             url = window.LocationURL;
             name = window.LocationName;
         }
-        catch (Exception e) when (e is COMException or Microsoft.CSharp.RuntimeBinder.RuntimeBinderException && !Cancelled(e))
+        catch (Exception e) when (CallFailed(e) && !Cancelled(e))
         {
         }
         return new View(url, name, ParsingName(browser));
     }
+
+    /// <summary>
+    /// A late-bound call into Explorer that failed: Explorer restarting or a window that closed (COMException), or the binder's own errors,
+    /// such as MissingMemberException when a window can't even look up a member name (RPC_E_SYS_CALL_FAILED, seen after sleep).
+    /// </summary>
+    public static bool CallFailed(Exception e) => e is COMException or InvalidCastException or Microsoft.CSharp.RuntimeBinder.RuntimeBinderException
+        or InvalidComObjectException or MissingMemberException or UnauthorizedAccessException;
 
     /// <summary>A call the watchdog cancelled because Explorer didn't answer; callers let it pass instead of calling on.</summary>
     public static bool Cancelled(Exception e) => e is COMException { HResult: RpcCallCanceled };
