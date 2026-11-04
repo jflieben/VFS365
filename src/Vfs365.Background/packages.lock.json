@@ -4,9 +4,9 @@
     "net10.0-windows7.0": {
       "Microsoft.Win32.SystemEvents": {
         "type": "Direct",
-        "requested": "[10.0.13, )",
-        "resolved": "10.0.13",
-        "contentHash": "rtd1rRf5uiusn/r+hNsODiCjvA+nErw+1EQb2uCv0EedLi2GEYWgLK0V31SXzcZ2b0D7VeoOrHJ0WCQqfbO67Q=="
+        "requested": "[10.0.14, )",
+        "resolved": "10.0.14",
+        "contentHash": "axfieK5mj+uS/wLYl0dhlRFWdNP1iKHhx/M6DZNXPCSve7q4TCogw//W6BWGsYhnWuSw55aqheHE0a8l8s1oTw=="
       },
       "System.IO.FileSystem.AccessControl": {
         "type": "Transitive",
@@ -17,9 +17,9 @@
         "type": "Project",
         "dependencies": {
           "System.Security.Cryptography.ProtectedData": "[10.0.13, )",
-          "Vfs365.Core": "[0.5.0, )",
-          "Vfs365.Drive.WinFsp": "[0.5.0, )",
-          "Vfs365.Graph": "[0.5.0, )"
+          "Vfs365.Core": "[0.8.1, )",
+          "Vfs365.Drive.WinFsp": "[0.8.1, )",
+          "Vfs365.Graph": "[0.8.1, )"
         }
       },
       "vfs365.core": {
@@ -28,14 +28,14 @@
       "vfs365.drive.winfsp": {
         "type": "Project",
         "dependencies": {
-          "Vfs365.Core": "[0.5.0, )",
+          "Vfs365.Core": "[0.8.1, )",
           "winfsp.net": "[2.1.25156, )"
         }
       },
       "vfs365.graph": {
         "type": "Project",
         "dependencies": {
-          "Vfs365.Core": "[0.5.0, )"
+          "Vfs365.Core": "[0.8.1, )"
         }
       },
       "System.Security.Cryptography.ProtectedData": {
@@ -57,9 +57,9 @@
     "net10.0-windows7.0/win-arm64": {
       "Microsoft.Win32.SystemEvents": {
         "type": "Direct",
-        "requested": "[10.0.13, )",
-        "resolved": "10.0.13",
-        "contentHash": "rtd1rRf5uiusn/r+hNsODiCjvA+nErw+1EQb2uCv0EedLi2GEYWgLK0V31SXzcZ2b0D7VeoOrHJ0WCQqfbO67Q=="
+        "requested": "[10.0.14, )",
+        "resolved": "10.0.14",
+        "contentHash": "axfieK5mj+uS/wLYl0dhlRFWdNP1iKHhx/M6DZNXPCSve7q4TCogw//W6BWGsYhnWuSw55aqheHE0a8l8s1oTw=="
       },
       "System.IO.FileSystem.AccessControl": {
         "type": "Transitive",
@@ -70,9 +70,9 @@
     "net10.0-windows7.0/win-x64": {
       "Microsoft.Win32.SystemEvents": {
         "type": "Direct",
-        "requested": "[10.0.13, )",
-        "resolved": "10.0.13",
-        "contentHash": "rtd1rRf5uiusn/r+hNsODiCjvA+nErw+1EQb2uCv0EedLi2GEYWgLK0V31SXzcZ2b0D7VeoOrHJ0WCQqfbO67Q=="
+        "requested": "[10.0.14, )",
+        "resolved": "10.0.14",
+        "contentHash": "axfieK5mj+uS/wLYl0dhlRFWdNP1iKHhx/M6DZNXPCSve7q4TCogw//W6BWGsYhnWuSw55aqheHE0a8l8s1oTw=="
       },
       "System.IO.FileSystem.AccessControl": {
         "type": "Transitive",
