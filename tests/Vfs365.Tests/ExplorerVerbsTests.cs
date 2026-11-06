@@ -203,7 +203,13 @@ public sealed class ExplorerVerbsTests : IDisposable
             Assert.Equal([("browser", @"M:\OneDrive\Offerte café.docx"), ("keep", @"M:\OneDrive\a (conflict 2026-10-25 101010).docx"), ("link", @"\\VFS365\ann\OneDrive")], received);
         }
         stop.Cancel();
-        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => server);
+        try
+        {
+            await server; // ends at the cancel, between requests without an exception
+        }
+        catch (OperationCanceledException)
+        {
+        }
         Assert.False(VerbPipe.Send(name, "browser", @"M:\a.txt", TimeSpan.FromMilliseconds(200), out answer)); // no agent
         Assert.Null(answer);
     }
