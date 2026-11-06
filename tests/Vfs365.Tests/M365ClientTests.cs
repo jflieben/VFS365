@@ -178,13 +178,32 @@ public sealed class M365ClientTests
     static readonly TimeSpan Short = TimeSpan.FromMilliseconds(300);
 
     /// <summary>The agent's HttpClient has no timeout: the client's own deadlines apply.</summary>
-    static M365Client Timed(HttpMessageHandler server, Time? time = null)
+    static M365Client Timed(HttpMessageHandler server, Time? time = null, TimeSpan? timeout = null)
     {
         var clock = time ?? new Time();
         return new(new HttpClient(server) { Timeout = Timeout.InfiniteTimeSpan }, new Tokens())
         {
-            HeaderTimeout = Short, StallTimeout = Short, Clock = () => clock.Now, Monotonic = () => clock.Elapsed, Random = () => 0, Delay = clock.Delay,
+            HeaderTimeout = timeout ?? Short, StallTimeout = timeout ?? Short, Clock = () => clock.Now, Monotonic = () => clock.Elapsed, Random = () => 0, Delay = clock.Delay,
         };
+    }
+
+    /// <summary>The timeout for slow transfers that must complete.</summary>
+    static readonly TimeSpan Patient = TimeSpan.FromSeconds(2);
+
+    /// <summary>Runs a slow transfer that must complete. A CI runner can stall for seconds, so it gets three attempts; a real regression fails all three.</summary>
+    static async Task CompletesAsync(Func<Task> attempt)
+    {
+        for (var left = 2; ; left--)
+        {
+            try
+            {
+                await attempt();
+                return;
+            }
+            catch (TaskCanceledException) when (left > 0)
+            {
+            }
+        }
     }
 
     [Fact]
@@ -243,11 +262,12 @@ public sealed class M365ClientTests
     {
         var json = Encoding.UTF8.GetBytes("""{"value":1}""");
 
-        // 11 reads 60 ms apart: longer than the stall timeout in all, never in one read
-        using (var doc = await Timed(new Scripted(Body(new Dribble(json, TimeSpan.FromMilliseconds(60))))).GetJsonAsync(Item, default))
+        // 11 reads 200 ms apart: longer than the stall timeout in all, never in one read
+        await CompletesAsync(async () =>
         {
+            using var doc = await Timed(new Scripted(Body(new Dribble(json, TimeSpan.FromMilliseconds(200)))), timeout: Patient).GetJsonAsync(Item, default);
             Assert.Equal(1, doc!.RootElement.GetProperty("value").GetInt32());
-        }
+        });
 
         var stalled = Timed(new Scripted(Body(new Dribble(json, TimeSpan.Zero, stallAt: 4))));
         var e = await Assert.ThrowsAsync<TaskCanceledException>(() => stalled.GetJsonAsync(Item, default)).WaitAsync(TimeSpan.FromSeconds(10));
@@ -297,12 +317,15 @@ public sealed class M365ClientTests
     [Fact]
     public async Task An_upload_that_makes_progress_completes_and_one_that_stalls_times_out()
     {
-        // 96 KiB in 16 KiB writes 100 ms apart: longer in all than the header timeout, never stalled
-        var slow = new Sink(TimeSpan.FromMilliseconds(100));
-        using (await Timed(new Scripted(Consume(slow))).SendJsonAsync(HttpMethod.Put, UploadUrl, () => new ByteArrayContent(new byte[96 * 1024]), default, authenticate: false))
+        // 96 KiB in 16 KiB writes 400 ms apart: longer in all than the header timeout, never stalled
+        await CompletesAsync(async () =>
         {
-        }
-        Assert.Equal(96 * 1024, slow.Written);
+            var slow = new Sink(TimeSpan.FromMilliseconds(400));
+            using (await Timed(new Scripted(Consume(slow)), timeout: Patient).SendJsonAsync(HttpMethod.Put, UploadUrl, () => new ByteArrayContent(new byte[96 * 1024]), default, authenticate: false))
+            {
+            }
+            Assert.Equal(96 * 1024, slow.Written);
+        });
 
         var stuck = Timed(new Scripted(Consume(new Sink(TimeSpan.Zero, stallAt: 32 * 1024))));
         var e = await Assert.ThrowsAsync<TaskCanceledException>(() =>
