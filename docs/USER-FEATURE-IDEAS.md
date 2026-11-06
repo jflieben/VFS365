@@ -2,32 +2,33 @@
 
 VFS365 today is mostly about doing the plumbing right: safe saves, conflict copies, change
 feeds, discovery, offline reads of folders already seen, throttling and monitoring. The
-**interactive surface users touch is still thin** — a tray menu (Status, Sign in, Show files,
-Show log, Restart, Help), a handful of notifications, and a command-line tool.
+**interactive surface users touch is still thin**: a tray menu (Status, Sign in, Show files,
+Search, Show log, Collect diagnostics, Restart, Help), a VFS365 right-click menu, status icons
+in Explorer, a handful of notifications, and a command-line tool.
 
 This is a menu of **ideas for things users could do from the drive**, grouped by theme, to
 pick from. They are **not commitments or a roadmap**, and each needs its own design. Admin,
 deployment and policy features are deliberately left out here; this is the end-user side only.
+~~Struck through~~ means built, with the version that brought it.
 
 A few things worth knowing up front:
 
 - Most of these reuse Microsoft 365 capabilities VFS365 already reaches with the signed-in
   user's delegated permissions (versions, sharing links, the recycle bin, search, recent
   files, thumbnails, columns, check-out). They mostly need a UI and some wiring, not a bigger
-  footprint — though any new permission scope would need a one-time admin consent.
-- The biggest lift is **Explorer integration**: overlay icons, a status column, right-click
-  menu items, thumbnails and property pages each need a Windows shell extension, and none
-  exist yet. A tray window or a small standalone window is a much cheaper way to ship many of
-  the same features first.
-- The cheapest early wins reuse things that are nearly there already: version history
-  (`ListVersionsAsync` exists but is diagnostics-only today), restoring from the recycle bin
-  (deletes already go there), "copy link" / "open in browser", and a small settings/pins
-  window.
+  footprint, though any new permission scope would need a one-time admin consent.
+- The biggest lift left is **Explorer integration**: a status column, thumbnails and property
+  pages each need more from the shell extension, which so far has the right-click menu and the
+  status icons. A tray window or a small standalone window is a much cheaper way to ship many
+  of the same features first, and a verb that opens SharePoint's own page cheaper still.
+- The cheapest early wins reuse things that are nearly there already: restoring from the
+  recycle bin (deletes already go there) and a small settings/pins window.
 
 ## A. Versioning, history & recovery
 
-1. **Restore a previous version.** Right-click → *Version history*: list a file's versions
-   with their date, author and size, and restore or save-as one.
+1. ~~**Restore a previous version.** Right-click → *Version history*: list a file's versions
+   with their date, author and size, and restore or save-as one.~~
+   *0.7.0, in SharePoint's version history page.*
 2. **Browse & restore the recycle bin.** A "Recently deleted" view (or tray action) to put
    back items that were deleted; today deletes go to the recycle bin with no way back from the
    drive.
@@ -37,8 +38,9 @@ A few things worth knowing up front:
    date, for recovery after a mass accidental edit or ransomware.
 5. **See a file's recent activity.** Who changed it and when, shown in its properties or a
    small panel, without opening the browser.
-6. **Smarter conflict resolution.** When a conflict copy is made, offer *Open both*,
-   *Compare*, or *Keep mine / keep theirs* instead of only a notification.
+6. ~~**Smarter conflict resolution.** When a conflict copy is made, offer *Open both*,
+   *Compare*, or *Keep mine / keep theirs* instead of only a notification.~~
+   *0.7.0: Keep this version and Compare, on the conflict copy's menu.*
 7. **Recover unsaved changes on demand.** Surface the "(recovered)" copies the agent already
    writes after a crash as a visible "unsaved changes" list to review and keep or discard.
 
@@ -46,21 +48,27 @@ A few things worth knowing up front:
 
 8. **Copy sharing link.** Right-click → *Copy link* (view or edit, organisation-wide or
    specific people), so people stop mailing attachments.
+   *Partly built (0.7.0): Copy link gives the address for people who already have access; it makes no sharing link.*
 9. **Share with specific people.** A share dialog to invite colleagues with view or edit, an
    optional message and an expiry.
+   *Partly built (0.7.0): Share in browser opens the file's page, where the user shares it.*
 10. **Manage & stop sharing.** See who has access to a file or folder and revoke links or
     people.
-11. **Open in browser / View in SharePoint.** Right-click to open the item's web address in
-    the browser.
-12. **Edit in Office for the web.** Since live co-authoring isn't possible from the drive, a
+11. ~~**Open in browser / View in SharePoint.** Right-click to open the item's web address in
+    the browser.~~
+    *0.7.0.*
+12. ~~**Edit in Office for the web.** Since live co-authoring isn't possible from the drive, a
     one-click way to edit in the browser with others, after which the file is back on the
-    drive.
+    drive.~~
+    *0.7.0 and 0.8.0: Open in browser, the `OfficeFiles` policy; the desktop app co-authors too.*
 13. **Request access to a restricted folder.** When a user opens a location they can't reach,
     offer a *Request access* action to the owner.
-14. **"Shared with me" view.** A place that lists files and folders others shared with the
-    user, not only discovered sites.
-15. **Copy path / copy SharePoint URL.** Quick actions to copy the `\\VFS365\<user>\…` path or
-    the item's web address for pasting into chat or e-mail.
+14. ~~**"Shared with me" view.** A place that lists files and folders others shared with the
+    user, not only discovered sites.~~
+    *0.7.1.*
+15. ~~**Copy path / copy SharePoint URL.** Quick actions to copy the `\\VFS365\<user>\…` path or
+    the item's web address for pasting into chat or e-mail.~~
+    *0.7.0: Copy link; Windows' own Copy as path gives the path.*
 
 ## C. Offline availability & storage
 
@@ -70,8 +78,9 @@ A few things worth knowing up front:
     reclaiming disk.
 18. **Make a whole folder available offline.** Pin a library or folder subtree ahead of travel
     or a weak connection.
-19. **Offline and sync overlay icons.** Show a file's state at a glance in Explorer — on the
-    device, online-only, or uploading.
+19. ~~**Offline and sync overlay icons.** Show a file's state at a glance in Explorer: on the
+    device, online-only, or uploading.~~
+    *0.7.1.*
 20. **"Work offline" toggle.** Let a user deliberately stop background calls on a metered
     connection or in flight, and resume later.
 21. **Cache usage view.** Show how much disk the cache uses, broken down by library, with a
@@ -81,8 +90,9 @@ A few things worth knowing up front:
 
 ## D. Search & discovery
 
-23. **Search Microsoft 365 from the drive.** A fast search box (in the tray, or a virtual
-    "Search results" folder) that uses SharePoint search instead of a slow Explorer tree-walk.
+23. ~~**Search Microsoft 365 from the drive.** A fast search box (in the tray, or a virtual
+    "Search results" folder) that uses SharePoint search instead of a slow Explorer tree-walk.~~
+    *0.7.2: tray, right-click menu and Explorer's search box, results in the browser.*
 24. **Recent files.** A tray menu or "Recent" view of recently opened or edited items.
 25. **"Add shortcut to my drive".** Follow a library or folder shared with you so it shows at
     the drive root.
@@ -96,7 +106,7 @@ A few things worth knowing up front:
 ## E. Status, activity & transparency
 
 29. **Activity / upload centre window.** A window listing uploads and downloads in progress and
-    waiting, with progress, cause and retry — more than a one-line notification.
+    waiting, with progress, cause and retry, more than a one-line notification.
 30. **Per-file sync status in properties.** A details entry showing last-uploaded time and
     whether the file is queued, uploading, in conflict or available offline.
 31. **"VFS365 status" column in Explorer.** A sortable column (Up to date / Uploading /
@@ -107,6 +117,7 @@ A few things worth knowing up front:
     the connection.
 34. **Richer "what's happening now" in the tray.** Expand to show the current file, the queue
     length, whether Microsoft 365 is limiting requests, and the next retry time.
+    *Partly built (0.4.0): the tray shows offline, throttled and waiting states; not the current file or next retry.*
 35. **Completion notification for big copies.** An optional "your copy of X is done" message
     when a long transfer finishes.
 36. **Quota and storage usage.** Show the OneDrive or site storage used versus available, so
@@ -130,7 +141,7 @@ A few things worth knowing up front:
 *These ease the drive's co-authoring and multi-user database limits.*
 
 42. **Check-out and check-in.** Reserve a file with SharePoint check-out, then check it in or
-    discard, from the right-click menu — a safe path for files that can't co-author.
+    discard, from the right-click menu, a safe path for files that can't co-author.
 43. **"Who has this open?" presence.** Show whether a colleague currently has the file open or
     checked out before you start editing.
 44. **Clear warning for multi-user database files.** A plain-language warning when opening
@@ -163,5 +174,6 @@ A few things worth knowing up front:
 54. **"What's new" after an update.** Surface the changelog highlights once per version.
 55. **One-click "Report a problem".** Bundle the current logs and open the help page or a
     prefilled support mail; today the tray only offers *Show log*.
+    *Partly built (0.7.0): Collect diagnostics makes the zip; it doesn't open the help page or a mail.*
 56. **An in-drive "Read me first" shortcut.** A small help link at the drive root for
     non-technical users.
