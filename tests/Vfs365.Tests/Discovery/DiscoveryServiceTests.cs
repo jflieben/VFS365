@@ -83,7 +83,22 @@ public class DiscoveryServiceTests
             return Task.FromResult(Lists.GetValueOrDefault($"{baseUrl}|{listId}"));
         }
 
-        public Task<string> GetLibraryDriveIdAsync(LibraryEntry library, CancellationToken ct) => Task.FromResult("b!drive");
+        public Func<LibraryEntry, string> DriveOf = _ => "b!drive";
+        public string DefaultDrive = "b!drive";
+        public bool FailDefaultDrive;
+        public int DriveLookups, DefaultLookups;
+
+        public Task<string> GetLibraryDriveIdAsync(LibraryEntry library, CancellationToken ct)
+        {
+            Interlocked.Increment(ref DriveLookups);
+            return Task.FromResult(DriveOf(library));
+        }
+
+        public Task<string> GetDefaultDriveIdAsync(LibraryEntry library, CancellationToken ct)
+        {
+            Interlocked.Increment(ref DefaultLookups);
+            return FailDefaultDrive ? throw new HttpRequestException("403 Forbidden") : Task.FromResult(DefaultDrive);
+        }
 
         public Dictionary<string, PinnedLocation> Pins = new(StringComparer.OrdinalIgnoreCase);
         public bool FailPins;
@@ -276,6 +291,57 @@ public class DiscoveryServiceTests
         Assert.Equal(2, sameDay.Libraries.Count);
         Assert.Equal(1, api.Resolves);
         Assert.Equal(2, nextWeek.Libraries.Count);
+    }
+
+    [Fact]
+    public async Task A_pinned_site_carries_its_template_like_a_searched_one()
+    {
+        var api = new FakeApi();
+        api.Pins["https://contoso.sharepoint.com/sites/Hidden"] = Pinned("https://contoso.sharepoint.com/sites/Hidden", (Id(40), "Documents", "Shared Documents")) with { Template = "GROUP#0" };
+
+        var run = await new DiscoveryService(api, new DiscoveryOptions { PinnedLocations = ["https://contoso.sharepoint.com/sites/Hidden"] }).RunAsync(null);
+
+        Assert.Equal("GROUP#0", run.Libraries.Single().SiteTemplate);
+    }
+
+    [Fact]
+    public async Task The_default_library_of_a_named_site_is_marked_once_and_remembered()
+    {
+        var api = new FakeApi { DriveOf = l => l.LibraryTitle == "Documenten" ? "b!default" : $"b!{l.LibraryTitle}", DefaultDrive = "b!default" };
+        api.Add("Finance", Id(1), "Documenten", template: "GROUP");
+        api.Add("Finance", Id(2), "Archive", template: "GROUP");
+        api.Add("Intranet", Id(3), "Documents", template: "SITEPAGEPUBLISHING");
+        var options = new DiscoveryOptions { DefaultLibrarySites = new DefaultLibrarySites(["GROUP"]) };
+
+        var first = await new DiscoveryService(api, options).RunAsync(null);
+        var lookups = (api.DefaultLookups, api.DriveLookups);
+        var second = await new DiscoveryService(api, options with { Clock = () => DateTimeOffset.UtcNow + NextWeek }).RunAsync(first.State);
+
+        Assert.True(first.Libraries.Single(l => l.LibraryTitle == "Documenten").DefaultLibrary);
+        Assert.False(first.Libraries.Single(l => l.LibraryTitle == "Archive").DefaultLibrary);
+        Assert.Null(first.Libraries.Single(l => l.LibraryTitle == "Documents").DefaultLibrary); // a site the policy doesn't name isn't looked up
+        Assert.Equal("b!default", first.Libraries.Single(l => l.LibraryTitle == "Documenten").DriveId);
+        Assert.Equal((1, 2), lookups);
+        Assert.Equal(lookups, (api.DefaultLookups, api.DriveLookups)); // metadata read again, the mark kept
+        Assert.True(second.Libraries.Single(l => l.LibraryTitle == "Documenten").DefaultLibrary);
+    }
+
+    [Fact]
+    public async Task A_failed_default_library_lookup_leaves_the_site_unchecked_until_a_later_run()
+    {
+        var api = new FakeApi { FailDefaultDrive = true };
+        api.Add("Finance", Id(1), "Documenten", template: "GROUP");
+        var options = new DiscoveryOptions { DefaultLibrarySites = new DefaultLibrarySites(["GROUP"]) };
+
+        var failed = await new DiscoveryService(api, options).RunAsync(null);
+        api.FailDefaultDrive = false;
+        var next = await new DiscoveryService(api, options).RunAsync(failed.State);
+
+        Assert.Null(failed.Libraries.Single().DefaultLibrary);
+        Assert.Contains(failed.Errors, e => e.Reason == "Default library: 403 Forbidden");
+        Assert.Single(options.DefaultLibrarySites.Unchecked(failed.Libraries));
+        Assert.True(next.Libraries.Single().DefaultLibrary);
+        Assert.Empty(options.DefaultLibrarySites.Unchecked(next.Libraries));
     }
 
     [Fact]

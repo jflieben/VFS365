@@ -60,6 +60,25 @@ public sealed class LocationExplainerTests
     public void Folder_file_and_sharing_links_name_their_library(string link) =>
         Assert.Contains(@"Finance / Documents at M:\Finance\Documents", Text(Why(link)));
 
+    [Fact]
+    public void A_site_that_is_its_default_library_says_its_other_libraries_dont_show()
+    {
+        var marked = Context() with
+        {
+            DefaultLibraries = ["GROUP"],
+            State = State() with { Libraries = [Documents with { DefaultLibrary = true }, Archive with { DefaultLibrary = false }, Projects] },
+        };
+
+        var answer = Why($"{Root}/sites/Finance", marked);
+        var notLookedUp = Text(Why($"{Root}/sites/Finance", Context() with { DefaultLibraries = ["GROUP"] }));
+
+        Assert.True(answer.Shown);
+        Assert.Contains(@"Shown:      Finance / Documents at M:\Finance", answer.Lines);
+        Assert.Contains("Not shown:  Finance / Archive: the site's folder is its default library (DefaultLibrarySites, default), so its other libraries don't show", Text(answer));
+        Assert.False(Why($"{Root}/sites/Finance/Archive", marked).Shown);
+        Assert.Contains("which discovery hasn't looked up yet; the site shows after the next run", notLookedUp);
+    }
+
     [Theory]
     [InlineData(Root + "/sites/Finance")]
     [InlineData(Root + "/sites/Finance/SitePages/Home.aspx")]

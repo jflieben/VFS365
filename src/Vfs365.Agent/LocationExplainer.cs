@@ -14,9 +14,20 @@ namespace Vfs365.Agent;
 /// of that name.
 /// </summary>
 public sealed record WhyContext(DiscoveryOptions Options, IReadOnlyList<string> PolicyPins, IReadOnlyList<string> UserPins, DriveScope Scope,
-    DiscoveryState? State, DiscoveryReport? Report, string DriveRoot, Func<string, string>? Source = null, bool SharedWithMe = true)
+    DiscoveryState? State, DiscoveryReport? Report, string DriveRoot, Func<string, string>? Source = null, bool SharedWithMe = true,
+    IReadOnlyList<string>? DefaultLibraries = null)
 {
     DriveNamespace? drive;
+    DefaultLibrarySites? defaultLibrarySites;
+
+    /// <summary>Policy DefaultLibrarySites.</summary>
+    internal DefaultLibrarySites DefaultLibrarySites => defaultLibrarySites ??= new DefaultLibrarySites(DefaultLibraries ?? []);
+
+    /// <summary>Whether the drive shows the library: discovery keeps it, yet DefaultLibrarySites may leave it out.</summary>
+    internal bool Shows(LibraryEntry library) => Drive().VolumePathOfLibrary(library.Key) is not null;
+
+    DriveNamespace Drive() => drive ??= DriveNamespace.Build(State?.OneDrive ?? new MyDrive("", ""), State?.Libraries ?? [], (_, _) => Task.FromResult(""), Scope,
+        defaultLibrarySites: DefaultLibrarySites);
     IReadOnlyDictionary<string, string>? sharedNames;
 
     /// <summary>Where a shared item shows, as Windows shows it; null when the drive has no Shared with me folder.</summary>
@@ -33,8 +44,7 @@ public sealed record WhyContext(DiscoveryOptions Options, IReadOnlyList<string> 
     /// <summary>The library's folder as Windows shows it, with the names the drive gives the state's libraries.</summary>
     internal string PathOf(LibraryEntry library)
     {
-        drive ??= DriveNamespace.Build(State?.OneDrive ?? new MyDrive("", ""), State?.Libraries ?? [], (_, _) => Task.FromResult(""), Scope);
-        return drive.VolumePathOfLibrary(library.Key) is { } path ? WindowsPath(path) : "(not on the drive)";
+        return Drive().VolumePathOfLibrary(library.Key) is { } path ? WindowsPath(path) : "(not on the drive)";
     }
 
     internal string WindowsPath(string volumePath) => volumePath == @"\" ? DriveRoot + @"\" : DriveRoot + volumePath;
@@ -137,6 +147,14 @@ public static partial class LocationExplainer
         var shown = false;
         foreach (var library in librarySegment is null ? onWeb : matched)
         {
+            if (context.DefaultLibrarySites.Matches(library.WebUrl, DefaultLibrarySites.TemplateOf(onWeb)) && !context.Shows(library))
+            {
+                var rule = $"Not shown:  {library.SiteTitle} / {library.LibraryTitle}: the site's folder is its default library (DefaultLibrarySites, {Source(context, "DefaultLibrarySites")})";
+                lines.Add(onWeb.Any(DefaultLibrarySites.IsDefault) ? $"{rule}, so its other libraries don't show"
+                    : onWeb.Any(l => l.DefaultLibrary is null) ? $"{rule}, which discovery hasn't looked up yet; the site shows after the next run (Restart in the tray)"
+                    : $"{rule}, which isn't among the libraries you can reach, so the site doesn't show");
+                continue;
+            }
             shown = true;
             lines.Add($"Shown:      {library.SiteTitle} / {library.LibraryTitle} at {context.PathOf(library)}{(library.ReadOnly ? ", read-only (the library requires check-out, or the site is read-only or locked)" : "")}");
             if (state?.Misses?.GetValueOrDefault(library.Key) is > 0 and var misses)

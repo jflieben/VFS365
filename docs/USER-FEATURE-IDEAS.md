@@ -3,7 +3,7 @@
 VFS365 today is mostly about doing the plumbing right: safe saves, conflict copies, change
 feeds, discovery, offline reads of folders already seen, throttling and monitoring. The
 **interactive surface users touch is still thin** — a tray menu (Status, Sign in, Show files,
-Show log, Refresh, Restart, Help), a handful of notifications, and a command-line tool.
+Show log, Restart, Help), a handful of notifications, and a command-line tool.
 
 This is a menu of **ideas for things users could do from the drive**, grouped by theme, to
 pick from. They are **not commitments or a roadmap**, and each needs its own design. Admin,

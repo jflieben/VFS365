@@ -165,6 +165,8 @@ public sealed class NoOneDriveTests : IDisposable
             Task.FromResult<ListMetadata?>(new ListMetadata("Documents", false, 101, false, false, null, false, false, 5));
 
         public Task<string> GetLibraryDriveIdAsync(LibraryEntry library, CancellationToken ct) => Task.FromResult("b!finance");
+
+        public Task<string> GetDefaultDriveIdAsync(LibraryEntry library, CancellationToken ct) => Task.FromResult("b!finance");
         public Task<PinnedLocation?> ResolveLocationAsync(string url, CancellationToken ct) => Task.FromResult<PinnedLocation?>(null);
     }
 

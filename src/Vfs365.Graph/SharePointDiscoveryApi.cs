@@ -160,6 +160,13 @@ public sealed class SharePointDiscoveryApi(M365Client client) : ISharePointDisco
         return Str(doc.RootElement, "id")!;
     }
 
+    public async Task<string> GetDefaultDriveIdAsync(LibraryEntry library, CancellationToken ct)
+    {
+        var host = new Uri(library.WebUrl).Host;
+        using var doc = await RequiredAsync(new Uri($"{M365Client.GraphResource}/v1.0/sites/{host},{library.SiteId},{library.WebId}/drive?$select=id"), ct);
+        return Str(doc.RootElement, "id")!;
+    }
+
     public async Task<PinnedLocation?> ResolveLocationAsync(string url, CancellationToken ct)
     {
         var target = new Uri(url.Trim());
@@ -209,7 +216,25 @@ public sealed class SharePointDiscoveryApi(M365Client client) : ISharePointDisco
                     }
                 }
             }
-            return new PinnedLocation(webUrl, siteId, webId, title, siteMetadata, libraries);
+            return new PinnedLocation(webUrl, siteId, webId, title, siteMetadata, libraries, await SiteTemplateAsync(webUrl, ct));
+        }
+    }
+
+    /// <summary>The site collection's template as search reports it for its libraries (GROUP#0); null when the root web can't be read.</summary>
+    async Task<string?> SiteTemplateAsync(string webUrl, CancellationToken ct)
+    {
+        try
+        {
+            using var root = await ProbeAsync(new Uri($"{webUrl}/_api/site/rootweb?$select=WebTemplate,Configuration"), ct);
+            return root is not null && Str(root.RootElement, "WebTemplate") is { Length: > 0 } template
+                ? root.RootElement.TryGetProperty("Configuration", out var configuration) && configuration.ValueKind == JsonValueKind.Number
+                    ? $"{template}#{configuration.GetInt32()}"
+                    : template
+                : null;
+        }
+        catch (Exception) when (!ct.IsCancellationRequested)
+        {
+            return null; // a subsite's user may not read the root web; the pin still shows
         }
     }
 

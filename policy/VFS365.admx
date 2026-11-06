@@ -115,6 +115,13 @@
         <multiText id="PinnedLocations" valueName="PinnedLocations" />
       </elements>
     </policy>
+    <policy name="DefaultLibrarySites" class="Both" displayName="$(string.DefaultLibrarySites)" explainText="$(string.DefaultLibrarySites_Help)" presentation="$(presentation.DefaultLibrarySites)" key="Software\Policies\JSolve\VFS365">
+      <parentCategory ref="VFS365" />
+      <supportedOn ref="SUPPORTED_Windows11" />
+      <elements>
+        <multiText id="DefaultLibrarySites" valueName="DefaultLibrarySites" />
+      </elements>
+    </policy>
     <policy name="FolderRedirection" class="Both" displayName="$(string.FolderRedirection)" explainText="$(string.FolderRedirection_Help)" presentation="$(presentation.FolderRedirection)" key="Software\Policies\JSolve\VFS365">
       <parentCategory ref="VFS365" />
       <supportedOn ref="SUPPORTED_Windows11" />

@@ -27,6 +27,9 @@ public interface ISharePointDiscoveryApi
 
     Task<string> GetLibraryDriveIdAsync(LibraryEntry library, CancellationToken ct);
 
+    /// <summary>The drive ID of the default document library of the library's web (Graph's default drive of the site).</summary>
+    Task<string> GetDefaultDriveIdAsync(LibraryEntry library, CancellationToken ct);
+
     /// <summary>
     /// A pinned site or library URL (also a folder or view link inside a library): its web and the document libraries it stands for.
     /// Null when nothing is found there.

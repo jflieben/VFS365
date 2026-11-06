@@ -81,8 +81,9 @@ internal sealed record Resolved(string Path, VirtualFolder? Folder, DriveMount? 
 public enum DriveScope { All, OneDrive, SharePoint }
 
 /// <summary>
-/// The fixed top of the tree: OneDrive\, Sites\&lt;site&gt;\&lt;library&gt;\ and Shared with me\, or just the OneDrive or the sites as the
-/// root. The library and shared sets can be replaced while mounted (discovery finishing after the mount); unchanged ones keep their mount.
+/// The fixed top of the tree: OneDrive\, Sites\&lt;site&gt;\&lt;library&gt;\ (Sites\&lt;site&gt;\ for a site that is its default library,
+/// <see cref="DefaultLibrarySites"/>) and Shared with me\, or just the OneDrive or the sites as the root. The library and shared sets can
+/// be replaced while mounted (discovery finishing after the mount); unchanged ones keep their mount.
 /// Folder names depend only on the set of sites, libraries and shared items, never on the order they came in: a title several sites
 /// share gets each site's URL in brackets, a name several shared items share gets each owner's name, so a remembered path never opens
 /// another site or another person's item. A drive can be mounted at several places (a shared folder of a library also shown under Sites,
@@ -95,6 +96,7 @@ public sealed class DriveNamespace
     readonly DriveScope scope;
     readonly Func<LibraryEntry, CancellationToken, Task<string>> resolveDriveId;
     readonly Action<LibraryEntry, string>? driveResolved;
+    readonly DefaultLibrarySites defaultLibrarySites;
     readonly DriveMount? oneDriveMount;
     readonly Lock gate = new();
     Dictionary<string, DriveMount> mounts = new(StringComparer.OrdinalIgnoreCase);
@@ -112,9 +114,10 @@ public sealed class DriveNamespace
     Layout layout;
 
     DriveNamespace(MyDrive? oneDrive, DriveScope scope, Func<LibraryEntry, CancellationToken, Task<string>> resolveDriveId,
-        Action<LibraryEntry, string>? driveResolved)
+        Action<LibraryEntry, string>? driveResolved, DefaultLibrarySites? defaultLibrarySites)
     {
         (this.scope, this.resolveDriveId, this.driveResolved) = (scope, resolveDriveId, driveResolved);
+        this.defaultLibrarySites = defaultLibrarySites ?? DefaultLibrarySites.None;
         oneDriveMount = oneDrive is null ? null : new DriveMount(_ => Task.FromResult(oneDrive.DriveId), false, oneDrive.DriveId);
         layout = new Layout(new VirtualFolder(""), []);
     }
@@ -124,10 +127,12 @@ public sealed class DriveNamespace
     /// <param name="oneDrive">The user's OneDrive; null for a user without one: no OneDrive folder (Scope All), an empty root (Scope OneDrive).</param>
     /// <param name="driveResolved">Called when a library's drive ID was looked up, so it can be kept for the next start.</param>
     /// <param name="shared">What others shared with the user, for the Shared with me folder (Scope All only); null: no such folder.</param>
+    /// <param name="defaultLibrarySites">Sites whose folder is their default library (policy DefaultLibrarySites).</param>
     public static DriveNamespace Build(MyDrive? oneDrive, IReadOnlyList<LibraryEntry> libraries, Func<LibraryEntry, CancellationToken, Task<string>> resolveDriveId,
-        DriveScope scope = DriveScope.All, Action<LibraryEntry, string>? driveResolved = null, IReadOnlyList<SharedItem>? shared = null)
+        DriveScope scope = DriveScope.All, Action<LibraryEntry, string>? driveResolved = null, IReadOnlyList<SharedItem>? shared = null,
+        DefaultLibrarySites? defaultLibrarySites = null)
     {
-        var ns = new DriveNamespace(oneDrive, scope, resolveDriveId, driveResolved);
+        var ns = new DriveNamespace(oneDrive, scope, resolveDriveId, driveResolved, defaultLibrarySites);
         lock (ns.gate)
         {
             ns.shared = shared;
@@ -193,24 +198,41 @@ public sealed class DriveNamespace
                 sites = newRoot.Add(new VirtualFolder("Sites"));
                 sitesPath = "\\Sites";
             }
-            // A web's title and URL come from its first library by key, so they don't depend on the order of the list either
+            DriveMount MountOf(LibraryEntry library)
+            {
+                var mount = mounts.GetValueOrDefault(library.Key) is { ReadOnly: var wasReadOnly } existing && wasReadOnly == library.ReadOnly
+                    ? existing
+                    : new DriveMount(ct => library.DriveId is { } id ? Task.FromResult(id) : ResolveAsync(library, ct), library.ReadOnly, library.DriveId,
+                        resolved: Resolved);
+                newMounts[library.Key] = mount;
+                return mount;
+            }
+
+            // A web's title and URL come from its first library by key, so they don't depend on the order of the list either. A web
+            // DefaultLibrarySites names keeps only its default library, which is its folder; without it, the web has no folder.
             var webs = libraries.DistinctBy(l => l.Key).GroupBy(l => l.WebUrl, StringComparer.OrdinalIgnoreCase)
                 .Select(g => g.OrderBy(l => l.Key, StringComparer.Ordinal).ToList())
+                .Select(web => defaultLibrarySites.Matches(web[0].WebUrl, DefaultLibrarySites.TemplateOf(web))
+                    ? (Libraries: web.Where(DefaultLibrarySites.IsDefault).Take(1).ToList(), IsLibrary: true)
+                    : (Libraries: web, IsLibrary: false))
+                .Where(web => web.Libraries.Count > 0)
                 .ToList();
-            var siteNames = UniqueNames(webs, w => SafeName(w[0].SiteTitle), w => w[0].WebUrl, w => SiteSuffixes(w[0].WebUrl));
+            var siteNames = UniqueNames(webs, w => SafeName(w.Libraries[0].SiteTitle), w => w.Libraries[0].WebUrl, w => SiteSuffixes(w.Libraries[0].WebUrl));
             for (var s = 0; s < webs.Count; s++)
             {
-                var web = webs[s];
+                var (web, isLibrary) = webs[s];
+                if (isLibrary)
+                {
+                    var siteMount = MountOf(web[0]);
+                    sites.Add(new VirtualFolder(siteNames[s], siteMount));
+                    mounted.Add((siteMount, $"{sitesPath}\\{siteNames[s]}"));
+                    continue;
+                }
                 var siteFolder = sites.Add(new VirtualFolder(siteNames[s], site: web[0].WebUrl.ToUpperInvariant()));
                 var libraryNames = UniqueNames(web, l => SafeName(l.LibraryTitle), l => l.Key, LibrarySuffixes);
                 for (var l = 0; l < web.Count; l++)
                 {
-                    var library = web[l];
-                    var mount = mounts.GetValueOrDefault(library.Key) is { ReadOnly: var wasReadOnly } existing && wasReadOnly == library.ReadOnly
-                        ? existing
-                        : new DriveMount(ct => library.DriveId is { } id ? Task.FromResult(id) : ResolveAsync(library, ct), library.ReadOnly, library.DriveId,
-                            resolved: Resolved);
-                    newMounts[library.Key] = mount;
+                    var mount = MountOf(web[l]);
                     siteFolder.Add(new VirtualFolder(libraryNames[l], mount));
                     mounted.Add((mount, $"{sitesPath}\\{siteNames[s]}\\{libraryNames[l]}"));
                 }

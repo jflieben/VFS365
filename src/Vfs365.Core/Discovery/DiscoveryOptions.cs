@@ -20,6 +20,9 @@ public sealed record DiscoveryOptions
     /// <summary>Site or library URLs always shown (admin policy and user pins), also where search doesn't reach; site patterns and templates don't apply.</summary>
     public IReadOnlyList<string> PinnedLocations { get; init; } = [];
 
+    /// <summary>Sites whose default library discovery marks, for their folder (policy DefaultLibrarySites).</summary>
+    public DefaultLibrarySites DefaultLibrarySites { get; init; } = DefaultLibrarySites.None;
+
     /// <summary>Hide nothing in a run whose visible set shrank by more than this fraction.</summary>
     public double HidingSafetyRatio { get; init; } = 0.40;
 
@@ -55,6 +58,6 @@ public sealed record DiscoveryOptions
         : null;
 
     /// <summary>Wildcards as for site patterns. A configuration number (GROUP#0) only counts when both sides have one.</summary>
-    static bool TemplateMatches(string template, string pattern) =>
+    internal static bool TemplateMatches(string template, string pattern) =>
         template.Contains('#') && pattern.Contains('#') ? Wildcard.IsMatch(template, pattern.Trim()) : Wildcard.IsMatch(template.Split('#')[0], pattern.Trim().Split('#')[0]);
 }

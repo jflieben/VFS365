@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.8.2
+
+- Policy `DefaultLibrarySites`: sites (by template e.g. `GROUP` for every Teams site or by using a URL pattern) where VFS365 should mount the default library directly instead of the root. So a Teams channel is one click away: `Sites\Finance\General` instead of `Sites\Finance\Documents\General`. Caveat: if a site has more libraries, they won't show. Off by default; turning it on moves these sites' paths. `vfs365 why` explains a library it hides.
+
 ## 0.8.1
 
 - Fixed: an Explorer window that stopped answering (seen after sleep) crashed the agent through the search watcher, again at every restart, until the tray's Retry. That window is now skipped, and an unexpected error in the search watcher only stops the watcher, never the drive.

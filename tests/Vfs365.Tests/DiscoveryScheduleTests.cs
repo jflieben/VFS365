@@ -24,6 +24,8 @@ public sealed class DiscoveryScheduleTests
         public Task<IReadOnlyList<PinnedLibrary>?> GetWebLibrariesAsync(string webUrl, CancellationToken ct) => throw new NotSupportedException();
         public Task<ListMetadata?> GetListAsync(string baseUrl, string listId, CancellationToken ct) => throw new NotSupportedException();
         public Task<string> GetLibraryDriveIdAsync(LibraryEntry library, CancellationToken ct) => throw new NotSupportedException();
+
+        public Task<string> GetDefaultDriveIdAsync(LibraryEntry library, CancellationToken ct) => throw new NotSupportedException();
         public Task<PinnedLocation?> ResolveLocationAsync(string url, CancellationToken ct) => throw new NotSupportedException();
     }
 

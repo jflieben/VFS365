@@ -58,6 +58,12 @@ Disabled: no "Uploaded" notifications. Conflict copies and uploads that wait are
       <string id="PinnedLocations">Pinned locations</string>
       <string id="PinnedLocations_Help">Site or library addresses to show for everyone who can open them, one per line, also where SharePoint Search doesn't find them (Restricted Content Discovery, sites excluded from search, the root site, portals, new sites). A link copied from the browser works. Users add their own with vfs365.exe pin.</string>
 
+      <string id="DefaultLibrarySites">Sites that open in their default library</string>
+      <string id="DefaultLibrarySites_Help">Sites whose folder is their default document library, one entry per line: Sites\Finance\General instead of Sites\Finance\Documents\General. An entry with a slash is a site address pattern (* matches any characters, as in Included sites), any other a site template (as in Included site templates): GROUP covers every Teams and Microsoft 365 group site.
+
+The other libraries of these sites don't show, and a user who can't open the default library doesn't get the site. Standard Teams channels are folders in the default library, so they all stay visible.
+
+Turning this on or off changes the paths of the files in these sites: update Folder redirection, Drive mappings and paths apps keep at the same time.</string>
       <string id="FolderRedirection">Folder redirection</string>
       <string id="FolderRedirection_Help">Moves Windows' user folders into VFS365 while the drive is mounted, one per line: Folder=path. Folders: Desktop, Documents, Downloads, Music, Pictures, Videos, Favorites, Contacts, Links, SavedGames, SavedSearches, or any known folder's ID in braces. The path is from the drive's root (OneDrive\Documents, Sites\Home\Documents\%USERNAME%) and may use %USERNAME%, %USERDOMAIN%, %COMPUTERNAME% and other environment variables, %UPN% and %UPNNAME% (the signed-in account, and its part before the @), and * or ? in a folder name for the first matching folder. Folders that don't exist are made inside the library. Add |move to move what the local folder holds into it (names that exist there stay).
 
@@ -194,6 +200,7 @@ Disabled: no such folder.</string>
       <presentation id="IncludedSites"><multiTextBox refId="IncludedSites">Site URL patterns, one per line</multiTextBox></presentation>
       <presentation id="CacheSizeMB"><decimalTextBox refId="CacheSizeMB" defaultValue="2048">MB</decimalTextBox></presentation>
       <presentation id="PinnedLocations"><multiTextBox refId="PinnedLocations">Site or library addresses, one per line</multiTextBox></presentation>
+      <presentation id="DefaultLibrarySites"><multiTextBox refId="DefaultLibrarySites">Site templates or site address patterns, one per line</multiTextBox></presentation>
       <presentation id="FolderRedirection"><multiTextBox refId="FolderRedirection">Folder=path, one per line</multiTextBox></presentation>
       <presentation id="DriveMappings"><multiTextBox refId="DriveMappings">Letter:=path, one per line</multiTextBox></presentation>
       <presentation id="ChangeCheckSeconds"><decimalTextBox refId="ChangeCheckSeconds" defaultValue="20">Seconds (0: push notifications only)</decimalTextBox></presentation>

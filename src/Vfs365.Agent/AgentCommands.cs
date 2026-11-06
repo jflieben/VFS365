@@ -400,7 +400,7 @@ public static class AgentCommands
             Say($"Libraries:  {libraries.Count} shown ({libraries.Count(l => l.ReadOnly)} read-only), {result.Skipped.Count} skipped, {result.Errors.Count} errors");
             foreach (var library in libraries)
             {
-                Say($"  {$"{library.SiteTitle} / {library.LibraryTitle}",-60} {library.ItemCount,10:N0} items  {library.SiteTemplate ?? "?",-20}{(library.ReadOnly ? "  read-only" : "")}{(library.DriveId is null ? "" : $"  {library.DriveId}")}");
+                Say($"  {$"{library.SiteTitle} / {library.LibraryTitle}",-60} {library.ItemCount,10:N0} items  {library.SiteTemplate ?? "?",-20}{(library.DefaultLibrary == true ? "  default" : "")}{(library.ReadOnly ? "  read-only" : "")}{(library.DriveId is null ? "" : $"  {library.DriveId}")}");
             }
             Say("Skipped:");
             foreach (var group in result.Skipped.GroupBy(s => s.Reason).OrderByDescending(g => g.Count()))
@@ -465,6 +465,7 @@ public static class AgentCommands
             PinnedLocations = [.. settings.PinnedLocations, .. UserPins.Load()],
             IncludedSiteTemplates = settings.IncludedSiteTemplates,
             ExcludedSiteTemplates = settings.ExcludedSiteTemplates,
+            DefaultLibrarySites = new DefaultLibrarySites(settings.DefaultLibrarySites),
         };
         if (settings.IncludedSites is { } included)
         {
@@ -534,7 +535,7 @@ public static class AgentCommands
         var state = DiscoveryStore.Load();
         var engine = new DriveEngine(
             DriveNamespace.Build(home.OneDrive, state?.Libraries ?? [], api.GetLibraryDriveIdAsync, settings.Scope,
-                shared: settings.SharedWithMe ? state?.Shared?.Items ?? [] : null),
+                shared: settings.SharedWithMe ? state?.Shared?.Items ?? [] : null, defaultLibrarySites: DiscoveryOptionsOf(settings).DefaultLibrarySites),
             driveApi,
             new ContentCache(Path.Combine(Path.GetTempPath(), $"vfs365-tool-{Environment.ProcessId}"), driveApi),
             new DriveEngineOptions { StagingDirectory = Path.Combine(Path.GetTempPath(), $"vfs365-tool-{Environment.ProcessId}", "staging") });
@@ -1003,7 +1004,8 @@ public static class AgentCommands
             var sharedShown = settings.Scope == DriveScope.All && settings.SharedWithMe;
             Action? sharedListed = null;
             var ns = DriveNamespace.Build(oneDrive, settings.Scope == DriveScope.OneDrive ? [] : keeper.Current.Libraries, api.GetLibraryDriveIdAsync, settings.Scope,
-                (library, driveId) => keeper.RememberDriveId(library.Key, driveId), sharedShown ? keeper.Current.Shared?.Items ?? [] : null);
+                (library, driveId) => keeper.RememberDriveId(library.Key, driveId), sharedShown ? keeper.Current.Shared?.Items ?? [] : null,
+                discoveryOptions.DefaultLibrarySites);
             var engine = new DriveEngine(
                 ns,
                 driveApi,
@@ -1857,8 +1859,14 @@ public static class AgentCommands
                 {
                     // With a recent state (under a week old, with libraries) the drive shows it at once; discovery waits 5 to 90 minutes, so a
                     // tenant's sign-ins don't all discover at the same moment. A first start, an older state, or one that never found
-                    // libraries (a first run that didn't finish, a failed search) discovers right away.
-                    var recent = usable && !discoverNow && DiscoverySchedule.Recent(keeper.Current, settings.Scope, DateTimeOffset.UtcNow);
+                    // libraries (a first run that didn't finish, a failed search) discovers right away, as does one with sites whose
+                    // default library DefaultLibrarySites needs and no run looked up yet: they have no folder until then.
+                    var notLookedUp = discoveryOptions.DefaultLibrarySites.Unchecked(keeper.Current.Libraries).Count();
+                    var recent = usable && !discoverNow && notLookedUp == 0 && DiscoverySchedule.Recent(keeper.Current, settings.Scope, DateTimeOffset.UtcNow);
+                    if (notLookedUp > 0 && settings.Scope != DriveScope.OneDrive)
+                    {
+                        say($"Discovery:  now, to find the default library of {notLookedUp} site(s) (DefaultLibrarySites)");
+                    }
                     var wait = DiscoverySchedule.StartWait(recent, Random.Shared);
                     if (recent && settings.Scope != DriveScope.OneDrive)
                     {

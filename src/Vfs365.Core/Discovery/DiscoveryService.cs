@@ -320,7 +320,7 @@ public sealed class DiscoveryService(ISharePointDiscoveryApi api, DiscoveryOptio
                     var readOnly = verdict.Access == LibraryAccess.ReadOnly || location.Site.ReadOnly || location.Site.WriteLocked;
                     var checkedAt = CheckedAt(key) is null ? now - FirstReadOffset(key) : now;
                     found.Add(new LibraryEntry(key, siteId, webId, listId, location.WebUrl.TrimEnd('/'), location.SiteTitle, library.List.Title, readOnly,
-                        library.List.ItemCount, knownDrives.GetValueOrDefault(key), library.List.InternalName, checkedAt));
+                        library.List.ItemCount, knownDrives.GetValueOrDefault(key), library.List.InternalName, checkedAt, location.Template));
                     keys.Add(key);
                 }
                 if (keys.Count == 0)
@@ -357,6 +357,7 @@ public sealed class DiscoveryService(ISharePointDiscoveryApi api, DiscoveryOptio
             .OrderBy(library => library.SiteTitle, StringComparer.OrdinalIgnoreCase)
             .ThenBy(library => library.LibraryTitle, StringComparer.OrdinalIgnoreCase)
             .ToList();
+        visible = await MarkDefaultLibrariesAsync(visible, previous, errors, ct);
         // A failed search keeps the time of the last run whose search completed, so a restart doesn't take this run as a recent one
         var runAt = searchError is null ? now : previous?.RunAt ?? DateTimeOffset.MinValue;
         var state = new DiscoveryState(runAt, tenantRoot, visible, new Dictionary<string, string>(staticExclusions), LibraryRules.Version, oneDrive,
@@ -374,6 +375,59 @@ public sealed class DiscoveryService(ISharePointDiscoveryApi api, DiscoveryOptio
             reconciliation.HidingSkippedReason,
             state,
             searchNote);
+    }
+
+    /// <summary>
+    /// Marks the default library of each web <see cref="DiscoveryOptions.DefaultLibrarySites"/> names. Marks carry over from the last
+    /// run; a web without a marked library and with unchecked ones has Graph's default drive of the site compared with its libraries'
+    /// drives (known ones first). A failed lookup leaves the web unchecked, so it has no folder until a later run marks it.
+    /// </summary>
+    async Task<List<LibraryEntry>> MarkDefaultLibrariesAsync(List<LibraryEntry> visible, DiscoveryState? previous, ConcurrentBag<SkippedLibrary> errors,
+        CancellationToken ct)
+    {
+        if (options.DefaultLibrarySites.IsEmpty)
+        {
+            return visible;
+        }
+        var marks = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+        foreach (var library in previous?.Libraries ?? [])
+        {
+            if (library.DefaultLibrary is { } mark)
+            {
+                marks[library.Key] = mark;
+            }
+        }
+        var result = visible.Select(l => l.DefaultLibrary is null && marks.TryGetValue(l.Key, out var mark) ? l with { DefaultLibrary = mark } : l).ToList();
+        var at = Enumerable.Range(0, result.Count).ToDictionary(i => result[i].Key, StringComparer.OrdinalIgnoreCase);
+        var webs = options.DefaultLibrarySites.Unchecked(result).Select(web => web.ToList()).ToList();
+        await Parallel.ForEachAsync(webs, new ParallelOptions { MaxDegreeOfParallelism = options.MaxParallelSites, CancellationToken = ct }, async (web, token) =>
+        {
+            try
+            {
+                var defaultDrive = await api.GetDefaultDriveIdAsync(web[0], token);
+                var marked = new List<LibraryEntry>();
+                var found = false;
+                foreach (var library in web.OrderBy(l => l.DriveId is null))
+                {
+                    var driveId = found ? library.DriveId : library.DriveId ?? await api.GetLibraryDriveIdAsync(library, token);
+                    var isDefault = !found && string.Equals(driveId, defaultDrive, StringComparison.Ordinal);
+                    found |= isDefault;
+                    marked.Add(library with { DriveId = driveId, DefaultLibrary = isDefault });
+                }
+                lock (result)
+                {
+                    foreach (var library in marked)
+                    {
+                        result[at[library.Key]] = library;
+                    }
+                }
+            }
+            catch (Exception e) when (!ct.IsCancellationRequested)
+            {
+                errors.Add(new SkippedLibrary($"default|{web[0].WebUrl}", web[0].WebUrl, web[0].SiteTitle, $"Default library: {e.Message}"));
+            }
+        });
+        return result;
     }
 
     /// <summary>By tenant ID when both sides have one, else by SharePoint root.</summary>

@@ -48,12 +48,17 @@ public sealed record ListMetadata(
 /// <summary>A document library of a web with its metadata, as listed by the web (pinned locations, discovery per site).</summary>
 public sealed record PinnedLibrary(string ListId, ListMetadata List);
 
-/// <summary>A pinned URL resolved: the web it belongs to and its document libraries (all of them for a site URL, one for a library URL).</summary>
-public sealed record PinnedLocation(string WebUrl, string SiteId, string WebId, string SiteTitle, SiteMetadata Site, IReadOnlyList<PinnedLibrary> Libraries);
+/// <summary>
+/// A pinned URL resolved: the web it belongs to and its document libraries (all of them for a site URL, one for a library URL).
+/// Template: its site collection's (WebTemplate#Configuration of the root web), null when it couldn't be read.
+/// </summary>
+public sealed record PinnedLocation(string WebUrl, string SiteId, string WebId, string SiteTitle, SiteMetadata Site, IReadOnlyList<PinnedLibrary> Libraries,
+    string? Template = null);
 
 /// <summary>
 /// A library shown to the user. CheckedAt: when its site and library metadata was read (null in state of earlier versions). SiteTemplate:
-/// its site collection's template as search reports it.
+/// its site collection's template as search reports it. DefaultLibrary: whether it is its site's default library, looked up only for
+/// sites <see cref="DefaultLibrarySites"/> names; null when not checked.
 /// </summary>
 public sealed record LibraryEntry(
     string Key,
@@ -68,7 +73,8 @@ public sealed record LibraryEntry(
     string? DriveId = null,
     string? InternalName = null,
     DateTimeOffset? CheckedAt = null,
-    string? SiteTemplate = null);
+    string? SiteTemplate = null,
+    bool? DefaultLibrary = null);
 
 public sealed record SkippedLibrary(string Key, string WebUrl, string Title, string Reason, string? InternalName = null)
 {

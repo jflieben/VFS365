@@ -27,7 +27,7 @@ public sealed class AgentSettings
     public static readonly IReadOnlyList<string> Names =
     [
         "ClientId", "TenantId", "DriveLetter", "Label", "Scope", "IncludedSites", "ExcludedSites", "IncludedSiteTemplates", "ExcludedSiteTemplates",
-        "PinnedLocations", "NavigationPane", "OverlayIcons", "CacheSizeMB", "TrayIcon", "NotifyUploads", "HelpUrl", "ChangeCheckSeconds", "ApiBudgetPerMinute",
+        "PinnedLocations", "DefaultLibrarySites", "NavigationPane", "OverlayIcons", "CacheSizeMB", "TrayIcon", "NotifyUploads", "HelpUrl", "ChangeCheckSeconds", "ApiBudgetPerMinute",
         "ThrottlePauseMinutes", "WalkPrefetchFolders", "ReadAheadFiles", "BackgroundUploads", "RepeatSaveSeconds", "DatabaseFiles", "MonitoringUrl",
         "MonitoringDetail", "FolderRedirection", "DriveMappings", "SharedWithMe", "ExplorerSearch", "OfficeFiles", "OfficeFileTypes", "OfficeMissing",
     ];
@@ -70,6 +70,9 @@ public sealed class AgentSettings
 
     /// <summary>Site or library URLs always shown, also where search doesn't reach (restricted, excluded from search, root or portal sites).</summary>
     public IReadOnlyList<string> PinnedLocations => List("PinnedLocations") ?? [];
+
+    /// <summary>Site templates or web URL patterns whose site folder is their default library (Sites\Finance\General).</summary>
+    public IReadOnlyList<string> DefaultLibrarySites => List("DefaultLibrarySites") ?? [];
 
     public bool NavigationPane => Bool("NavigationPane") ?? true;
 
@@ -185,6 +188,7 @@ public sealed class AgentSettings
             ("IncludedSiteTemplates", IncludedSiteTemplates.Count == 0 ? "all" : string.Join("; ", IncludedSiteTemplates), From("IncludedSiteTemplates")),
             ("ExcludedSiteTemplates", ExcludedSiteTemplates.Count == 0 ? "none" : string.Join("; ", ExcludedSiteTemplates), From("ExcludedSiteTemplates")),
             ("PinnedLocations", PinnedLocations.Count == 0 ? "none" : string.Join("; ", PinnedLocations), From("PinnedLocations")),
+            ("DefaultLibrarySites", DefaultLibrarySites.Count == 0 ? "none" : string.Join("; ", DefaultLibrarySites), From("DefaultLibrarySites")),
             ("NavigationPane", OnOff(NavigationPane), From("NavigationPane")),
             ("OverlayIcons", OnOff(OverlayIcons), From("OverlayIcons")),
             ("SharedWithMe", Scope == DriveScope.All ? OnOff(SharedWithMe) : $"{OnOff(SharedWithMe)} (shown with Scope All only)", From("SharedWithMe")),
@@ -264,7 +268,7 @@ public sealed class AgentSettings
             Unreadable(name, Raw(name, out _) is string, "text", "the default");
         }
         foreach (var name in new[] { "IncludedSites", "ExcludedSites", "IncludedSiteTemplates", "ExcludedSiteTemplates", "PinnedLocations", "FolderRedirection", "DriveMappings",
-            "OfficeFileTypes" })
+            "OfficeFileTypes", "DefaultLibrarySites" })
         {
             Unreadable(name, Raw(name, out _) is string or string[], "a list", "the default");
         }
