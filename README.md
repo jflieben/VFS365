@@ -85,13 +85,13 @@ Idle drives make no calls. Discovery and change checks yield to what users open 
 
 ### Explorer menu
 
-Right-click a file or folder in the drive (on Windows 11 under "Show more options"), then VFS365: Open in browser, Open in desktop app (Word, Excel, PowerPoint, co-authoring included), Copy link (for people who already have access; no sharing link is made), Version history, and Share in browser (opens the item in the browser, where its Share button is). On a conflict copy also Keep this version (the copy becomes a new version of the original; the other version stays in its version history) and Compare with the original.
+Right-click a file or folder in the drive (on Windows 11 in the first menu with a signed release, else under "Show more options"), then VFS365: Open in browser, Open in desktop app (Word, Excel, PowerPoint, co-authoring included), Copy link (for people who already have access; no sharing link is made), Version history, Share in browser (opens the item in the browser, where its Share button is), and Details and columns (a window with who made and changed it, its versions and labels, and its SharePoint columns and content type, to change there), Open library in browser (the library's top) and Recently deleted (the site's recycle bin page, to restore deleted items). On a conflict copy also Keep this version (the copy becomes a new version of the original; the other version stays in its version history) and Compare with the original.
 
 A double-click on a Word, Excel or PowerPoint file in the drive opens it from Microsoft 365, with co-authoring and AutoSave, unless the copy on the drive has changes that aren't uploaded yet (policy `OfficeFiles`: desktop app, browser or the copy on the drive).
 
 ### Tray
 
-The tray icon follows the taskbar theme and shows whether everything is saved (plain), something is waiting to upload (amber) or needs attention (red). Its menu has Show files, Show log, Collect diagnostics (one zip for the helpdesk, tokens removed), Restart, Sign in when needed, and Help (your own service desk page by policy). English or Dutch, by the Windows display language.
+The tray icon follows the taskbar theme and shows whether everything is saved (plain), something is waiting to upload (amber) or needs attention (red). Its menu has Show files, Waiting files (while files wait to upload: which, where, why and since when), Add a library by link (shows on the drive after Restart), Why is a site missing? (explains it in plain words), Show log, Collect diagnostics (one zip for the helpdesk, tokens removed), Restart, Sign in when needed, and Help (your own service desk page by policy). English or Dutch, by the Windows display language.
 
 <img src="assets/tray/preview.png" width="420" alt="Tray icons: normal, waiting and problem, for dark and light taskbars">
 

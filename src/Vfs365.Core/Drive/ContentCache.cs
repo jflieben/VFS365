@@ -11,6 +11,9 @@ public sealed record ContentCacheOptions
     /// <summary>Complete files beyond this total are evicted, least recently used first.</summary>
     public long MaxBytes { get; init; } = 2L << 30;
 
+    /// <summary>Complete files beyond this many are evicted the same way: each one costs memory in the index, whatever its size.</summary>
+    public int MaxFiles { get; init; } = 50_000;
+
     /// <summary>Encrypts content at rest; null keeps it plain (tests).</summary>
     public CacheCipher? Cipher { get; init; }
 
@@ -23,8 +26,9 @@ public sealed record ContentCacheOptions
 
 /// <summary>
 /// File content on local disk: one file per item version, in a folder per drive (cache\&lt;drive&gt;\&lt;item&gt;-&lt;version&gt;), encrypted and
-/// authenticated when a cipher is set and kept under MaxBytes. Content not here yet streams in as it is read. Content written under
-/// another key or format, or by a version that didn't encrypt, is dropped at start; a file that fails its check is dropped when read.
+/// authenticated when a cipher is set and kept under MaxBytes and MaxFiles. Content not here yet streams in as it is read. Content
+/// written under another key or format, or by a version that didn't encrypt, is dropped at start; a file that fails its check is
+/// dropped when read.
 /// What is here is known in memory by item version, so opens and lengths need no disk access and no hashing; the name index (the IDs
 /// each file name hashes, sealed line by line) carries that to the next start.
 /// </summary>
@@ -40,18 +44,22 @@ public sealed class ContentCache
     readonly record struct ContentKey(string DriveId, string ItemId, string Tag);
 
     /// <summary>
-    /// A complete cache file: its name with the drive folder, size on disk, the content length it holds (-1 when its size fits no
-    /// content length), when this run completed it (earlier runs: MinValue), when it was last used and when that was last set on disk.
-    /// Key is null for a file of an earlier run the name index doesn't list: a lookup hashes its key into the name, then sets it.
+    /// A complete cache file: its path, size on disk, the content length it holds (-1 when its size fits no content length), when
+    /// this run completed it (earlier runs: MinValue), when it was last used and when that was last set on disk. Key is null for a
+    /// file of an earlier run the name index doesn't list: a lookup hashes its key into the name, then sets it. There is one of these
+    /// per cached file, so what the path gives (name, drive folder) is worked out when asked for.
     /// </summary>
-    sealed class Entry(string path, string name, long length, long contentLength, DateTime completedAt, DateTime usedAt)
+    sealed class Entry(string path, long length, long contentLength, DateTime completedAt, DateTime usedAt)
     {
         long used = usedAt.Ticks, touched = usedAt.Ticks;
 
         public string Path { get; } = path;
-        public string Name { get; } = name;
-        public string Folder => Name[..Name.IndexOf('/')];
+        public string Name => NameOf(Path);
+        public string Folder => System.IO.Path.GetFileName(System.IO.Path.GetDirectoryName(Path.AsSpan())).ToString();
         public ContentKey? Key { get; set; }
+
+        /// <summary>The next cached version of the same item (see <see cref="versions"/>). Under sizeGate.</summary>
+        public Entry? Next { get; set; }
         public long Length { get; } = length;
         public long ContentLength { get; } = contentLength;
         public DateTime CompletedAt { get; } = completedAt;
@@ -78,8 +86,19 @@ public sealed class ContentCache
     readonly Lock sizeGate = new();
     readonly Dictionary<string, Entry> files = new(StringComparer.OrdinalIgnoreCase);
 
-    /// <summary>The complete files of each item (by the path up to the version), so finding an item's versions needs no disk scan.</summary>
-    readonly Dictionary<string, HashSet<string>> versions = new(StringComparer.OrdinalIgnoreCase);
+    /// <summary>
+    /// The complete files of each item, so finding an item's versions needs no disk scan: the first one, by the path of any of them
+    /// (paths compare up to the version), the others through <see cref="Entry.Next"/>.
+    /// </summary>
+    readonly Dictionary<string, Entry> versions = new(new SameItem());
+
+    /// <summary>Cache file paths are equal when they are versions of one item.</summary>
+    sealed class SameItem : IEqualityComparer<string>
+    {
+        public bool Equals(string? a, string? b) => a is not null && b is not null && ItemOf(a).Equals(ItemOf(b), StringComparison.OrdinalIgnoreCase);
+
+        public int GetHashCode(string path) => string.GetHashCode(ItemOf(path), StringComparison.OrdinalIgnoreCase);
+    }
 
     /// <summary>Files without a key, per drive folder and in all: a lookup hashes only while its drive has any.</summary>
     readonly Dictionary<string, int> unmatchedIn = new(StringComparer.OrdinalIgnoreCase);
@@ -111,11 +130,11 @@ public sealed class ContentCache
             }
             File.WriteAllText(marker, expected);
         }
-        foreach (var leftover in Directory.EnumerateFiles(this.directory, "*.part", SearchOption.AllDirectories))
+        foreach (var leftover in Directory.EnumerateFiles(this.directory, "*.part"))
         {
             TryDelete(leftover);
         }
-        Rescan();
+        Rescan(leftovers: true);
         ScheduleTrim();
     }
 
@@ -133,6 +152,9 @@ public sealed class ContentCache
 
     /// <summary>Above this a file alone would push out most of the cache: a download isn't kept and an upload isn't adopted.</summary>
     long Target => options.MaxBytes / 10 * 9;
+
+    /// <summary>A trim for the number of files leaves this many, so the next files don't each start one.</summary>
+    int FileTarget => (int)(options.MaxFiles * 9L / 10);
 
     /// <summary>Above this an upload isn't adopted and a copy (staging for changes) bypasses the cache: big saves don't churn it.</summary>
     long LargeFile => options.MaxBytes / 8;
@@ -370,10 +392,13 @@ public sealed class ContentCache
     {
         DropDownloads(key => key.DriveId == driveId && key.ItemId == itemId);
         var item = Path.Combine(directory, FolderOf(driveId), $"{Hash(itemId)}-");
-        List<string> cached;
+        var cached = new List<string>();
         lock (sizeGate)
         {
-            cached = versions.TryGetValue(item, out var paths) ? [.. paths] : [];
+            for (var entry = versions.GetValueOrDefault(item); entry is not null; entry = entry.Next)
+            {
+                cached.Add(entry.Path);
+            }
         }
         foreach (var path in cached)
         {
@@ -521,10 +546,14 @@ public sealed class ContentCache
             finished => Completed(key, finished), gaveUp => Failed(key, gaveUp), changed, options.NoProgressTimeout);
     }
 
-    /// <summary>Counts what is on disk again, with the keys the name index gives.</summary>
-    void Rescan()
+    /// <summary>
+    /// Counts what is on disk again, with the keys the name index gives, in one pass over the folders. <paramref name="leftovers"/>:
+    /// downloads an earlier run left unfinished go (at the start, when this run has none).
+    /// </summary>
+    void Rescan(bool leftovers = false)
     {
-        var names = ReadNames();
+        var names = ReadNames(out var lines);
+        var matched = 0;
         lock (sizeGate)
         {
             files.Clear();
@@ -535,17 +564,29 @@ public sealed class ContentCache
             (unmatched, total) = (0, 0);
             foreach (var folder in new DirectoryInfo(directory).EnumerateDirectories())
             {
-                foreach (var file in folder.EnumerateFiles().Where(f => f.Extension != ".part"))
+                foreach (var file in folder.EnumerateFiles())
                 {
-                    var name = $"{folder.Name}/{file.Name}";
-                    Track(new Entry(file.FullName, name, file.Length, ContentLengthOf(file.Length), DateTime.MinValue, file.LastAccessTimeUtc)
+                    if (file.Extension == ".part")
                     {
-                        Key = names.TryGetValue(name, out var key) ? key : null,
+                        if (leftovers)
+                        {
+                            TryDelete(file.FullName);
+                        }
+                        continue;
+                    }
+                    var listed = names.TryGetValue($"{folder.Name}/{file.Name}", out var key);
+                    matched += listed ? 1 : 0;
+                    Track(new Entry(file.FullName, file.Length, ContentLengthOf(file.Length), DateTime.MinValue, file.LastAccessTimeUtc)
+                    {
+                        Key = listed ? key : null,
                     });
                 }
             }
         }
-        WriteNames();
+        if (lines != matched)
+        {
+            WriteNames(); // not when every line names a file here: there is nothing to drop
+        }
     }
 
     /// <summary>Lists a complete file. Called under sizeGate.</summary>
@@ -554,12 +595,10 @@ public sealed class ContentCache
         files[entry.Path] = entry;
         total += entry.Length;
         superseded.Remove(entry.Path);
-        var item = ItemOf(entry.Path);
-        if (!versions.TryGetValue(item, out var paths))
-        {
-            versions[item] = paths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        }
-        paths.Add(entry.Path);
+        // The first of its item's versions, under its own path (not that of a file that may go)
+        versions.Remove(entry.Path, out var others);
+        entry.Next = others;
+        versions[entry.Path] = entry;
         if (entry.Key is { } key)
         {
             known[key] = entry;
@@ -580,10 +619,28 @@ public sealed class ContentCache
             return false;
         }
         total -= entry.Length;
-        var item = ItemOf(path);
-        if (versions.TryGetValue(item, out var paths) && paths.Remove(path) && paths.Count == 0)
+        if (versions.Remove(path, out var first))
         {
-            versions.Remove(item);
+            if (first == entry)
+            {
+                first = entry.Next;
+            }
+            else
+            {
+                for (var other = first; other.Next is not null; other = other.Next)
+                {
+                    if (other.Next == entry)
+                    {
+                        other.Next = entry.Next;
+                        break;
+                    }
+                }
+            }
+            if (first is not null)
+            {
+                versions[first.Path] = first;
+            }
+            entry.Next = null;
         }
         if (entry.Key is { } key)
         {
@@ -601,14 +658,11 @@ public sealed class ContentCache
     /// <summary>Marks the versions of the file's item completed before <paramref name="requestedAt"/> for the next trim. Called under sizeGate.</summary>
     void Supersede(string path, DateTime requestedAt)
     {
-        if (versions.TryGetValue(ItemOf(path), out var paths))
+        for (var other = versions.GetValueOrDefault(path); other is not null; other = other.Next)
         {
-            foreach (var other in paths)
+            if (!other.Path.Equals(path, StringComparison.OrdinalIgnoreCase) && other.CompletedAt < requestedAt)
             {
-                if (!other.Equals(path, StringComparison.OrdinalIgnoreCase) && !(files.TryGetValue(other, out var entry) && entry.CompletedAt >= requestedAt))
-                {
-                    superseded.Add(other);
-                }
+                superseded.Add(other.Path);
             }
         }
     }
@@ -620,7 +674,7 @@ public sealed class ContentCache
     string PathFor(ContentKey key) => Path.Combine(directory, FolderOf(key.DriveId), $"{Hash(key.ItemId)}-{Hash(key.Tag)}");
 
     /// <summary>A cache file's path up to its version: the same for every cached version of the item.</summary>
-    static string ItemOf(string path) => path[..(path.LastIndexOf('-') + 1)];
+    static ReadOnlySpan<char> ItemOf(string path) => path.AsSpan(0, path.LastIndexOf('-') + 1);
 
     static string Hash(string text)
     {
@@ -632,27 +686,35 @@ public sealed class ContentCache
     /// <summary>A cache file's name with its drive folder: what its encrypted chunks are bound to.</summary>
     static string NameOf(string path) => $"{Path.GetFileName(Path.GetDirectoryName(path))}/{Path.GetFileName(path)}";
 
-    /// <summary>The name index: the keys of complete files by their names, from lines that open with this key (others are skipped).</summary>
-    Dictionary<string, ContentKey> ReadNames()
+    /// <summary>
+    /// The name index: the keys of complete files by their names, from lines that open with this key (others are skipped), read line
+    /// by line. <paramref name="lines"/> is how many it has, -1 when it is missing or couldn't be read to its end.
+    /// </summary>
+    Dictionary<string, ContentKey> ReadNames(out int lines)
     {
         var names = new Dictionary<string, ContentKey>(StringComparer.OrdinalIgnoreCase);
-        string[] lines;
+        var drives = new Dictionary<string, string>(StringComparer.Ordinal); // one string per drive, not one per line
+        lines = 0;
         try
         {
-            lines = File.ReadAllLines(Path.Combine(directory, NameIndex));
+            foreach (var line in File.ReadLines(Path.Combine(directory, NameIndex)))
+            {
+                lines++;
+                // The name is worked out from the key, so a line can only ever name the file that key hashes to
+                if ((options.Cipher is { } cipher ? cipher.OpenRecord(line) : line)?.Split('\t') is [var driveId, var itemId, var tag])
+                {
+                    if (!drives.TryGetValue(driveId, out var drive))
+                    {
+                        drives[driveId] = drive = driveId;
+                    }
+                    var key = new ContentKey(drive, itemId, tag);
+                    names[NameOf(PathFor(key))] = key;
+                }
+            }
         }
         catch (Exception e) when (e is IOException or UnauthorizedAccessException)
         {
-            return names;
-        }
-        foreach (var line in lines)
-        {
-            // The name is worked out from the key, so a line can only ever name the file that key hashes to
-            if ((options.Cipher is { } cipher ? cipher.OpenRecord(line) : line)?.Split('\t') is [var driveId, var itemId, var tag])
-            {
-                var key = new ContentKey(driveId, itemId, tag);
-                names[NameOf(PathFor(key))] = key;
-            }
+            lines = -1;
         }
         return names;
     }
@@ -825,7 +887,7 @@ public sealed class ContentCache
             if (keep)
             {
                 // Its last access time on disk is about when its file was made
-                Track(new Entry(path, NameOf(path), info.Length, ContentLengthOf(info.Length), now, now) { Key = key, TouchedAt = requestedAt });
+                Track(new Entry(path, info.Length, ContentLengthOf(info.Length), now, now) { Key = key, TouchedAt = requestedAt });
             }
             Supersede(path, requestedAt);
         }
@@ -869,7 +931,7 @@ public sealed class ContentCache
 
     /// <summary>
     /// Records new keys in the name index, deletes superseded versions, then least recently used files while the total is above
-    /// MaxBytes, down to the target.
+    /// MaxBytes or there are more than MaxFiles, down to 90% of the limit passed.
     /// </summary>
     void Trim()
     {
@@ -886,7 +948,7 @@ public sealed class ContentCache
         }
         lock (sizeGate)
         {
-            if (total <= options.MaxBytes)
+            if (total <= options.MaxBytes && files.Count <= options.MaxFiles)
             {
                 return;
             }
@@ -900,10 +962,12 @@ public sealed class ContentCache
         var victims = new List<string>();
         lock (sizeGate)
         {
-            var left = total;
+            // Only a limit that was passed is brought down to its target
+            var (left, bytes) = (total, total > options.MaxBytes ? Target : long.MaxValue);
+            var (count, most) = (files.Count, files.Count > options.MaxFiles ? FileTarget : int.MaxValue);
             foreach (var (path, entry) in files.OrderBy(f => f.Value.UsedAt))
             {
-                if (left <= Target)
+                if (left <= bytes && count <= most)
                 {
                     break;
                 }
@@ -911,6 +975,7 @@ public sealed class ContentCache
                 {
                     victims.Add(path);
                     left -= entry.Length;
+                    count--;
                 }
             }
         }

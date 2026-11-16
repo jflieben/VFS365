@@ -156,6 +156,32 @@ public sealed class WamTests
     }
 
     [Fact]
+    public async Task A_refused_renewal_keeps_the_token_in_hand_and_raises_no_sign_in_problem()
+    {
+        var broker = new FakeBroker { Respond = (_, _, _) => Task.FromResult(Token("ann@contoso.com", "working")) };
+        var tokens = Source(broker);
+        Assert.Equal("working", await tokens.GetAccessTokenAsync(Graph, default));
+        broker.Respond = (_, _, _) => Task.FromResult(Failed(WamStatus.UserInteractionRequired, "AADSTS65001: consent needed"));
+
+        await Assert.ThrowsAsync<SignInException>(() => tokens.RenewAsync(Graph, """{"access_token":{"nbf":{"essential":true}}}""", default).AsTask());
+
+        Assert.Equal("working", await tokens.GetAccessTokenAsync(Graph, default));
+        Assert.False(tokens.SignInProblem);
+    }
+
+    [Fact]
+    public async Task A_renewal_that_succeeds_replaces_the_token()
+    {
+        var broker = new FakeBroker { Respond = (_, _, _) => Task.FromResult(Token("ann@contoso.com", "before consent")) };
+        var tokens = Source(broker);
+        await tokens.GetAccessTokenAsync(Graph, default);
+        broker.Respond = (_, _, _) => Task.FromResult(Token("ann@contoso.com", "after consent"));
+
+        Assert.Equal("after consent", await tokens.RenewAsync(Graph, """{"access_token":{"nbf":{"essential":true}}}""", default));
+        Assert.Equal("after consent", await tokens.GetAccessTokenAsync(Graph, default));
+    }
+
+    [Fact]
     public async Task Signing_in_with_another_account_forgets_the_tokens_of_the_first()
     {
         var user = "ann@contoso.com";

@@ -66,7 +66,7 @@ static class ShellDll
 
     public static bool IsOnVolume(string path) => Export<IsOnVolumeFn>("VfsShellIsOnVolume")(path) == 1;
 
-    /// <summary>A command (0 the VFS365 item, 1 to 7 the verbs) for an item; null past the last.</summary>
+    /// <summary>A command (0 the VFS365 item, 1 to 11 the verbs) for an item; null past the last.</summary>
     public static (string Name, string Title, bool Shown)? Verb(int index, string path, bool folder)
     {
         var name = new StringBuilder(64);
@@ -435,7 +435,7 @@ public sealed class ShellExtensionTests
     public void The_verbs_match_the_legacy_menu()
     {
         ShellDll.UseSection($@"Local\VFS365.Shell.Test.{Guid.NewGuid():N}");
-        var names = Enumerable.Range(1, 10).Select(i => ShellDll.Verb(i, @"M:\a.docx", false)).TakeWhile(v => v is not null).Select(v => v!.Value.Name);
+        var names = Enumerable.Range(1, 12).Select(i => ShellDll.Verb(i, @"M:\a.docx", false)).TakeWhile(v => v is not null).Select(v => v!.Value.Name);
         Assert.Equal(ExplorerVerbs.Verbs.Select(v => v.Name), names);
         for (var i = 0; i < ExplorerVerbs.Verbs.Length; i++)
         {
@@ -523,16 +523,16 @@ public sealed class ShellExtensionTests
         Assert.Equal(2u, state); // ECS_HIDDEN without a selection
 
         Assert.Equal(0, menu.EnumSubCommands(out var verbs));
-        var commands = new IExplorerCommand[10];
-        Assert.Equal(1, verbs.Next(10, commands, out var fetched)); // S_FALSE: fewer than asked
+        var commands = new IExplorerCommand[12];
+        Assert.Equal(1, verbs.Next(12, commands, out var fetched)); // S_FALSE: fewer than asked
         Assert.Equal((uint)ExplorerVerbs.Verbs.Length, fetched);
         var titles = commands.Take((int)fetched).Select(c => c.GetTitle(IntPtr.Zero, out var t) == 0 ? Take(t) : null);
-        Assert.Equal(["Open in browser", "Open in desktop app", "Copy link", "Version history", "Share in browser", "Keep this version", "Compare with the original",
-            "Search in Microsoft 365"], titles);
-        Assert.Equal(0, commands[5].GetFlags(out var keepFlags));
+        Assert.Equal(["Open in browser", "Open in desktop app", "Copy link", "Version history", "Share in browser", "Details and columns", "Open library in browser", "Recently deleted", "Keep this version",
+            "Compare with the original", "Search in Microsoft 365"], titles);
+        Assert.Equal(0, commands[8].GetFlags(out var keepFlags));
         Assert.Equal(0x20u, keepFlags); // ECF_SEPARATORBEFORE
         Assert.Equal(0, verbs.Reset());
-        Assert.Equal(0, verbs.Skip(6));
+        Assert.Equal(0, verbs.Skip(9));
         Assert.Equal(0, verbs.Clone(out var copy));
         var last = new IExplorerCommand[1];
         Assert.Equal(0, copy.Next(1, last, out _));
@@ -541,7 +541,7 @@ public sealed class ShellExtensionTests
         Assert.Equal(0, copy.Next(1, last, out _));
         Assert.Equal(0, last[0].GetTitle(IntPtr.Zero, out var searchTitle));
         Assert.Equal("Search in Microsoft 365", Take(searchTitle));
-        Assert.Equal(0, commands[7].GetFlags(out var searchFlags));
+        Assert.Equal(0, commands[10].GetFlags(out var searchFlags));
         Assert.Equal(0x20u, searchFlags); // ECF_SEPARATORBEFORE
         Assert.Equal(1, copy.Next(1, last, out var none));
         Assert.Equal(0u, none);

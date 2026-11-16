@@ -13,7 +13,8 @@ namespace Vfs365.Agent;
 /// copy's version itself. Problems and results reach the user as notifications, in plain words.
 /// </summary>
 public sealed class VerbActions(DriveEngine engine, Func<string, string, CancellationToken, Task<ItemLinks?>> links, Func<string, string?> volumePath,
-    Action<string> open, Action<string> copy, Action<string, string, bool> notify, Action<string> log)
+    Action<string> open, Action<string> copy, Action<string, string, bool> notify, Action<string> log, Action<DetailsRequest>? details = null,
+    Func<string, CancellationToken, Task<string?>>? rootUrl = null)
 {
     public async Task RunAsync(string verb, string path, CancellationToken ct)
     {
@@ -38,6 +39,18 @@ public sealed class VerbActions(DriveEngine engine, Func<string, string, Cancell
                     return;
                 case "compare":
                     await CompareAsync(entry, ct);
+                    return;
+                case "details":
+                    if (await IdsOfAsync(entry, ct) is { } ids)
+                    {
+                        details?.Invoke(new(ids.DriveId, ids.ItemId, entry.Name, path, entry.ReadOnly));
+                    }
+                    return;
+                case "library":
+                    if (await IdsOfAsync(entry, ct) is { } library)
+                    {
+                        Open(rootUrl is null ? null : await rootUrl(library.DriveId, ct), entry);
+                    }
                     return;
             }
             if (await LinksOfAsync(entry, ct) is not { } found)
@@ -78,6 +91,16 @@ public sealed class VerbActions(DriveEngine engine, Func<string, string, Cancell
                     else
                     {
                         Problem("Verb.NotFound", entry.Name);
+                    }
+                    break;
+                case "deleted":
+                    if (Https(found.SiteUrl) is { } siteUrl)
+                    {
+                        open(ItemUrls.RecycleBin(siteUrl));
+                    }
+                    else
+                    {
+                        Problem("Verb.NoRecycleBin", entry.Name);
                     }
                     break;
                 case "versions":
@@ -161,8 +184,8 @@ public sealed class VerbActions(DriveEngine engine, Func<string, string, Cancell
         }
     }
 
-    /// <summary>The links of an entry (a library's top: its root folder), or null after telling the user why there are none.</summary>
-    async Task<ItemLinks?> LinksOfAsync(FsEntry entry, CancellationToken ct)
+    /// <summary>An entry's drive and item (a library's top: its root folder), or null after telling the user why it has none.</summary>
+    async Task<(string DriveId, string ItemId)?> IdsOfAsync(FsEntry entry, CancellationToken ct)
     {
         var driveId = await engine.DriveIdOfAsync(entry, ct);
         if (driveId is null)
@@ -174,6 +197,16 @@ public sealed class VerbActions(DriveEngine engine, Func<string, string, Cancell
         if (itemId is null)
         {
             Problem("Verb.NotUploaded", entry.Name);
+            return null;
+        }
+        return (driveId, itemId);
+    }
+
+    /// <summary>The links of an entry, or null after telling the user why there are none.</summary>
+    async Task<ItemLinks?> LinksOfAsync(FsEntry entry, CancellationToken ct)
+    {
+        if (await IdsOfAsync(entry, ct) is not var (driveId, itemId))
+        {
             return null;
         }
         var found = await links(driveId, itemId, ct);
@@ -261,7 +294,8 @@ public sealed class ExplorerMenu : IDisposable
     /// <paramref name="overlays"/> (policy OverlayIcons) it says there are none. The Office verb follows <paramref name="officeFiles"/>.
     /// </summary>
     public static ExplorerMenu? Start(DriveEngine engine, DriveApi api, string unc, string? letter, SessionDriveLetters? folders, bool overlays,
-        OfficeSettings officeFiles, Func<string, CancellationToken, Task>? search, Action<string, string, bool> notify, Action<string> say, Action<string> log)
+        OfficeSettings officeFiles, Func<string, CancellationToken, Task>? search, Action<string, string, bool> notify, Action<string> say, Action<string> log,
+        Action<DetailsRequest>? details = null)
     {
         var exe = Path.Combine(AppContext.BaseDirectory, "vfs365-agent.exe");
         if (!File.Exists(exe))
@@ -270,7 +304,7 @@ public sealed class ExplorerMenu : IDisposable
             return null;
         }
         string? VolumePath(string path) => ExplorerVerbs.VolumePath(path, unc, letter, folders?.Folders() ?? new Dictionary<string, string>());
-        var actions = new VerbActions(engine, api.GetLinksAsync, VolumePath, Shell, Clipboard.SetText, notify, log);
+        var actions = new VerbActions(engine, api.GetLinksAsync, VolumePath, Shell, Clipboard.SetText, notify, log, details, api.GetRootUrlAsync);
         var office = new OfficeVerbs(Registry.CurrentUser, exe, officeFiles, OfficeAssociations.Of);
         var opener = new OfficeOpen(engine, api.GetLinksAsync, VolumePath, officeFiles, OfficeAssociations.Of, Shell,
             (path, chooseApp) => LocalOpen.OpenAsync(path, chooseApp).ContinueWith(t => log($"Office open: Windows didn't open it: {t.Exception!.InnerException!.Message}"),

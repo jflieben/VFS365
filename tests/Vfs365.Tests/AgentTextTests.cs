@@ -51,7 +51,50 @@ public sealed class AgentTextTests
     [InlineData("AADSTS50076: Due to a configuration change made by your administrator, you must use multi-factor authentication.", Cause.SignedOut)]
     [InlineData("SharePoint has the library read-only for now (maintenance or a site move)", Cause.ReadOnly)]
     [InlineData("Something odd", Cause.Other)]
+    [InlineData("507 InsufficientStorage from https://x/y: quota", Cause.Quota)]
+    [InlineData("503 ServiceUnavailable from https://x/y: {\"code\":\"quotaLimitReached\"}", Cause.Quota)]
+    [InlineData("500 InternalServerError from https://x/y: {\"code\":\"insufficientStorage\"}", Cause.Quota)]
+    [InlineData("insufficientStorage", Cause.Quota)]
+    [InlineData("400 BadRequest from https://x/y: invalidRequest, the name is not allowed", Cause.Refused)]
+    [InlineData("413 RequestEntityTooLarge from https://x/y: too big", Cause.TooLarge)]
+    [InlineData("502 BadGateway from https://x/y: oops", Cause.Unavailable)]
+    [InlineData("418 Teapot from https://x/y: odd", Cause.Other)]
     public void Errors_get_a_plain_cause(string message, Cause cause) => Assert.Equal(cause, PlainCause.Of(message));
+
+    [Fact]
+    public void Every_cause_has_a_text_in_both_languages_and_the_new_ones_say_what_to_do()
+    {
+        foreach (var cause in Enum.GetValues<Cause>())
+        {
+            Assert.False(string.IsNullOrWhiteSpace(PlainCause.Text(cause, English)), cause.ToString());
+            Assert.False(string.IsNullOrWhiteSpace(PlainCause.Text(cause, Dutch)), cause.ToString());
+            Assert.False(string.IsNullOrWhiteSpace(PlainCause.Text(cause, English, upload: true)), cause.ToString());
+            Assert.False(string.IsNullOrWhiteSpace(PlainCause.Text(cause, Dutch, upload: true)), cause.ToString());
+        }
+        Assert.Contains("free up space", PlainCause.Text(Cause.Quota, English));
+        Assert.Contains("rename the file", PlainCause.Text(Cause.Refused, English, upload: true));
+        Assert.DoesNotContain("name", PlainCause.Text(Cause.Refused, English)); // outside uploads (the details window) a 400 is about something else
+        Assert.Contains("too large", PlainCause.Text(Cause.TooLarge, English));
+        Assert.Contains("Collect diagnostics", PlainCause.Text(Cause.Other, English, upload: true));
+        Assert.Contains("Diagnosegegevens verzamelen", PlainCause.Text(Cause.Other, Dutch, upload: true));
+        Assert.Contains("upload when it recovers", PlainCause.Text(Cause.Unavailable, English, upload: true));
+        Assert.DoesNotContain("upload", PlainCause.Text(Cause.Unavailable, English)); // nothing uploads when the details window fails to load
+        Assert.Contains("opslagruimte", PlainCause.Text(Cause.Quota, Dutch));
+        Assert.Equal("report.docx isn't uploaded yet: the file is too large for Microsoft 365. VFS365 keeps trying; your changes are kept on this PC.",
+            UiText.Get(English, "Waiting.One", "report.docx", PlainCause.Text(Cause.TooLarge, English)));
+    }
+
+    [Fact]
+    public void The_tray_menus_access_keys_are_unique_per_language()
+    {
+        // Items that can show together: everything but Retry (before the drive is up) and Restart/SignIn variants
+        string[] keys = ["Menu.ShowFiles", "Menu.Search", "Menu.Details", "Menu.Waiting", "Menu.AddLibrary", "Menu.Why", "Menu.ShowLog", "Menu.Diagnostics", "Menu.Restart", "Menu.SignIn", "Menu.Help"];
+        foreach (var culture in new[] { English, Dutch })
+        {
+            var accelerators = keys.Select(key => UiText.Get(culture, key, 1)).Select(text => char.ToLowerInvariant(text[text.IndexOf('&') + 1])).ToList();
+            Assert.Equal(accelerators.Count, accelerators.Distinct().Count());
+        }
+    }
 
     [Fact]
     public void What_the_agent_knows_explains_unclear_errors()
@@ -72,6 +115,20 @@ public sealed class AgentTextTests
     }
 
     static EngineNotice Waiting(string name, string detail) => new(NoticeKind.UploadWaiting, name, $@"\OneDrive\{name}", detail);
+
+    [Fact]
+    public void A_file_refused_for_its_name_is_not_said_to_be_tried_again_and_its_toast_fits()
+    {
+        foreach (var culture in new[] { English, Dutch })
+        {
+            var batcher = new NoticeBatcher();
+            batcher.Add(Waiting("Quarterly report 2026.docx", "400 BadRequest from https://x/y: invalidRequest"), Cause.Refused, T0);
+            var text = Assert.Single(batcher.Due(T0 + NoticeBatcher.Window, culture)).Text;
+
+            Assert.Equal(UiText.Get(culture, "Waiting.Kept.One", "Quarterly report 2026.docx", PlainCause.Text(Cause.Refused, culture, upload: true)), text);
+            Assert.InRange(text.Length, 1, 255); // a toast shows no more
+        }
+    }
 
     [Fact]
     public void Notices_within_a_few_seconds_become_one_toast_per_kind()
@@ -177,7 +234,7 @@ public sealed class AgentTextTests
         Assert.Equal("Windows could not start the drive; WinFsp may be missing",
             StartText.Plain(new IOException("WinFsp could not mount a free drive letter (NTSTATUS 0xC0000034)."), English));
         Assert.Equal("VFS365 can't read or write its files in your profile", StartText.Plain(new UnauthorizedAccessException(@"Access to C:\Users\ann\AppData\Local\VFS365\cache.key is denied."), English));
-        Assert.Equal("een onverwachte fout", StartText.Plain(new InvalidOperationException("Sequence contains no elements"), Dutch));
+        Assert.StartsWith("een fout die VFS365 niet herkent", StartText.Plain(new InvalidOperationException("Sequence contains no elements"), Dutch));
     }
 
     [Fact]

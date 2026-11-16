@@ -18,8 +18,11 @@ Until then users see "Need admin approval" (user consent for these scopes is blo
 |---|---|---|
 | Microsoft Graph | `User.Read` | Sign-in, own OneDrive URL (finds the tenant's SharePoint host) |
 | Microsoft Graph | `Files.ReadWrite.All` | Read, upload, rename, move and delete files in every library the user can reach |
-| Microsoft Graph | `Sites.Read.All` | Resolve a discovered library to its Graph drive |
-| SharePoint | `AllSites.Read` | Discovery: SharePoint Search, site and library metadata. Not used with `Scope` = `OneDrive` |
+| Microsoft Graph | `Sites.ReadWrite.All` | Resolve a discovered library to its Graph drive; change a file's SharePoint columns and content type in the details window (replaces `Sites.Read.All`) |
+| Microsoft Graph | `TermStore.Read.All` | The choices of managed metadata columns in the details window |
+| SharePoint | `AllSites.Write` | Discovery: SharePoint Search, site and library metadata. In the details window: the people picker, and saving people and managed metadata columns (replaces `AllSites.Read`) |
+
+From 0.9.0 the app asks for `Sites.ReadWrite.All`, `TermStore.Read.All` and SharePoint `AllSites.Write` (instead of `AllSites.Read`): an admin consents again with the link above. None of these lets VFS365 do more than the signed-in user may do. Until then nothing stops working. The details window still saves columns with the earlier permissions, which Microsoft doesn't document for this, and it can't offer managed metadata terms: it says so and points to the browser. After the consent the terms work at once: Windows keeps handing out the token it has for up to a day, so when the term store refuses it, VFS365 asks for a new one (once per 15 minutes).
 
 ## Your own registration
 

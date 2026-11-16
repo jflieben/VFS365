@@ -136,6 +136,9 @@ public interface IDriveApi
     /// </summary>
     Task<DriveItemInfo?> UploadFragmentAsync(UploadSession session, string sourceFile, long offset, long length, long totalSize, CancellationToken ct);
 
+    /// <summary>A progressive upload completed <paramref name="item"/> (UploadAsync does this itself): what follows a save. Never throws.</summary>
+    Task UploadedAsync(string driveId, DriveItemInfo item, CancellationToken ct) => Task.CompletedTask;
+
     Task CancelUploadSessionAsync(UploadSession session, CancellationToken ct);
 
     Task<DriveItemInfo> CreateFolderAsync(string driveId, string parentPath, string name, CancellationToken ct);

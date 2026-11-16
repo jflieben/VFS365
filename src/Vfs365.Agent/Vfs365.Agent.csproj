@@ -6,14 +6,21 @@
     <TargetFramework>net10.0-windows</TargetFramework>
     <!-- Wam.cs calls WinRT interfaces by vtable slot -->
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <!-- The details window (DetailsWindow.cs); the tray and the other windows stay plain Win32 -->
+    <UseWindowsForms>true</UseWindowsForms>
   </PropertyGroup>
+
+  <ItemGroup>
+    <!-- No implicit Windows Forms names: the agent has its own Clipboard, Tray and timers -->
+    <Using Remove="System.Windows.Forms" />
+    <Using Remove="System.Drawing" />
+  </ItemGroup>
 
   <ItemGroup>
     <InternalsVisibleTo Include="Vfs365.Tests" />
   </ItemGroup>
 
   <ItemGroup>
-    <PackageReference Include="System.Security.Cryptography.ProtectedData" />
     <ProjectReference Include="..\Vfs365.Core\Vfs365.Core.csproj" />
     <ProjectReference Include="..\Vfs365.Graph\Vfs365.Graph.csproj" />
     <ProjectReference Include="..\Vfs365.Drive.WinFsp\Vfs365.Drive.WinFsp.csproj" />

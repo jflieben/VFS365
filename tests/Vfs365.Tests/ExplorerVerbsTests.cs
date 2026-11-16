@@ -121,22 +121,22 @@ public sealed class ExplorerVerbsTests : IDisposable
             Assert.Equal("Single", files.GetValue("MultiSelectModel"));
             Assert.Equal(ExplorerVerbs.AppliesTo([@"M:\", @"\\VFS365\ann\"]), files.GetValue("AppliesTo"));
             using var shell = files.OpenSubKey("shell")!;
-            Assert.Equal(["01browser", "02desktop", "03link", "04versions", "05share", "06keep", "07compare"], shell.GetSubKeyNames().Order());
+            Assert.Equal(["01browser", "02desktop", "03link", "04versions", "05share", "06details", "07library", "08deleted", "09keep", "10compare"], shell.GetSubKeyNames().Order());
             using var browser = shell.OpenSubKey(@"01browser\command")!;
             Assert.Equal($@"""{Exe}"" verb browser ""%1""", browser.GetValue(""));
             using var desktop = shell.OpenSubKey("02desktop")!;
             Assert.Equal("Open in desktop app", desktop.GetValue("MUIVerb"));
             Assert.Contains(@"System.FileExtension:="".docx""", (string)desktop.GetValue("AppliesTo")!);
-            using var keep = shell.OpenSubKey("06keep")!;
+            using var keep = shell.OpenSubKey("09keep")!;
             Assert.Contains("(conflict ????-??-?? ??????*)", (string)keep.GetValue("AppliesTo")!);
         }
         using (var folders = hive.OpenSubKey(@"Software\Classes\Directory\shell\VFS365\shell")!)
         {
-            Assert.Equal(["01browser", "02link", "03share", "04search"], folders.GetSubKeyNames().Order());
-            using var search = folders.OpenSubKey("04search")!;
+            Assert.Equal(["01browser", "02link", "03share", "04details", "05library", "06deleted", "07search"], folders.GetSubKeyNames().Order());
+            using var search = folders.OpenSubKey("07search")!;
             Assert.Equal("Search in Microsoft 365", search.GetValue("MUIVerb"));
             Assert.Equal(0x20, search.GetValue("CommandFlags"));
-            using var command = folders.OpenSubKey(@"04search\command")!;
+            using var command = folders.OpenSubKey(@"07search\command")!;
             Assert.Equal($@"""{Exe}"" verb search ""%1""", command.GetValue(""));
         }
         Assert.Null(hive.OpenSubKey(@"Software\Classes\Directory\Background\shell\VFS365")); // Explorer hides it there with AppliesTo
@@ -219,9 +219,10 @@ public sealed class ExplorerVerbsTests : IDisposable
         public readonly List<string> Opened = [], Copied = [];
         public readonly List<(string Title, string Text, bool Problem)> Told = [];
         public readonly List<(string DriveId, string ItemId)> Asked = [];
+        public readonly List<string> Roots = [];
     }
 
-    (VerbActions Actions, Recorder Seen) Actions(DriveEngine engine, ItemLinks? links)
+    (VerbActions Actions, Recorder Seen) Actions(DriveEngine engine, ItemLinks? links, string? rootUrl = "https://x-my.sharepoint.com/personal/u/Documents")
     {
         var seen = new Recorder();
         var actions = new VerbActions(engine,
@@ -231,8 +232,88 @@ public sealed class ExplorerVerbsTests : IDisposable
                 return Task.FromResult(links);
             },
             path => ExplorerVerbs.VolumePath(path, Unc, "M:", Folders),
-            seen.Opened.Add, seen.Copied.Add, (title, text, problem) => seen.Told.Add((title, text, problem)), _ => { });
+            seen.Opened.Add, seen.Copied.Add, (title, text, problem) => seen.Told.Add((title, text, problem)), _ => { }, null,
+            (drive, _) =>
+            {
+                seen.Roots.Add(drive);
+                return Task.FromResult(rootUrl);
+            });
         return (actions, seen);
+    }
+
+    [Fact]
+    public async Task Open_library_opens_the_libraries_root_and_Recently_deleted_the_sites_recycle_bin()
+    {
+        api.Add("Q4 plan.xlsx");
+        api.Add("Folder", folder: true);
+        var (actions, seen) = Actions(Engine(), Links);
+
+        await actions.RunAsync("library", @"M:\OneDrive\Q4 plan.xlsx", default);
+        await actions.RunAsync("library", @"M:\OneDrive\Folder", default);
+        await actions.RunAsync("deleted", @"M:\OneDrive\Q4 plan.xlsx", default);
+        await actions.RunAsync("deleted", @"M:\OneDrive\Folder", default);
+
+        Assert.Equal(["https://x-my.sharepoint.com/personal/u/Documents", "https://x-my.sharepoint.com/personal/u/Documents",
+            "https://x-my.sharepoint.com/personal/u/_layouts/15/RecycleBin.aspx", "https://x-my.sharepoint.com/personal/u/_layouts/15/RecycleBin.aspx"], seen.Opened);
+        Assert.Equal(["b!me", "b!me"], seen.Roots);
+        Assert.Empty(seen.Told);
+    }
+
+    [Fact]
+    public async Task Open_library_and_Recently_deleted_open_only_https_and_say_why_not()
+    {
+        api.Add("Q4 plan.xlsx");
+        var (insecure, seenInsecure) = Actions(Engine(), Links with { SiteUrl = "http://x-my.sharepoint.com/personal/u" }, "http://x-my.sharepoint.com/personal/u/Documents");
+        await insecure.RunAsync("library", @"M:\OneDrive\Q4 plan.xlsx", default);
+        await insecure.RunAsync("deleted", @"M:\OneDrive\Q4 plan.xlsx", default);
+        Assert.Empty(seenInsecure.Opened);
+        Assert.Equal([UiText.Get("Verb.NotFound", "Q4 plan.xlsx"), UiText.Get("Verb.NoRecycleBin", "Q4 plan.xlsx")], seenInsecure.Told.Select(t => t.Text));
+
+        var (none, seenNone) = Actions(Engine(), Links with { SiteUrl = null }, null);
+        await none.RunAsync("library", @"M:\OneDrive\Q4 plan.xlsx", default);
+        await none.RunAsync("deleted", @"M:\OneDrive\Q4 plan.xlsx", default);
+        await none.RunAsync("library", @"M:\", default); // the volume's own folder has no library
+        Assert.Empty(seenNone.Opened);
+        Assert.Equal(3, seenNone.Told.Count);
+        Assert.All(seenNone.Told, told => Assert.True(told.Problem));
+    }
+
+    [Fact]
+    public void The_recycle_bin_is_the_sites_page()
+    {
+        Assert.Equal("https://x.sharepoint.com/sites/Sales/_layouts/15/RecycleBin.aspx", ItemUrls.RecycleBin("https://x.sharepoint.com/sites/Sales/"));
+    }
+
+    [Fact]
+    public void The_verb_table_the_texts_and_the_shell_source_stay_in_step()
+    {
+        foreach (var (name, _, _) in ExplorerVerbs.Verbs)
+        {
+            Assert.False(string.IsNullOrWhiteSpace(UiText.Get(English, $"Verb.{name}")), name);
+            Assert.False(string.IsNullOrWhiteSpace(UiText.Get(Dutch, $"Verb.{name}")), name);
+        }
+        Assert.Equal(["browser", "desktop", "link", "versions", "share", "details", "library", "deleted", "keep", "compare", "search"], ExplorerVerbs.Verbs.Select(v => v.Name));
+
+        // vfs365shell.c: its Verbs[] table in the same order (names, English titles, folders) and a Commands[] entry for the menu item and each verb
+        var directory = new DirectoryInfo(AppContext.BaseDirectory);
+        while (directory is not null && !File.Exists(Path.Combine(directory.FullName, "src", "Vfs365.Shell", "vfs365shell.c")))
+        {
+            directory = directory.Parent;
+        }
+        Assert.NotNull(directory);
+        var source = File.ReadAllText(Path.Combine(directory.FullName, "src", "Vfs365.Shell", "vfs365shell.c"));
+        var table = source[source.IndexOf("static const VERB Verbs[]", StringComparison.Ordinal)..];
+        table = table[..table.IndexOf("};", StringComparison.Ordinal)];
+        var rows = System.Text.RegularExpressions.Regex.Matches(table, "\\{ L\"(\\w+)\", L\"Verb\\.(\\w+)\", L\"([^\"]+)\", (TRUE|FALSE)").ToList();
+        Assert.Equal(ExplorerVerbs.Verbs.Select(v => v.Name), rows.Select(r => r.Groups[1].Value));
+        Assert.Equal(ExplorerVerbs.Verbs.Select(v => v.Name), rows.Select(r => r.Groups[2].Value));
+        Assert.Equal(ExplorerVerbs.Verbs.Select(v => UiText.Get(English, $"Verb.{v.Name}")), rows.Select(r => r.Groups[3].Value));
+        Assert.Equal(ExplorerVerbs.Verbs.Select(v => v.Folders), rows.Select(r => r.Groups[4].Value == "TRUE"));
+
+        var commands = source[source.IndexOf("static COMMAND Commands[1 + VERB_COUNT] = {", StringComparison.Ordinal)..];
+        commands = commands[..commands.IndexOf("};", StringComparison.Ordinal)];
+        var indexes = System.Text.RegularExpressions.Regex.Matches(commands, @"\{ &CommandVtbl, (\d+) \}").Select(m => int.Parse(m.Groups[1].Value, CultureInfo.InvariantCulture));
+        Assert.Equal(Enumerable.Range(0, 1 + ExplorerVerbs.Verbs.Length), indexes);
     }
 
     DriveEngine Engine() =>

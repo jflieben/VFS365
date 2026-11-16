@@ -12,14 +12,26 @@ namespace Vfs365.Agent;
 internal static unsafe partial class AskWindow
 {
     internal const int IdOk = 1, IdCancel = 2, IdEdit = 100, IdPrompt = 101, IdSecond = 102;
-    const uint WmInitDialog = 0x0110, WmCommand = 0x0111, WmClose = 0x0010, EmLimitText = 0x00C5;
+    const uint WmInitDialog = 0x0110, WmCommand = 0x0111, WmClose = 0x0010, EmLimitText = 0x00C5, EmSetSel = 0x00B1;
     static readonly Lock gate = new();
     static IntPtr shown;
     static string prompt = "";
-    static string? answer;
+    static string? answer, start;
+    static int limit = SearchTerms.MaxLength;
+
+    /// <summary>The longest text <see cref="AskTextAsync"/> takes: a SharePoint address fits.</summary>
+    public const int MaxText = 2000;
 
     /// <summary>Asks for search words below <paramref name="text"/>; null when cancelled, closed or another one is open.</summary>
-    public static Task<string?> AskAsync(string text, CancellationToken ct) => RunAsync<string?>(text, ShowSearch, null, "VFS365 search words", ct);
+    public static Task<string?> AskAsync(string text, CancellationToken ct) =>
+        RunAsync<string?>(text, () => ShowSearch(UiText.Get("Search.Title"), UiText.Get("Search.Button"), null, SearchTerms.MaxLength), null, "VFS365 search words", ct);
+
+    /// <summary>
+    /// Asks for a line of text below <paramref name="text"/> in a window called <paramref name="title"/>, with <paramref name="initial"/>
+    /// (run on the window's thread, so it may read the clipboard) selected in the field; null when cancelled, closed or another one is open.
+    /// </summary>
+    public static Task<string?> AskTextAsync(string title, string text, string button, Func<string?>? initial, CancellationToken ct) =>
+        RunAsync<string?>(text, () => ShowSearch(title, button, initial, MaxText), null, "VFS365 search words", ct);
 
     /// <summary>
     /// Asks <paramref name="text"/>: 1 for <paramref name="first"/> (the default button), 2 for <paramref name="second"/>, 0 when cancelled,
@@ -80,10 +92,19 @@ internal static unsafe partial class AskWindow
         return result.Task;
     }
 
-    static string? ShowSearch()
+    static string? ShowSearch(string title, string button, Func<string?>? initial, int longest)
     {
         answer = null;
-        return Run(Template(UiText.Get("Search.Title"), UiText.Get("Search.Button"), UiText.Get("Search.Cancel")), &DialogProc) == 1 ? answer : null;
+        limit = longest;
+        try
+        {
+            start = initial?.Invoke();
+        }
+        catch (Exception e) when (e is not OutOfMemoryException)
+        {
+            start = null; // no suggestion, e.g. the clipboard is busy
+        }
+        return Run(Template(title, button, UiText.Get("Search.Cancel")), &DialogProc) == 1 ? answer : null;
     }
 
     static int ShowChoice(string title, string first, string second, string cancel) =>
@@ -124,7 +145,12 @@ internal static unsafe partial class AskWindow
                         shown = window;
                     }
                     SetDlgItemTextW(window, IdPrompt, prompt);
-                    SendDlgItemMessageW(window, IdEdit, EmLimitText, SearchTerms.MaxLength, 0);
+                    SendDlgItemMessageW(window, IdEdit, EmLimitText, limit, 0);
+                    if (!string.IsNullOrEmpty(start))
+                    {
+                        SetDlgItemTextW(window, IdEdit, start);
+                        SendDlgItemMessageW(window, IdEdit, EmSetSel, 0, -1); // selected: typing replaces it
+                    }
                     Present(window);
                     SetFocus(GetDlgItem(window, IdEdit));
                     return 0; // focus set here
@@ -132,8 +158,8 @@ internal static unsafe partial class AskWindow
                     switch ((int)(wParam & 0xFFFF))
                     {
                         case IdOk:
-                            var buffer = stackalloc char[SearchTerms.MaxLength + 2];
-                            var length = GetDlgItemTextW(window, IdEdit, buffer, SearchTerms.MaxLength + 1);
+                            var buffer = stackalloc char[limit + 2];
+                            var length = GetDlgItemTextW(window, IdEdit, buffer, limit + 1);
                             var text = new string(buffer, 0, Math.Max(0, length)).Trim();
                             if (text.Length == 0)
                             {

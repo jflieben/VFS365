@@ -29,9 +29,10 @@ A few things worth knowing up front:
 1. ~~**Restore a previous version.** Right-click → *Version history*: list a file's versions
    with their date, author and size, and restore or save-as one.~~
    *0.7.0, in SharePoint's version history page.*
-2. **Browse & restore the recycle bin.** A "Recently deleted" view (or tray action) to put
+2. ~~**Browse & restore the recycle bin.** A "Recently deleted" view (or tray action) to put
    back items that were deleted; today deletes go to the recycle bin with no way back from the
-   drive.
+   drive.~~
+   *0.9.0: the VFS365 menu's Recently deleted opens the site's recycle bin page, where items are restored; not a view inside the drive.*
 3. **Undo last action.** A tray or Explorer *Undo* for the most recent delete, rename or move
    made through the drive.
 4. **Restore a folder to an earlier point in time.** Roll a folder's files back to a chosen
@@ -98,6 +99,7 @@ A few things worth knowing up front:
     the drive root.
 26. **Self-service "Pin to VFS365" from Explorer.** Right-click a site, library or folder to
     pin it; today pinning needs the command line, which non-technical staff can't use.
+    *Partly built (0.9.0): the tray's "Add a library by link" pins an address; not from a right-click in Explorer.*
 27. **Quick "Go to library" launcher.** A type-to-filter jump list over every library the user
     can reach, for people with many sites.
 28. **Followed and frequent sites first.** Surface the user's followed or most-used sites near
@@ -107,6 +109,7 @@ A few things worth knowing up front:
 
 29. **Activity / upload centre window.** A window listing uploads and downloads in progress and
     waiting, with progress, cause and retry, more than a one-line notification.
+    *Partly built (0.9.0): the tray's Waiting files lists the files waiting to upload with the cause in plain words and since when; no progress, downloads or retry.*
 30. **Per-file sync status in properties.** A details entry showing last-uploaded time and
     whether the file is queued, uploading, in conflict or available offline.
 31. **"VFS365 status" column in Explorer.** A sortable column (Up to date / Uploading /
@@ -122,19 +125,25 @@ A few things worth knowing up front:
     when a long transfer finishes.
 36. **Quota and storage usage.** Show the OneDrive or site storage used versus available, so
     "quota exceeded" is never a surprise.
+    *Partly built (0.9.0): a full OneDrive or site is named as such, with what to do, when an upload is refused; the usage isn't shown beforehand.*
 
 ## F. Metadata & SharePoint columns
 
-37. **View & edit SharePoint columns.** See and edit library metadata (managed metadata,
-    choice and people columns) from a file's properties.
-38. **Choose a content type.** Pick a content type where the library requires one for a new or
-    edited document.
+37. ~~**View & edit SharePoint columns.** See and edit library metadata (managed metadata,
+    choice and people columns) from a file's properties.~~
+    *0.9.0: Details and columns in the VFS365 menu; lookups, links and rich text change in the browser.*
+38. ~~**Choose a content type.** Pick a content type where the library requires one for a new or
+    edited document.~~
+    *0.9.0, in the same window.*
 39. **View and apply sensitivity and retention labels.** Show the file's label and, where
     allowed, set a sensitivity label.
-40. **Prompt for required metadata on save.** When a library needs metadata before publishing,
-    ask for it instead of silently blocking the save or leaving a draft.
-41. **Rich file details panel.** Modified-by, created, size, path, web address and version
-    count in one place.
+    *Partly built (0.9.0): the window shows the labels. Setting a sensitivity label isn't possible for VFS365: Graph's call is metered and refuses desktop apps.*
+40. ~~**Prompt for required metadata on save.** When a library needs metadata before publishing,
+    ask for it instead of silently blocking the save or leaving a draft.~~
+    *0.9.0, after the save: a notification opens the details window. Before the save isn't possible: Windows' save has no room to ask.*
+41. ~~**Rich file details panel.** Modified-by, created, size, path, web address and version
+    count in one place.~~
+    *0.9.0, in the same window.*
 
 ## G. Locking & concurrency
 
@@ -155,6 +164,7 @@ A few things worth knowing up front:
 46. **Preview-pane support.** Make Explorer's preview pane render Office files, PDFs and images
     from the drive by streaming just enough of each.
 47. **Rich hover tooltips.** Modified-by, size and sync state in the Explorer hover tooltip.
+    *Tried for 0.9.0 (an infotip handler) and dropped: Explorer didn't show it on the drive.*
 
 ## I. Personalisation & self-service settings
 

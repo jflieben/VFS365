@@ -391,6 +391,34 @@ public class DiscoveryServiceTests
     }
 
     [Fact]
+    public async Task A_failed_search_keeps_the_exclusions_so_the_next_good_run_reads_no_site_again()
+    {
+        var api = new FakeApi();
+        api.Add("Finance", Id(1), "Documents");
+        api.Add("Finance", Id(2), "Stijlbibliotheek", new ListMetadata("Stijlbibliotheek", false, 101, false, false, null, false, false, 5, "Style Library"));
+        api.Add("Finance", Id(3), "Archive", new ListMetadata("Archive", true, 101, false, false, null, false, false, 5));
+        var first = await Run(api);
+        Assert.Single(first.State.StaticExclusions);
+        Assert.Single(first.State.Exclusions!);
+
+        api.FailSearch = true; // an outage: the search's first page fails
+        var failed = await Run(api, first.State);
+        Assert.NotNull(failed.SearchError);
+        Assert.Single(failed.State.StaticExclusions);
+        Assert.Single(failed.State.Exclusions!);
+
+        api.FailSearch = false;
+        api.WebListCalls = api.ListCalls = 0;
+        api.SiteCalls.Clear();
+        var recovered = await Run(api, failed.State);
+
+        Assert.Null(recovered.SearchError);
+        Assert.Equal(0, api.WebListCalls + api.ListCalls);
+        Assert.Empty(api.SiteCalls);
+        Assert.Single(recovered.Libraries);
+    }
+
+    [Fact]
     public async Task Failed_search_hides_nothing()
     {
         var api = new FakeApi();

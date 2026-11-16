@@ -271,6 +271,72 @@ public sealed class ReadPathStallTests : IDisposable
     }
 
     [Fact]
+    public async Task The_engine_tells_that_Microsoft_365_gives_no_answer_until_something_answers_again()
+    {
+        fake.Add("docs", folder: true);
+        var engine = Create();
+        await engine.PollAsync("b!me");
+        Assert.NotNull(await engine.GetEntryAsync("\\docs", default));
+        Assert.False(engine.CannotReach);
+
+        // A refusal is an answer
+        api.FailDelta = new RemoteException(RemoteError.Unavailable, "503 ServiceUnavailable");
+        now += TimeSpan.FromMinutes(1);
+        await engine.PollAsync("b!me");
+        Assert.False(engine.CannotReach);
+        api.FailDelta = null;
+        now += TimeSpan.FromMinutes(2);
+        await engine.PollAsync("b!me");
+        Assert.Contains(log, line => line.Contains("works again"));
+
+        // The network is there, Microsoft 365 isn't: the change feed fails without an answer, and stays that way while nothing is asked
+        api.Offline = true;
+        now += TimeSpan.FromMinutes(1);
+        await engine.PollAsync("b!me");
+        Assert.True(engine.CannotReach);
+        now += TimeSpan.FromMinutes(20);
+        Assert.True(engine.CannotReach);
+
+        api.Offline = false;
+        engine.NetworkRestored(); // within 30 s at random: 15 s here
+        now += TimeSpan.FromSeconds(16);
+        await engine.PollAsync("b!me");
+        Assert.False(engine.CannotReach);
+
+        // A lookup without an answer and no feed failing: told for two minutes
+        api.Offline = true;
+        await Assert.ThrowsAsync<HttpRequestException>(() => engine.GetEntryAsync("\\docs\\new.txt", default));
+        Assert.True(engine.CannotReach);
+        now += DriveEngine.NoAnswerShown;
+        Assert.False(engine.CannotReach);
+    }
+
+    [Fact]
+    public async Task A_drive_nobody_uses_any_more_still_finds_out_that_Microsoft_365_answers_again()
+    {
+        fake.Add("docs", folder: true);
+        var engine = Create();
+        await engine.PollAsync("b!me");
+        Assert.NotNull(await engine.GetEntryAsync("\\docs", default));
+        api.Offline = true;
+        now += TimeSpan.FromMinutes(1);
+        await engine.PollAsync("b!me");
+        Assert.True(engine.CannotReach);
+
+        // Hours after the drive's last use Microsoft 365 is back: the feed's next retry finds out
+        api.Offline = false;
+        now += TimeSpan.FromHours(3);
+        await engine.PollActiveAsync();
+        Assert.False(engine.CannotReach);
+
+        // A call the client holds after throttling ends without an answer too: that isn't "can't reach"
+        engine.HotPollingPaused = true;
+        api.Offline = true;
+        await Assert.ThrowsAsync<HttpRequestException>(() => engine.GetEntryAsync("\\docs\\new.txt", default));
+        Assert.False(engine.CannotReach);
+    }
+
+    [Fact]
     public async Task A_lookup_that_gets_no_answer_falls_back_to_the_stale_listing_after_its_deadline()
     {
         var engine = await StaleFolderAsync();

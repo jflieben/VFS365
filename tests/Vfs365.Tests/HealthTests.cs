@@ -91,7 +91,11 @@ public sealed class HealthTests : IDisposable
         status.Tick();
         Assert.Single(StatusFile.Read(StatusPath)!.WaitingFiles);
 
-        status.Live = s => s with { WaitingUploads = 0 }; // gone without an Uploaded notice (renamed, deleted)
+        status.Live = s => s with { WaitingUploads = 0, RefusedUploads = 1 }; // refused for good: not tried again, still to be seen
+        status.Tick();
+        Assert.Single(StatusFile.Read(StatusPath)!.WaitingFiles);
+
+        status.Live = s => s with { WaitingUploads = 0, RefusedUploads = 0 }; // gone without an Uploaded notice (renamed, deleted)
         status.Tick();
         Assert.Empty(StatusFile.Read(StatusPath)!.WaitingFiles);
     }

@@ -358,6 +358,19 @@ public sealed class DiscoveryService(ISharePointDiscoveryApi api, DiscoveryOptio
             .ThenBy(library => library.LibraryTitle, StringComparer.OrdinalIgnoreCase)
             .ToList();
         visible = await MarkDefaultLibrariesAsync(visible, previous, errors, ct);
+        if (searchError is not null)
+        {
+            // What earlier runs excluded stays known for the libraries this search didn't bring: without it the first complete run
+            // after an outage takes them all for new and reads every site again, for every user at about the same time
+            foreach (var (key, reason) in knownStatic)
+            {
+                staticExclusions.TryAdd(key, reason);
+            }
+            foreach (var (key, exclusion) in knownExclusions)
+            {
+                exclusions.TryAdd(key, exclusion);
+            }
+        }
         // A failed search keeps the time of the last run whose search completed, so a restart doesn't take this run as a recent one
         var runAt = searchError is null ? now : previous?.RunAt ?? DateTimeOffset.MinValue;
         var state = new DiscoveryState(runAt, tenantRoot, visible, new Dictionary<string, string>(staticExclusions), LibraryRules.Version, oneDrive,

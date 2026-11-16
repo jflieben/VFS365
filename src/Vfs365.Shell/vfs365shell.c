@@ -104,6 +104,9 @@ static const VERB Verbs[] = {
     { L"link", L"Verb.link", L"Copy link", TRUE, FILTER_NONE, 0 },
     { L"versions", L"Verb.versions", L"Version history", FALSE, FILTER_NONE, 0 },
     { L"share", L"Verb.share", L"Share in browser", TRUE, FILTER_NONE, 0 },
+    { L"details", L"Verb.details", L"Details and columns", TRUE, FILTER_NONE, 0 },
+    { L"library", L"Verb.library", L"Open library in browser", TRUE, FILTER_NONE, 0 },
+    { L"deleted", L"Verb.deleted", L"Recently deleted", TRUE, FILTER_NONE, 0 },
     { L"keep", L"Verb.keep", L"Keep this version", FALSE, FILTER_CONFLICT, ECF_SEPARATORBEFORE },
     { L"compare", L"Verb.compare", L"Compare with the original", FALSE, FILTER_CONFLICT, 0 },
     { L"search", L"Verb.search", L"Search in Microsoft 365", TRUE, FILTER_FOLDERS, ECF_SEPARATORBEFORE },
@@ -1016,7 +1019,7 @@ static const OVERLAY_VTBL OverlayVtbl = {
 static COMMAND Commands[1 + VERB_COUNT] = {
     { &CommandVtbl, 0 }, { &CommandVtbl, 1 }, { &CommandVtbl, 2 }, { &CommandVtbl, 3 },
     { &CommandVtbl, 4 }, { &CommandVtbl, 5 }, { &CommandVtbl, 6 }, { &CommandVtbl, 7 },
-    { &CommandVtbl, 8 },
+    { &CommandVtbl, 8 }, { &CommandVtbl, 9 }, { &CommandVtbl, 10 }, { &CommandVtbl, 11 },
 };
 
 static OVERLAY Overlays[OVERLAY_CLASSES] = {

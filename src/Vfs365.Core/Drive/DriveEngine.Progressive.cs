@@ -91,6 +91,10 @@ public sealed partial class DriveEngine
         var started = Stopwatch.GetTimestamp();
         var item = await api.UploadFragmentAsync(progress.Session!, staging, start, size, progress.Size, ct);
         progress.Fragment = UploadSession.NextFragmentSize(size, Stopwatch.GetElapsedTime(started), ++progress.Fragments);
+        if (item is not null && progress.Session!.DriveId is { } driveId)
+        {
+            await api.UploadedAsync(driveId, item, ct);
+        }
         return item;
     }
 

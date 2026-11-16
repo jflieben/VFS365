@@ -198,6 +198,48 @@ public sealed class RenameSaveConflictTests(ITestOutputHelper output) : IDisposa
     }
 
     [Fact]
+    public async Task An_Excel_save_that_deletes_first_and_then_fails_on_the_network_keeps_the_original()
+    {
+        var original = api.Add("book.xlsx", content: "v1");
+        var engine = await ListedAsync();
+        var excel = await OpenAsync(engine, "book.xlsx", Excel, "v1");
+
+        await WriteNewAsync(engine, "8A3F1C2D", "v1 + mine");
+        await engine.DeleteAsync(Root + "book.xlsx", default, Excel);
+        excel?.Dispose();
+        api.FailUpload = _ => new RemoteException(RemoteError.Unavailable, "503");
+        await Assert.ThrowsAsync<RemoteException>(() => engine.RenameAsync(Root + "8A3F1C2D", Root + "book.xlsx", false, default, Excel));
+        api.FailUpload = null; // online again; the user gave up on the save
+        await DueAsync(engine, TimeSpan.FromMinutes(1));
+
+        Assert.Equal(0, api.Deletes);
+        Assert.Equal("v1", api.ContentOf("book.xlsx"));
+        Assert.Equal(original.Id, api.ItemAt("book.xlsx")!.Id);
+        Assert.NotNull(await engine.GetEntryAsync(Root + "book.xlsx", default));
+    }
+
+    [Fact]
+    public async Task An_Excel_save_that_fails_once_and_is_tried_again_goes_into_the_original()
+    {
+        var original = api.Add("book.xlsx", content: "v1");
+        var engine = await ListedAsync();
+        var excel = await OpenAsync(engine, "book.xlsx", Excel, "v1");
+
+        await WriteNewAsync(engine, "8A3F1C2D", "v1 + mine");
+        await engine.DeleteAsync(Root + "book.xlsx", default, Excel);
+        excel?.Dispose();
+        api.FailUpload = _ => new RemoteException(RemoteError.Unavailable, "503");
+        await Assert.ThrowsAsync<RemoteException>(() => engine.RenameAsync(Root + "8A3F1C2D", Root + "book.xlsx", false, default, Excel));
+        api.FailUpload = null;
+        await engine.RenameAsync(Root + "8A3F1C2D", Root + "book.xlsx", false, default, Excel); // Save again
+        await DueAsync(engine, TimeSpan.FromMinutes(1));
+
+        Assert.Equal(0, api.Deletes);
+        Assert.Equal("v1 + mine", api.ContentOf("book.xlsx"));
+        Assert.Equal(original.Id, api.ItemAt("book.xlsx")!.Id);
+    }
+
+    [Fact]
     public async Task A_Word_save_of_the_version_it_opened_goes_into_the_item_also_twice_with_the_document_open()
     {
         var original = api.Add("report.docx", content: "v1");

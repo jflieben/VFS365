@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.9.0
+
+- Details and columns: right-click a file or folder on the drive, VFS365, Details and columns. A window shows who made and last changed it, its size, versions, check-out and labels, and its SharePoint columns, which you can change there: text, numbers, dates, yes/no, choices, people and managed metadata, and the content type. Other columns (lookups, links, rich text) show their value and change in the browser. A notification about required columns opens this window too, and VFS365 keeps after it: closing the window with a required column empty asks first, the tray menu shows Details needed while files wait, and reminders come after 1, 3, 7 and 15 hours, until the details are filled in (here or in the browser).
+- The tray menu shows Waiting files (N) while files wait to upload
+- The tray menu has "Add a library by link", it shows on the drive after Restart
+- The VFS365 menu in Explorer has Open library in browser and Recently deleted (the site's recycle bin page, where deleted items are restored).
+- The tray says "can't reach Microsoft 365; showing what was last known" when the PC has a network but Microsoft 365 doesn't answer (a captive portal, a VPN that is down, a firewall); it said "up to date" before.
+- An agent that hangs is ended and started again: the supervisor does so when a mounted agent gave no sign of life for 10 minutes (sleep doesn't count).
+- Fixed: an Excel save that failed on the network (offline, a timeout) could delete the workbook from the library a little later, leaving it in neither version until the next save worked. The original now stays.
+- Fixed: folders redirected into the drive stayed redirected after a crash when the next start couldn't mount; they now go back to their own location while VFS365 waits.
+- Faster: the folder you work in is no longer read again at every use during the first minutes after a library is first opened, and an idle agent with many cached folders uses less processor time.
+- Less memory during large copies, searches and backups
+- The cache keeps at most 50,000 files, next to `CacheSizeMB`; the least recently used go first. A cache of very many small files took hundreds of MB of memory and seconds at every start.
+- Throttling: an agent that is throttled again soon after its background work resumed now waits twice as long each time (15 minutes, 30, 60, up to 2 hours), and starts over after half an hour without throttling. After an outage of search, the next run no longer reads every site again.
+- Admins: file and folder names no longer go into the Application event log (conflicts, waiting uploads, unsaved files at stop): paths show as `[path 1a2b3c4d]`, as other users of a multi-session host can read that log. `agent.log` in the user's profile has the names.
+- Fixed: after a crash, changes that were still being written could end up in the file itself instead of in a "(recovered)" copy, when their first upload failed and VFS365 started once more.
+- Fixed: when the disk holding unsaved changes was full, a write could leave the whole drive unable to save until VFS365 was restarted.
+- Fixed: saving over a file (up to 10 MiB) in a library with a required column that is empty left the file checked out to you
+- A file saved with an empty required column, also a new one, gets a notification that the library asks for more details; a click opens the details window. To know this, VFS365 reads what a library requires at the first write to it each day.
+- Admins: VFS365 asks for other permissions: Graph `Sites.ReadWrite.All` (it replaces `Sites.Read.All`) and `TermStore.Read.All`, and SharePoint `AllSites.Write` (it replaces `AllSites.Read`), all delegated; consent again with the link in APP-REGISTRATION.md. Without them the drive works as before, and the details window can't list managed metadata terms.
+
 ## 0.8.2
 
 - Policy `DefaultLibrarySites`: sites (by template e.g. `GROUP` for every Teams site or by using a URL pattern) where VFS365 should mount the default library directly instead of the root. So a Teams channel is one click away: `Sites\Finance\General` instead of `Sites\Finance\Documents\General`. Caveat: if a site has more libraries, they won't show. Off by default; turning it on moves these sites' paths. `vfs365 why` explains a library it hides.

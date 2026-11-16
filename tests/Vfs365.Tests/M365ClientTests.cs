@@ -412,6 +412,68 @@ public sealed class M365ClientTests
     }
 
     [Fact]
+    public async Task Throttled_again_soon_after_a_hold_the_next_hold_doubles_up_to_two_hours_and_a_quiet_half_hour_starts_over()
+    {
+        var time = new Time { Blocking = TimeSpan.FromDays(1) };
+        var throttle = false;
+        var server = new Server(_ =>
+        {
+            var throttled = throttle;
+            throttle = false;
+            return throttled ? Status(429, TimeSpan.FromSeconds(10)) : Ok();
+        });
+        var client = Client(server, time);
+        client.ThrottlePause = TimeSpan.FromMinutes(15);
+
+        async Task<TimeSpan> HoldAfterThrottleAsync()
+        {
+            var before = time.Now;
+            throttle = true;
+            using (await client.GetJsonAsync(Item, default))
+            {
+            }
+            return client.BackgroundPausedUntil - before;
+        }
+
+        Assert.Equal(TimeSpan.FromMinutes(15), await HoldAfterThrottleAsync());
+        Assert.Equal(TimeSpan.FromMinutes(15), await HoldAfterThrottleAsync()); // throttled during the hold: it starts again, no longer than before
+        foreach (var minutes in new[] { 30, 60, 120, 120 })
+        {
+            time.Elapsed += client.BackgroundPausedUntil - time.Now + TimeSpan.FromMinutes(1); // the hold ran out a minute ago
+            Assert.Equal(TimeSpan.FromMinutes(minutes), await HoldAfterThrottleAsync());
+        }
+
+        time.Elapsed += client.BackgroundPausedUntil - time.Now + M365Client.ThrottleForget;
+        Assert.Equal(TimeSpan.FromMinutes(15), await HoldAfterThrottleAsync());
+    }
+
+    [Fact]
+    public async Task An_unwell_service_never_makes_the_hold_longer()
+    {
+        var time = new Time { Blocking = TimeSpan.FromDays(1) };
+        var unwell = false;
+        var server = new Server(_ =>
+        {
+            var fails = unwell;
+            unwell = false;
+            return fails ? Status(503) : Ok(); // no Retry-After: not throttling
+        });
+        var client = Client(server, time);
+        client.ThrottlePause = TimeSpan.FromMinutes(15);
+
+        for (var i = 0; i < 5; i++)
+        {
+            var before = time.Now;
+            unwell = true;
+            using (await client.GetJsonAsync(Item, default))
+            {
+            }
+            Assert.Equal(TimeSpan.FromMinutes(1), client.BackgroundPausedUntil - before);
+            time.Elapsed += client.BackgroundPausedUntil - time.Now + TimeSpan.FromMinutes(1); // the hold ran out a minute ago
+        }
+    }
+
+    [Fact]
     public async Task Promoted_work_stops_waiting_for_the_background_pause()
     {
         var time = new Time();

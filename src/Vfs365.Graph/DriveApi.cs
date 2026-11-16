@@ -203,19 +203,36 @@ public sealed partial class DriveApi(M365Client client) : IDriveApi
     /// </summary>
     public async Task<DriveItemInfo> UploadAsync(string driveId, UploadTarget target, string sourceFile, CancellationToken ct)
     {
-        var length = new FileInfo(sourceFile).Length;
-        if (length <= UploadSession.SimpleUploadLimit)
+        var library = await RequiredColumnsOfAsync(driveId, ct);
+        var saved = await UploadAsync(driveId, target, sourceFile, library is { Any: true }, ct);
+        if (library is { Any: true })
         {
-            var query = target.ItemId is null ? "?@microsoft.graph.conflictBehavior=fail" : "";
-            ExceptionDispatchInfo lost;
+            await TellEmptyColumnsAsync(driveId, saved, library, ct);
+        }
+        return saved;
+    }
+
+    /// <param name="requires">The library requires columns: a save into a file goes by upload session (<see cref="NeedsDetails"/>'s remarks).</param>
+    async Task<DriveItemInfo> UploadAsync(string driveId, UploadTarget target, string sourceFile, bool requires, CancellationToken ct)
+    {
+        var length = new FileInfo(sourceFile).Length;
+        if (length <= UploadSession.SimpleUploadLimit && !(requires && target.ItemId is not null && length > 0))
+        {
+            var query = target.ItemId is null ? "?@microsoft.graph.conflictBehavior=fail" : $"?$select={SaveSelect}";
+            ExceptionDispatchInfo? lost = null;
+            (DriveItemInfo? Item, bool CheckedOut) saved = default;
             try
             {
                 using var doc = await client.SendJsonAsync(HttpMethod.Put, new Uri($"{TargetUrl(driveId, target)}/content{query}"), () => FileRange(sourceFile, 0, length), ct, target.IfMatch);
-                return Parse(doc!.RootElement)!;
+                saved = (Parse(doc!.RootElement)!, target.ItemId is not null && IsCheckedOut(doc.RootElement));
             }
             catch (Exception e) when (!ct.IsCancellationRequested && MayHaveLanded(e))
             {
                 lost = ExceptionDispatchInfo.Capture(e);
+            }
+            if (lost is null)
+            {
+                return saved.CheckedOut ? await AfterCheckedOutSaveAsync(driveId, saved.Item!, ct) : saved.Item!;
             }
             return await LandedAsync(driveId, target, sourceFile, length, ct) is (true, { } landed) ? landed : throw Rethrow(lost);
         }

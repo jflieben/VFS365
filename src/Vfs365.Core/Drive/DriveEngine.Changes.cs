@@ -29,6 +29,9 @@ public sealed partial class DriveEngine
         public DateTimeOffset LastRead { get; set; } = DateTimeOffset.MinValue;
         public DateTimeOffset LastUsed { get; set; }
         public bool Broken { get; set; }
+
+        /// <summary>Broken without an answer from Microsoft 365 (no network, a timeout), not by a refusal.</summary>
+        public bool NoAnswer { get; set; }
         public bool Pushed { get; set; }
 
         /// <summary>When the push channel last came up; CatchUpAt is when the read for what happened while it was down is due.</summary>
@@ -395,6 +398,10 @@ public sealed partial class DriveEngine
             {
                 return true;
             }
+            if (feed.Broken && feed.NoAnswer && Now >= feed.RetryAt)
+            {
+                return true; // also when unused: CannotReach ends when Microsoft 365 answers, not when the drive is next used
+            }
             if (Now - feed.LastUsed >= options.ActiveWindow)
             {
                 return false;
@@ -556,6 +563,30 @@ public sealed partial class DriveEngine
         feed.BaselineAt = Now;
         (feed.LinkGeneration, feed.LinkCountedAt) = (feed.LinkGeneration + 1, Now);
         Recovered(driveId, feed, feed.BaselineAt);
+        RefreshFromBeforeBaseline(driveId, feed);
+    }
+
+    /// <summary>Listings read again at a baseline; the others are read when next used.</summary>
+    const int BaselineRefreshes = 8;
+
+    /// <summary>
+    /// The folder whose opening started the feed was asked for one round trip before the baseline, so the feed covers neither it nor
+    /// anything below it while it stays cached: the folder a user works in would be read again at every use. The drive's listings
+    /// from before the baseline are read again now, the most recently used first; one still loading is read again when it has loaded
+    /// (<see cref="LoadAsync"/>).
+    /// </summary>
+    void RefreshFromBeforeBaseline(string driveId, Feed feed)
+    {
+        var prefix = Key(driveId, "");
+        foreach (var (key, listing) in listings
+            .Where(l => l.Key.StartsWith(prefix, StringComparison.Ordinal) && l.Value.IsLoaded && l.Value.RequestedAt < feed.BaselineAt)
+            .OrderByDescending(l => l.Value.LastUsed).Take(BaselineRefreshes))
+        {
+            if (listing.TryStartRefresh())
+            {
+                _ = RefreshAsync(driveId, key[prefix.Length..], key, listing);
+            }
+        }
     }
 
     static readonly TimeSpan FirstFeedRetry = TimeSpan.FromMinutes(1), LastFeedRetry = TimeSpan.FromMinutes(30);
@@ -584,6 +615,7 @@ public sealed partial class DriveEngine
         TimeSpan wait;
         lock (feed)
         {
+            feed.NoAnswer = Unanswered(e);
             feed.Broken = true;
             feed.Failures++;
             wait = TimeSpan.FromTicks(Math.Min(LastFeedRetry.Ticks, FirstFeedRetry.Ticks << Math.Min(feed.Failures - 1, 10))) * (0.75 + 0.5 * options.Random());
@@ -1489,28 +1521,39 @@ public sealed partial class DriveEngine
         Report(driveId, path, ChangeKind.Modified, false);
     }
 
-    DateTimeOffset nextMaintenance;
+    DateTimeOffset nextMaintenance, nextEviction;
     static readonly TimeSpan MaintenanceInterval = TimeSpan.FromSeconds(30);
 
-    /// <summary>A listing used this recently is never evicted.</summary>
-    static readonly TimeSpan ListingKeep = TimeSpan.FromMinutes(2);
+    /// <summary>From half of MaxCachedItems the listings are counted this often: a tree walk loads thousands of items a second.</summary>
+    static readonly TimeSpan EvictionInterval = TimeSpan.FromSeconds(5);
 
     /// <summary>
-    /// What a listing costs in memory beyond its items, counted as this many items for MaxCachedItems (measured: about 1 KB per listing
-    /// against about 300 bytes per item).
+    /// A listing used this recently is never evicted. Beyond MaxCachedItems the time shrinks with the overshoot, down to
+    /// ListingKeepLeast from 1.5 times the cap: a walk can bring several times the cap into use within two minutes.
+    /// </summary>
+    static readonly TimeSpan ListingKeep = TimeSpan.FromMinutes(2);
+    static readonly TimeSpan ListingKeepLeast = TimeSpan.FromSeconds(20);
+
+    /// <summary>
+    /// What a listing costs in memory beyond its items (about 1 KB), counted as this many items for MaxCachedItems. An item is about
+    /// 0.7 KB (its strings, the listing's two dictionaries, the holder index), so the default of 250,000 is 170 to 250 MB.
     /// </summary>
     const int ListingOverhead = 3;
 
     /// <summary>
     /// Every 30 s (from <see cref="PollActiveAsync"/>): lookups past their TTL go, so do changes kept for replays past their time,
     /// entries kept for scans of folders not used lately, folders known by ID with nothing cached below them any more, and listings
-    /// beyond MaxCachedItems, least recently used first (a folder counts as used when one below it is: the listings below rely on it
-    /// to be kept current). Then what left the cache leaves the holder indexes, also of drives whose feed isn't read.
+    /// beyond MaxCachedItems (<see cref="Evict"/>; near the cap that part runs every 5 s). Then what left the cache leaves the holder
+    /// indexes, also of drives whose feed isn't read.
     /// </summary>
     void Maintain()
     {
         if (Now < nextMaintenance)
         {
+            if (Now >= nextEviction)
+            {
+                TrimListings(dropEntries: false);
+            }
             return;
         }
         nextMaintenance = Now + MaintenanceInterval;
@@ -1559,18 +1602,11 @@ public sealed partial class DriveEngine
             }
         }
 
-        var size = 0L;
-        foreach (var listing in listings.Values)
+        TrimListings(dropEntries: true);
+        var gone = Interlocked.Exchange(ref evicted, 0);
+        if (gone > 0)
         {
-            size += listing.Items.Count + ListingOverhead;
-            if (listing.HasEntries && Now - listing.LastUsed > ListingKeep)
-            {
-                listing.DropEntries();
-            }
-        }
-        if (size > options.MaxCachedItems)
-        {
-            Evict(size);
+            Log($"{gone} folder listing(s) left memory (least recently used); they are read again when opened");
         }
         foreach (var (driveId, feed) in feeds)
         {
@@ -1582,30 +1618,101 @@ public sealed partial class DriveEngine
         }
     }
 
-    /// <summary>Evicts the least recently used listings until they hold 90% of MaxCachedItems.</summary>
-    void Evict(long size)
+    /// <summary>Listings evicted since the log last said so (at most every 30 s, however often a walk makes them go).</summary>
+    int evicted;
+
+    /// <summary>Counts the cached listings and evicts beyond MaxCachedItems; from half of it they are counted again after EvictionInterval.</summary>
+    void TrimListings(bool dropEntries)
+    {
+        var size = 0L;
+        foreach (var (_, listing) in listings)
+        {
+            size += listing.Items.Count + ListingOverhead;
+            if (dropEntries && listing.HasEntries && Now - listing.LastUsed > ListingKeep)
+            {
+                listing.DropEntries();
+            }
+        }
+        if (size > options.MaxCachedItems)
+        {
+            size = Evict(size);
+        }
+        nextEviction = size > options.MaxCachedItems / 2 ? Now + EvictionInterval : DateTimeOffset.MaxValue;
+    }
+
+    /// <summary>
+    /// Evicts listings until they hold 90% of MaxCachedItems, the longest unused first; returns what they hold then. A folder counts
+    /// as used when one below it is (the listings below rely on it to be kept current), so leaves go before the folders above them.
+    /// Never evicted: a listing that is loading (a scan may be reading it page by page), one used within the keep time, and one of a
+    /// folder with local state in it (files waiting to upload, deletes and renames not sent yet). The keep time is ListingKeep at
+    /// the cap and shrinks with the overshoot. Listings inside a tree walk that is going on get ListingKeepLeast at once and count as
+    /// unused that much longer, so they go before the folders someone works in: the walk passed them and rarely comes back.
+    /// </summary>
+    long Evict(long size)
     {
         var target = options.MaxCachedItems / 10 * 9;
-        var evicted = 0;
+        var overshoot = Math.Min(1, (size - options.MaxCachedItems) / Math.Max(1, options.MaxCachedItems / 2.0));
+        var keep = ListingKeep - (ListingKeep - ListingKeepLeast) * overshoot;
+        var walks = new List<(string Drive, string Root)>();
+        foreach (var (driveId, feed) in feeds)
+        {
+            lock (feed)
+            {
+                if (Now < feed.WalkingUntil)
+                {
+                    walks.Add((Key(driveId, ""), feed.WalkRoot));
+                }
+            }
+        }
+        var local = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (!overlay.IsEmpty)
+        {
+            foreach (var state in overlay.Values)
+            {
+                local.Add(Key(state.DriveId, ParentOf(state.DrivePath)));
+            }
+        }
         var loaded = listings.Where(l => l.Value.IsLoaded).ToList();
         var used = LastUseBelow(loaded);
-        foreach (var old in loaded.Where(l => Now - used[l.Key] > ListingKeep).OrderBy(l => used[l.Key]).ThenByDescending(l => l.Key.Count(c => c == '/')).ToList())
+        var old = new List<(KeyValuePair<string, Listing> Listing, TimeSpan Unused)>();
+        foreach (var listing in loaded)
+        {
+            var unused = Now - used[listing.Key] + (Walked(listing.Key) ? keep - ListingKeepLeast : TimeSpan.Zero);
+            if (unused > keep && !local.Contains(listing.Key))
+            {
+                old.Add((listing, unused));
+            }
+        }
+        foreach (var (listing, _) in old.OrderByDescending(o => o.Unused).ThenByDescending(o => o.Listing.Key.Count(c => c == '/')))
         {
             if (size <= target)
             {
                 break;
             }
-            if (listings.TryRemove(old))
+            if (listings.TryRemove(listing))
             {
-                size -= old.Value.Items.Count + ListingOverhead;
-                evicted++;
+                size -= listing.Value.Items.Count + ListingOverhead;
+                Interlocked.Increment(ref evicted);
             }
         }
-        if (evicted > 0)
+        return size;
+
+        bool Walked(string key)
         {
-            Log($"{evicted} folder listing(s) left memory (least recently used); they are read again when opened");
+            foreach (var (drive, root) in walks)
+            {
+                if (key.StartsWith(drive, StringComparison.Ordinal) && IsAtOrBelow(key.AsSpan(drive.Length), root))
+                {
+                    return true;
+                }
+            }
+            return false;
         }
     }
+
+    /// <summary>The path is the folder's or one below it ("" is the drive's root).</summary>
+    static bool IsAtOrBelow(ReadOnlySpan<char> path, string folder) =>
+        folder.Length == 0 || (path.StartsWith(folder, StringComparison.OrdinalIgnoreCase) && (path.Length == folder.Length || path[folder.Length] == '/'));
 
     /// <summary>When each listing, or a cached one below it, was last used.</summary>
     static Dictionary<string, DateTimeOffset> LastUseBelow(IReadOnlyCollection<KeyValuePair<string, Listing>> cached)

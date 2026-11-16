@@ -16,6 +16,7 @@ if (!args.Contains(AgentSupervisor.ChildFlag, StringComparer.OrdinalIgnoreCase))
     SystemEvents.SessionEnded += (_, _) => ending = true; // the child is ended at logoff too: no restart then
     return AgentSupervisor.Run(args, () => ending);
 }
+DetailsWindows.PrepareProcess(); // before the tray's window
 SystemEvents.SessionEnded += (_, _) => AgentCommands.StopForSessionEnd();
 SystemEvents.PowerModeChanged += (_, e) =>
 {

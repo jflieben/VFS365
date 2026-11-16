@@ -26,17 +26,28 @@ public sealed class ContentCacheTests : IDisposable
     /// <summary>Content files, in the drive folders (the key marker and the name index are at the top).</summary>
     IEnumerable<string> CacheFiles() => Directory.EnumerateDirectories(Cache).SelectMany(d => Directory.EnumerateFiles(d));
 
-    /// <summary>Lines in the name index, -1 while it is missing or being written.</summary>
+    /// <summary>
+    /// Lines in the name index, -1 while it is missing. Read without keeping writers out: the cache appends in the background and
+    /// leaves a line for a later trim when it can't open the file.
+    /// </summary>
     static int LinesIn(string path)
     {
         try
         {
-            return File.ReadAllLines(path).Length;
+            return Encoding.UTF8.GetString(ReadShared(path)).Count(c => c == '\n');
         }
         catch (IOException)
         {
             return -1;
         }
+    }
+
+    static byte[] ReadShared(string path)
+    {
+        using var file = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+        var bytes = new byte[file.Length];
+        file.ReadExactly(bytes);
+        return bytes;
     }
 
     /// <summary>The cache trims in the background.</summary>
@@ -596,6 +607,194 @@ public sealed class ContentCacheTests : IDisposable
 
         Assert.True(File.GetLastAccessTimeUtc(file) > DateTime.UtcNow.AddMinutes(-5));
         Assert.Equal(1, api.Downloads);
+    }
+
+    [Fact]
+    public async Task Least_recently_used_files_go_beyond_the_file_limit()
+    {
+        var api = new FakeDriveApi();
+        var cache = new ContentCache(Cache, api, new ContentCacheOptions { Cipher = KeyA, MaxFiles = 10 });
+        var items = new List<DriveItemInfo>();
+        for (var i = 0; i < 25; i++)
+        {
+            items.Add(api.Add($"f{i}.bin", new byte[100]));
+            await cache.FetchAsync("d", items[i].Id, items[i].CTag, 100, default);
+            await Task.Delay(5);
+        }
+
+        await Eventually(() => cache.Usage.Files <= 10);
+        await Task.Delay(100); // a trim still running
+        Assert.InRange(cache.Usage.Files, 9, 10); // down to 90% of the limit
+        var kept = Enumerable.Range(0, 25).Where(i => cache.LengthOf("d", items[i].Id, items[i].CTag) is not null).ToList();
+        Assert.Equal(Enumerable.Range(25 - kept.Count, kept.Count), kept); // the newest
+        Assert.Equal(kept.Count, CacheFiles().Count());
+        Assert.True(cache.Usage.Bytes < 10 * 200); // far below the size limit: the count alone trimmed
+        Assert.Equal(25, api.Downloads);
+    }
+
+    [Fact]
+    public async Task A_file_that_keeps_being_used_stays_when_the_file_limit_trims()
+    {
+        var api = new FakeDriveApi();
+        var cache = new ContentCache(Cache, api, new ContentCacheOptions { MaxFiles = 5 });
+        var first = api.Add("first.bin", RandomNumberGenerator.GetBytes(100));
+        await cache.FetchAsync("d", first.Id, first.CTag, 100, default);
+        for (var i = 0; i < 15; i++)
+        {
+            var item = api.Add($"f{i}.bin", new byte[100]);
+            await cache.FetchAsync("d", item.Id, item.CTag, 100, default);
+            await Task.Delay(5);
+            using var again = cache.Open("d", first.Id, first.CTag, 100); // the oldest file, but used again and again
+            await Task.Delay(5);
+        }
+
+        await Eventually(() => cache.Usage.Files <= 5);
+        Assert.Equal(100, cache.LengthOf("d", first.Id, first.CTag));
+        using var source = cache.Open("d", first.Id, first.CTag, 100);
+        Assert.Equal(api.BytesOf("first.bin"), await ReadAll(source));
+        Assert.Equal(16, api.Downloads); // never downloaded again
+    }
+
+    [Fact]
+    public async Task A_reader_keeps_its_content_when_the_file_limit_evicts_the_file()
+    {
+        var api = new FakeDriveApi();
+        var cache = new ContentCache(Cache, api, new ContentCacheOptions { Cipher = KeyA, MaxFiles = 5 });
+        var first = api.Add("first.bin", RandomNumberGenerator.GetBytes(100_000));
+        await cache.FetchAsync("d", first.Id, first.CTag, first.Size, default);
+        using var held = cache.Open("d", first.Id, first.CTag, first.Size);
+        for (var i = 0; i < 15; i++)
+        {
+            var item = api.Add($"f{i}.bin", new byte[100]);
+            await cache.FetchAsync("d", item.Id, item.CTag, 100, default);
+            await Task.Delay(5);
+        }
+
+        await Eventually(() => cache.LengthOf("d", first.Id, first.CTag) is null); // evicted as the least recently used, like the size limit does
+        Assert.Equal(api.BytesOf("first.bin"), await ReadAll(held));
+    }
+
+    [Theory]
+    [InlineData(3500, 4)] // the size limit is the stricter one
+    [InlineData(100_000, 3)] // the file limit is
+    public async Task The_size_limit_and_the_file_limit_both_hold(long maxBytes, int maxFiles)
+    {
+        var api = new FakeDriveApi();
+        var cache = new ContentCache(Cache, api, new ContentCacheOptions { MaxBytes = maxBytes, MaxFiles = maxFiles });
+        for (var i = 0; i < 8; i++)
+        {
+            var item = api.Add($"f{i}.bin", new byte[1000]);
+            await cache.FetchAsync("d", item.Id, item.CTag, item.Size, default);
+            await Task.Delay(20);
+        }
+
+        await Eventually(() => cache.Usage.Bytes <= maxBytes && cache.Usage.Files <= maxFiles);
+        Assert.True(cache.Usage.Files >= 2);
+        Assert.Equal(1000, cache.LengthOf("d", api.ItemAt("f7.bin")!.Id, api.ItemAt("f7.bin")!.CTag));
+        Assert.Null(cache.LengthOf("d", api.ItemAt("f0.bin")!.Id, api.ItemAt("f0.bin")!.CTag));
+        Assert.Equal(cache.Usage.Files, CacheFiles().Count());
+    }
+
+    [Fact]
+    public async Task Every_cached_version_of_an_item_goes_with_it()
+    {
+        // Two versions of one item on disk (the older one wasn't removed before the last stop), next to another item
+        var api = new FakeDriveApi();
+        var options = new ContentCacheOptions { Cipher = KeyA };
+        var cache = new ContentCache(Cache, api, options);
+        var one = api.Add("a.txt", content: "one");
+        await cache.FetchAsync("d", one.Id, one.CTag, one.Size, default);
+        var older = CacheFiles().Single();
+        var aside = Path.Combine(directory, "aside");
+        File.Copy(older, aside);
+        api.RemoteEdit("a.txt", "two!");
+        var two = api.ItemAt("a.txt")!;
+        await cache.FetchAsync("d", two.Id, two.CTag, two.Size, default);
+        await Eventually(() => !File.Exists(older)); // the newer version replaced it
+        var other = api.Add("b.txt", content: "other");
+        await cache.FetchAsync("d", other.Id, other.CTag, other.Size, default);
+        File.Copy(aside, older);
+
+        var reopened = new ContentCache(Cache, api, options);
+        Assert.Equal(3, reopened.Usage.Files); // listed by the name index, or found by their hashed names
+        Assert.Equal(3, reopened.LengthOf("d", one.Id, one.CTag));
+        Assert.Equal(4, reopened.LengthOf("d", two.Id, two.CTag));
+        reopened.ForgetItem("d", one.Id);
+
+        Assert.Equal(1, reopened.Usage.Files);
+        Assert.Null(reopened.LengthOf("d", one.Id, one.CTag));
+        Assert.Null(reopened.LengthOf("d", two.Id, two.CTag));
+        Assert.Equal(5, reopened.LengthOf("d", other.Id, other.CTag));
+        Assert.Single(CacheFiles());
+    }
+
+    [Fact]
+    public async Task A_newer_version_replaces_every_older_one_found_at_start()
+    {
+        var api = new FakeDriveApi();
+        var cache = new ContentCache(Cache, api);
+        var one = api.Add("a.txt", content: "one");
+        await cache.FetchAsync("d", one.Id, one.CTag, one.Size, default);
+        var older = CacheFiles().Single();
+        var aside = Path.Combine(directory, "aside");
+        File.Copy(older, aside);
+        api.RemoteEdit("a.txt", "two!");
+        var two = api.ItemAt("a.txt")!;
+        await cache.FetchAsync("d", two.Id, two.CTag, two.Size, default);
+        await Eventually(() => !File.Exists(older));
+        File.Copy(aside, older);
+        var reopened = new ContentCache(Cache, api);
+        Assert.Equal(2, reopened.Usage.Files);
+
+        api.RemoteEdit("a.txt", "three");
+        var three = api.ItemAt("a.txt")!;
+        await reopened.FetchAsync("d", three.Id, three.CTag, three.Size, default);
+
+        await Eventually(() => reopened.Usage.Files == 1);
+        Assert.Equal(5, reopened.LengthOf("d", three.Id, three.CTag));
+        Assert.Single(CacheFiles());
+    }
+
+    [Fact]
+    public async Task A_name_index_that_lists_exactly_the_files_is_left_alone_at_start()
+    {
+        var api = new FakeDriveApi();
+        var options = new ContentCacheOptions { Cipher = KeyA };
+        var cache = new ContentCache(Cache, api, options);
+        var items = new List<DriveItemInfo>();
+        for (var i = 0; i < 3; i++)
+        {
+            items.Add(api.Add($"f{i}.txt", content: $"content {i}"));
+            await cache.FetchAsync("d", items[i].Id, items[i].CTag, items[i].Size, default);
+        }
+        var names = Path.Combine(Cache, "names");
+        await Eventually(() => LinesIn(names) == 3);
+        var index = ReadShared(names);
+
+        var reopened = new ContentCache(Cache, api, options);
+        Assert.Equal(index, ReadShared(names)); // sealed lines differ each time they are written
+        Assert.All(items, i => Assert.Equal(i.Size, reopened.LengthOf("d", i.Id, i.CTag)));
+
+        reopened.ForgetItem("d", items[0].Id);
+        var again = new ContentCache(Cache, api, options); // a line names no file any more: written anew without it
+        Assert.Equal(2, LinesIn(names));
+        Assert.Equal(2, again.Usage.Files);
+        Assert.Equal(3, api.Downloads);
+    }
+
+    [Fact]
+    public async Task Unfinished_downloads_of_an_earlier_run_go_at_start()
+    {
+        var api = new FakeDriveApi();
+        var item = api.Add("a.txt", content: "abc");
+        await new ContentCache(Cache, api).FetchAsync("d", item.Id, item.CTag, item.Size, default);
+        var leftover = CacheFiles().Single() + ".0123.part";
+        await File.WriteAllBytesAsync(leftover, new byte[500]);
+
+        var reopened = new ContentCache(Cache, api);
+
+        Assert.False(File.Exists(leftover));
+        Assert.Equal((3L, 1), reopened.Usage);
     }
 
     public void Dispose()

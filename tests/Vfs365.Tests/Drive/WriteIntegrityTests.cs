@@ -363,6 +363,72 @@ public sealed class WriteIntegrityTests : IDisposable
     }
 
     [Fact]
+    public async Task Never_flushed_content_stays_a_recovered_copy_when_its_first_upload_fails_and_the_agent_starts_again()
+    {
+        api.Add("notes.txt", content: "v1");
+        var engine = Create();
+        await SaveAsync(engine, "notes.txt", "maybe zeros", close: false);
+
+        // Start 1: the upload fails (offline at logon); the staged content is flushed before the retry
+        var first = Create();
+        first.Recover();
+        api.FailUpload = _ => new RemoteException(RemoteError.Unavailable, "503");
+        await DueAsync(first, TimeSpan.Zero);
+        Assert.True(JournalSaysFlushed());
+
+        // Start 2: still a copy, never into the item
+        api.FailUpload = null;
+        var second = Create();
+        second.Recover();
+        await DueAsync(second, TimeSpan.Zero);
+
+        Assert.Equal("v1", api.ContentOf("notes.txt"));
+        Assert.Equal("maybe zeros", api.ContentOf(Assert.Single(api.Paths, p => p.StartsWith("notes (recovered ", StringComparison.Ordinal))));
+        Assert.Empty(second.Unsaved());
+    }
+
+    [Fact]
+    public async Task A_journal_that_can_t_be_written_fails_the_write_but_never_blocks_the_file_s_upload()
+    {
+        api.Add("notes.txt", content: "v1");
+        var engine = Create();
+        api.FailUpload = _ => new RemoteException(RemoteError.Unavailable, "503");
+        await SaveAsync(engine, "notes.txt", "v2"); // closed and flushed, waiting to upload
+        var handle = await engine.StageAsync((await engine.GetEntryAsync(Root + "notes.txt", default))!, truncate: false, default);
+        var blocker = Assert.Single(Directory.GetFiles(Staging, "*.json")) + ".tmp";
+        Directory.CreateDirectory(blocker); // the journal's rewrite can't create its file
+
+        Assert.ThrowsAny<Exception>(() => engine.BeginWrite(handle));
+
+        Directory.Delete(blocker);
+        api.FailUpload = null;
+        var upload = DueAsync(engine, TimeSpan.FromMinutes(20));
+        Assert.Same(upload, await Task.WhenAny(upload, Task.Delay(TimeSpan.FromSeconds(20)))); // the write lock isn't left held
+        await upload;
+        Assert.Equal("v2", api.ContentOf("notes.txt"));
+    }
+
+    [Fact]
+    public async Task A_write_after_a_journal_that_couldn_t_be_written_tells_the_journal_before_it_writes()
+    {
+        static bool Flushed(string journal) => System.Text.Json.Nodes.JsonNode.Parse(File.ReadAllText(journal))!["Flushed"]!.GetValue<bool>();
+        api.Add("notes.txt", content: "v1");
+        var engine = Create();
+        api.FailUpload = _ => new RemoteException(RemoteError.Unavailable, "503");
+        await SaveAsync(engine, "notes.txt", "v2"); // closed and flushed, waiting to upload
+        var handle = await engine.StageAsync((await engine.GetEntryAsync(Root + "notes.txt", default))!, truncate: false, default);
+        var journal = Assert.Single(Directory.GetFiles(Staging, "*.json"));
+        Directory.CreateDirectory(journal + ".tmp"); // the journal's rewrite can't create its file
+        Assert.ThrowsAny<Exception>(() => engine.BeginWrite(handle));
+        Assert.True(Flushed(journal));
+        Directory.Delete(journal + ".tmp");
+
+        // The app writes again: a crash from here on must find the content marked as not flushed (it recovers as a copy)
+        engine.BeginWrite(handle)!.Dispose();
+        Assert.False(Flushed(journal));
+    }
+
+    [Fact]
     public async Task A_journal_from_before_the_flushed_marker_recovers_into_its_item()
     {
         // 0.4.x flushed staging at every close and wrote no Flushed field: after the upgrade its saves go into their items

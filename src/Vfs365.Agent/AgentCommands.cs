@@ -123,7 +123,7 @@ public static class AgentCommands
 
         if (command is "pin" or "unpin")
         {
-            if (args.Length < 2 || !Uri.TryCreate(args[1], UriKind.Absolute, out var location) || location.Scheme != "https")
+            if (args.Length < 2 || UserPins.Parse(args[1]) is not { } location)
             {
                 error.WriteLine("Usage: vfs365 pin <https URL of a SharePoint site or library>");
                 return 2;
@@ -359,8 +359,16 @@ public static class AgentCommands
             {
                 if (Option(AgentSupervisor.RestartedFlag) is { } crashCode)
                 {
-                    Say($"Restarted:  the agent stopped unexpectedly (exit code {crashCode}); the lines above say what Windows recorded");
-                    monitoring?.Error("crash", $"The agent stopped unexpectedly (exit code {crashCode}) and was started again");
+                    if (crashCode == AgentSupervisor.Hung)
+                    {
+                        Say("Restarted:  the agent gave no sign of life and was ended");
+                        monitoring?.Error("crash", "The agent gave no sign of life, was ended and was started again");
+                    }
+                    else
+                    {
+                        Say($"Restarted:  the agent stopped unexpectedly (exit code {crashCode}); the lines above say what Windows recorded");
+                        monitoring?.Error("crash", $"The agent stopped unexpectedly (exit code {crashCode}) and was started again");
+                    }
                 }
                 return await MountAsync(settings, Option("--config"), api, client, tokens, discoveryOptions, tenant.Tenant, background: tray,
                     (tray || Flag("--tray")) && settings.TrayIcon, Option("--after"), Option("--drive"), Flag("--trace"), !Flag("--no-shell") && settings.NavigationPane,
@@ -711,6 +719,22 @@ public static class AgentCommands
                 WakeUp();
             }
         }
+        // Another Wi-Fi, a VPN that connects: the network stays "available" while Microsoft 365 may be in reach again. Once the
+        // addresses are quiet for a few seconds, what failed without an answer is tried again
+        var addressChanges = 0;
+        void AddressChanged(object? sender, EventArgs e)
+        {
+            var change = Interlocked.Increment(ref addressChanges);
+            _ = Task.Delay(TimeSpan.FromSeconds(5)).ContinueWith(_ =>
+            {
+                if (Volatile.Read(ref addressChanges) == change && networkUp && restoredEngine is { CannotReach: true } unanswered)
+                {
+                    say("Network:    changed; Microsoft 365 is tried again");
+                    unanswered.NetworkRestored();
+                    WakeUp();
+                }
+            }, TaskScheduler.Default);
+        }
         var prefix = UncPrefix(Environment.UserName);
         var unc = $@"\{prefix}";
         var restarting = false; // a new agent takes over: redirected folders stay where they are
@@ -767,6 +791,7 @@ public static class AgentCommands
         }
 
         NetworkChange.NetworkAvailabilityChanged += NetworkChanged;
+        NetworkChange.NetworkAddressChanged += AddressChanged;
         try
         {
             var letter = DriveLetterOption.Parse(driveOption ?? settings.DriveLetter);
@@ -779,6 +804,7 @@ public static class AgentCommands
                     if (await tokens.SignInAsync(userAsked: true, default))
                     {
                         say("Sign-in:    done from the tray");
+                        restoredEngine?.NetworkRestored(); // change feeds that failed without a token are read again soon
                         WakeUp();
                     }
                     else
@@ -875,6 +901,13 @@ public static class AgentCommands
                 return !stop.WaitOne(0);
             }
             string? lastProblem = null;
+            // The drive won't be there for an hour or more: folders an earlier run left redirected (a crash, a session that ended
+            // uncleanly) go back now. They point at this user's UNC path, which may be another user's live volume meanwhile.
+            void RestoreStaleLayout()
+            {
+                RestoreLayout(restoreFolders: true, null);
+                layoutRestored = false; // the stop restores again: a later mount may have redirected anew
+            }
             // A start that can't go on: logged and reported once per cause, shown in the tray, tried again after a growing pause
             async Task<bool> WaitAfterAsync(Exception e, int attempt, string what)
             {
@@ -890,6 +923,7 @@ public static class AgentCommands
                     say($"Waiting:    {what}: {englishReason} ({e.Message.Split('\n')[0].Trim()}); trying again in {delay.TotalMinutes:0.#} min, or at Retry in the tray");
                     if (problem.Wait == StartWait.Retry)
                     {
+                        RestoreStaleLayout();
                         monitoring?.Error("start", e.Message);
                         AgentEvents.Write(AgentEvent.NotStarted, $"VFS365 didn't start, {what}: {englishReason} ({e.Message.Split('\n')[0].Trim()}); it tries again in an hour or at Retry in the tray");
                         tray?.Notify(UiText.Get("Failed.Title"), UiText.Get("Failed.Text", Sentence(reason)));
@@ -998,6 +1032,21 @@ public static class AgentCommands
             }
 
             var driveApi = new DriveApi(client);
+            var columnsApi = new ColumnsApi(client);
+            PendingDetails? pendingDetails = null;
+            var detailsWindows = new DetailsWindows(columnsApi, ExplorerMenu.Shell, say, saved => pendingDetails?.Filled(saved.DriveId, saved.ItemId));
+            pendingDetails = new PendingDetails(driveApi.EmptyRequiredAsync, detailsWindows.Show,
+                (title, text, clicked) => tray?.Notify(title, text, clicked), say);
+            var detailsNotices = new DetailsNotices(detailsWindows.Show, (title, text, clicked) => tray?.Notify(title, text, clicked), say);
+            driveApi.NeedsDetails = file =>
+            {
+                detailsNotices.Handle(file);
+                pendingDetails.Add(file);
+                if (file.StillCheckedOut)
+                {
+                    monitoring?.Error("check-in", $"{file.Name} stays checked out after a save: {file.Error}", null, file.Name);
+                }
+            };
             DriveHost? drive = null;
             var notices = new NoticeBatcher(settings.NotifyUploads);
             // Shared with me: only with Scope All; shown at once with the last run's list, read again in the background
@@ -1040,17 +1089,18 @@ public static class AgentCommands
                         {
                             monitoring?.Error("conflict copy", $"{notice.Path ?? notice.Name} was changed or locked in Microsoft 365; saved as {notice.Detail}",
                                 notice.Path, notice.Name, notice.Detail);
-                            AgentEvents.Write(AgentEvent.ConflictCopy, $"{notice.Path ?? notice.Name} was changed or locked in Microsoft 365; the user's version is saved as {notice.Detail}");
+                            AgentEvents.Write(AgentEvent.ConflictCopy, $"{notice.Path ?? notice.Name} was changed or locked in Microsoft 365; the user's version is saved as {notice.Detail}",
+                                notice.Path, notice.Name, notice.Detail);
                         }
                         else if (notice.Kind == NoticeKind.UploadWaiting)
                         {
                             monitoring?.Error("upload", $"{notice.Path ?? notice.Name}: {notice.Detail}", notice.Path, notice.Name);
-                            AgentEvents.Write(AgentEvent.UploadWaiting, $"{notice.Path ?? notice.Name} is waiting to upload, kept on this PC: {notice.Detail}");
+                            AgentEvents.Write(AgentEvent.UploadWaiting, $"{notice.Path ?? notice.Name} is waiting to upload, kept on this PC: {notice.Detail}", notice.Path, notice.Name);
                         }
                         else if (notice.Kind == NoticeKind.NotDeleted)
                         {
                             monitoring?.Error("delete", $"{notice.Path ?? notice.Name} could not be deleted: {notice.Detail}", notice.Path, notice.Name);
-                            AgentEvents.Write(AgentEvent.DeleteRefused, $"{notice.Path ?? notice.Name} could not be deleted in Microsoft 365 and is back: {notice.Detail}");
+                            AgentEvents.Write(AgentEvent.DeleteRefused, $"{notice.Path ?? notice.Name} could not be deleted in Microsoft 365 and is back: {notice.Detail}", notice.Path, notice.Name);
                         }
                     },
                 });
@@ -1151,6 +1201,7 @@ public static class AgentCommands
                         : $@"{unc} is held by {sameName}, another account with the same user name as this one ({Environment.UserDomainName}\{Environment.UserName}). " +
                           "UNC paths go by user name, so only one of them can have VFS365's drive on this PC at a time; files saved to that path would go to " +
                           $"the other account's drive, so VFS365 doesn't mount. Sign {sameName} out of this PC. ({e.Message})";
+                    RestoreStaleLayout();
                     if (lastProblem != message)
                     {
                         lastProblem = message;
@@ -1600,12 +1651,23 @@ public static class AgentCommands
 
             if (tray is not null)
             {
+                var smallWindows = new SmallWindows(ExplorerMenu.Shell, say);
+                var locations = new LocationActions(AskWindow.AskTextAsync, UserPins.Add, query => SupportCommands.Explain(query, settings).Lines,
+                    (title, text, problem) => VerbPipe.Tell(tray, title, text, problem), smallWindows.ShowText, say);
                 // Show files opens the navigation pane entry, which needs neither a drive letter nor the network provider loaded in Explorer
                 tray.Actions = startActions with
                 {
                     Retry = null,
                     ShowFiles = navigationPane ? $"shell:::{ExplorerLocation.Clsid}" : drive.DriveLetter is { } trayLetter ? trayLetter + "\\" : unc,
                     Restart = () => RestartAgent("from the tray"),
+                    DetailsNeeded = () => pendingDetails.Count,
+                    ShowDetails = pendingDetails.ShowOldest,
+                    WaitingFiles = () => status?.Current is { WaitingFiles.Count: > 0 } now ? Math.Max(now.WaitingUploads + now.RefusedUploads, now.WaitingFiles.Count) : 0,
+                    ShowWaiting = () => smallWindows.ShowWaiting(
+                        () => status?.Current is { } now ? new WaitingSnapshot(now.WaitingFiles, Math.Max(now.WaitingUploads + now.RefusedUploads, now.WaitingFiles.Count)) : new WaitingSnapshot([], 0),
+                        volumePath => WaitingFilesWindow.FolderOf(drive.DriveLetter ?? unc, volumePath)),
+                    AddLibrary = () => _ = Task.Run(() => locations.AddLibraryAsync(default)),
+                    WhyMissing = () => _ = Task.Run(() => locations.WhyAsync(default)),
                 };
                 tray.SetStatus(UiText.Get("Status.UpToDate"), TrayState.Normal);
                 if (recovered > 0)
@@ -1677,10 +1739,11 @@ public static class AgentCommands
                         User = tokens.LastResult?.Username ?? s.User,
                         TenantId = tokens.LastResult?.TenantId ?? s.TenantId,
                         SignInProblem = tokens.SignInProblem ? s.SignInProblem ?? "unknown" : null,
-                        Online = networkUp && DateTimeOffset.UtcNow - networkFailedAt >= TimeSpan.FromMinutes(2),
+                        Online = networkUp && DateTimeOffset.UtcNow - networkFailedAt >= TimeSpan.FromMinutes(2) && !engine.CannotReach,
                         Throttled = client.ThrottledWithin(throttledSpan),
                         WaitingUploads = waiting,
                         HeldChanges = Math.Max(0, engine.Unsaved().Count - waiting),
+                        RefusedUploads = engine.RefusedUploads(),
                     };
                 };
                 if (navigationPane)
@@ -1706,7 +1769,7 @@ public static class AgentCommands
                 // The VFS365 menu on the drive's files and folders and the shell section for overlay icons (ExplorerMenu.cs); removed and
                 // cleared when this block ends at the stop
                 using var explorerMenu = ExplorerMenu.Start(engine, driveApi, unc, drive.DriveLetter, driveLetters, settings.OverlayIcons, OfficeSettings.From(settings), search.AskAndSearchAsync,
-                    (title, text, problem) => VerbPipe.Tell(tray, title, text, problem), say, log);
+                    (title, text, problem) => VerbPipe.Tell(tray, title, text, problem), say, log, detailsWindows.Show);
                 _ = shellPackage.ContinueWith(_ => explorerMenu?.Update(), TaskScheduler.Default); // legacy verbs go once the package is there
                 using var searchWatcher = ExplorerSearchWatcher.Start(engine, settings.ExplorerSearch,
                     () => ExplorerMenu.Roots(unc, drive.DriveLetter, driveLetters?.Folders().Keys ?? []), DriveVolumePath, search.HandOffAsync,
@@ -1862,7 +1925,12 @@ public static class AgentCommands
                     // libraries (a first run that didn't finish, a failed search) discovers right away, as does one with sites whose
                     // default library DefaultLibrarySites needs and no run looked up yet: they have no folder until then.
                     var notLookedUp = discoveryOptions.DefaultLibrarySites.Unchecked(keeper.Current.Libraries).Count();
-                    var recent = usable && !discoverNow && notLookedUp == 0 && DiscoverySchedule.Recent(keeper.Current, settings.Scope, DateTimeOffset.UtcNow);
+                    var pinsChanged = settings.Scope != DriveScope.OneDrive && UserPins.ChangedSince(keeper.Current.RunAt);
+                    var recent = usable && !discoverNow && notLookedUp == 0 && !pinsChanged && DiscoverySchedule.Recent(keeper.Current, settings.Scope, DateTimeOffset.UtcNow);
+                    if (pinsChanged && usable && !discoverNow)
+                    {
+                        say("Discovery:  now, for what the user added or removed by link since the last run");
+                    }
                     if (notLookedUp > 0 && settings.Scope != DriveScope.OneDrive)
                     {
                         say($"Discovery:  now, to find the default library of {notLookedUp} site(s) (DefaultLibrarySites)");
@@ -1901,6 +1969,7 @@ public static class AgentCommands
                 Action saveDiscoveryState = keeper.SaveIfChanged; // made once: the tick allocates as little as it can
                 Func<Task> applyLayout = ApplyLayoutAsync, discover = DiscoverAsync;
                 Action checkDriveLetter = CheckDriveLetter, saveSnapshots = SaveSnapshotsIfChanged;
+                var alive = AliveSignal.TryCreate(Environment.ProcessId); // the supervisor ends an agent whose tick stops (HangWatch)
                 scheduler = Task.Run(async () =>
                 {
                     using var timer = new PeriodicTimer(TimeSpan.FromSeconds(1));
@@ -1928,6 +1997,7 @@ public static class AgentCommands
                     {
                         var now = DateTimeOffset.UtcNow;
                         var at = tick++;
+                        alive?.Beat();
                         if (processing.IsCompleted)
                         {
                             processing = ProcessDueQuietlyAsync();
@@ -1950,6 +2020,10 @@ public static class AgentCommands
                             catch (Exception e) when (Failed(e))
                             {
                             }
+                        }
+                        if (at % 60 == 0)
+                        {
+                            _ = pendingDetails.RemindAsync(due.Token);
                         }
                         if (at % 5 == 0)
                         {
@@ -2009,12 +2083,14 @@ public static class AgentCommands
                             try
                             {
                                 var waiting = engine.WaitingToUpload();
-                                var offline = !networkUp || now - networkFailedAt < TimeSpan.FromMinutes(2);
                                 var throttled = client.ThrottledWithin(throttleShown);
+                                var noAnswer = networkUp && engine.CannotReach && !throttled; // a network, but no Microsoft 365 behind it
+                                var offline = !networkUp || now - networkFailedAt < TimeSpan.FromMinutes(2) || noAnswer;
                                 var signIn = tokens.SignInProblem;
                                 tray.BlockShutdown(waiting > 0 ? UiText.Get("Shutdown.Uploading", waiting) : null);
                                 tray.SetStatus(
                                     signIn ? UiText.Get("Status.SignIn")
+                                        : noAnswer ? waiting == 0 ? UiText.Get("Status.NoAnswer") : UiText.Get("Status.NoAnswerWaiting", waiting)
                                         : offline ? waiting == 0 ? UiText.Get("Status.Offline") : UiText.Get("Status.OfflineWaiting", waiting)
                                         : waiting > 0 ? UiText.Get("Status.Waiting", waiting)
                                         : throttled ? UiText.Get("Status.Throttled")
@@ -2045,10 +2121,15 @@ public static class AgentCommands
                                 nextDiscovery = DateTimeOffset.MaxValue;
                                 _ = Task.Run(discover);
                             }
-                            if (now >= nextSnapshot && snapshotting.IsCompleted && !accountChanged && engine.MetadataVersion != Interlocked.Read(ref savedVersion))
+                            if (now >= nextSnapshot && snapshotting.IsCompleted && !accountChanged)
                             {
-                                nextSnapshot = now + SnapshotInterval;
-                                snapshotting = Task.Run(saveSnapshots); // a large one takes about a second
+                                // MetadataVersion walks every cached listing: looked at once per SnapshotCheck, not at every tick
+                                nextSnapshot = now + SnapshotCheck;
+                                if (engine.MetadataVersion != Interlocked.Read(ref savedVersion))
+                                {
+                                    nextSnapshot = now + SnapshotInterval;
+                                    snapshotting = Task.Run(saveSnapshots); // a large one takes about a second
+                                }
                             }
                         }
                         catch (Exception e) when (Failed(e))
@@ -2058,6 +2139,7 @@ public static class AgentCommands
                 });
 
                 stop.WaitOne();
+                alive?.Stopping(); // the last uploads may take long
                 powerChanged = null;
                 layoutSoon = null;
                 accountSwitchedNow = null;
@@ -2127,7 +2209,8 @@ public static class AgentCommands
             }
             if (notSaved.Count > 0)
             {
-                AgentEvents.Write(AgentEvent.NotSaved, $"{notSaved.Count} changed file(s) are not saved to Microsoft 365 yet and stay on this PC: " + string.Join("; ", notSaved.Take(20)));
+                AgentEvents.Write(AgentEvent.NotSaved, $"{notSaved.Count} changed file(s) are not saved to Microsoft 365 yet and stay on this PC: " + string.Join("; ", notSaved.Take(20)),
+                    [.. notSaved.Take(20)]);
             }
             AgentEvents.Write(AgentEvent.Stopped, $"VFS365 stopped and unmounted {unc}");
             var usage = client.Usage; // monitoring flushes once, below
@@ -2139,6 +2222,7 @@ public static class AgentCommands
         finally
         {
             NetworkChange.NetworkAvailabilityChanged -= NetworkChanged;
+            NetworkChange.NetworkAddressChanged -= AddressChanged;
             powerChanged = null;
             layoutSoon = null;
             layoutCancel.Cancel();
@@ -2158,6 +2242,9 @@ public static class AgentCommands
     }
 
     static readonly TimeSpan SnapshotInterval = TimeSpan.FromMinutes(5);
+
+    /// <summary>Once a snapshot is due, how often the tick looks whether there is anything to save.</summary>
+    static readonly TimeSpan SnapshotCheck = TimeSpan.FromSeconds(30);
 
     /// <summary>Another user's volume holds this user's UNC path (\\VFS365\&lt;user&gt;). The user's own leftover volume is retried like any start problem.</summary>
     static bool IsMountConflict(Exception e) => e is MountConflictException { OwnedByAnotherUser: true };

@@ -16,8 +16,9 @@ public sealed partial class DriveEngine
     /// so their records count as flushed. OriginalPath: renamed away from there to a temp name (<see cref="PendingFile.Alias"/>), so it
     /// goes back there unless a save claims its item. FolderPath and FolderId: <see cref="PendingFile.Folder"/>.
     /// </summary>
+    /// <param name="RecoverAsCopy">Recovered content that was never flushed before the crash: a flush since (before a retry) doesn't make it whole.</param>
     sealed record JournalRecord(string DriveId, string DrivePath, DriveItemInfo? Base, DateTimeOffset Modified, bool? Flushed = null, string? OriginalPath = null,
-        string? FolderPath = null, string? FolderId = null);
+        string? FolderPath = null, string? FolderId = null, bool? RecoverAsCopy = null);
 
     static string JournalOf(string stagingPath) => stagingPath + ".json";
 
@@ -49,7 +50,7 @@ public sealed partial class DriveEngine
             using (var file = new FileStream(path + ".tmp", FileMode.Create, FileAccess.Write, FileShare.None))
             {
                 JsonSerializer.Serialize(file, new JournalRecord(pending.DriveId, pending.DrivePath, pending.Base, pending.Modified, pending.Flushed, pending.Alias?.OriginalPath,
-                    pending.Folder?.Path, pending.Folder?.Id));
+                    pending.Folder?.Path, pending.Folder?.Id, pending.RecoverAsCopy ? true : null));
                 if (durable)
                 {
                     file.Flush(flushToDisk: true);
@@ -118,7 +119,16 @@ public sealed partial class DriveEngine
             if (pending.IsLive && !pending.Flushed && FlushToDisk(pending.StagingPath))
             {
                 pending.Flushed = true;
-                Journal(pending);
+                try
+                {
+                    Journal(pending);
+                }
+                catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+                {
+                    // The journal still says not flushed: after a crash this content is a recovered copy. The caller goes on to upload
+                    pending.Flushed = false;
+                    Log($"error: journal of {pending.DrivePath}: {e.Message}");
+                }
             }
         }
         finally
@@ -135,7 +145,15 @@ public sealed partial class DriveEngine
             if (pending.Flushed)
             {
                 pending.Flushed = false;
-                Journal(pending);
+                try
+                {
+                    Journal(pending);
+                }
+                catch
+                {
+                    pending.Flushed = true; // the record on disk still says so: the next write tries again
+                    throw;
+                }
             }
         }
     }
@@ -165,7 +183,7 @@ public sealed partial class DriveEngine
                         Queued = true,
                         Recovered = true,
                         Flushed = flushed,
-                        RecoverAsCopy = !flushed,
+                        RecoverAsCopy = !flushed || record.RecoverAsCopy == true,
                         TempSince = Now,
                         Alias = record.OriginalPath is { } original && record.Base is { } item
                             ? new AliasItem(record.DriveId, record.DrivePath, item, original, Now + options.SettleWindow) : null,

@@ -4,7 +4,7 @@ using Vfs365.Core.Drive;
 
 namespace Vfs365.Agent;
 
-public enum Cause { Offline, Throttled, SignedOut, Locked, NoAccess, ReadOnly, Unavailable, Gone, Other }
+public enum Cause { Offline, Throttled, SignedOut, Locked, NoAccess, ReadOnly, Unavailable, Gone, Quota, Refused, TooLarge, Other }
 
 /// <summary>Why something failed, in words a user understands, from an error message and what the agent knows about the network and sign-in.</summary>
 public static partial class PlainCause
@@ -16,6 +16,10 @@ public static partial class PlainCause
     public static Cause Of(string? message, bool offline = false, bool signInProblem = false)
     {
         message ??= "";
+        if (message.Contains("insufficientStorage", StringComparison.OrdinalIgnoreCase) || message.Contains("quotaLimitReached", StringComparison.OrdinalIgnoreCase))
+        {
+            return Cause.Quota;
+        }
         if (StatusCode().Match(message) is { Success: true } status)
         {
             return int.Parse(status.Groups[1].Value, CultureInfo.InvariantCulture) switch
@@ -26,6 +30,9 @@ public static partial class PlainCause
                 401 => Cause.SignedOut,
                 403 => Cause.NoAccess,
                 404 or 410 => Cause.Gone,
+                400 => Cause.Refused,
+                413 => Cause.TooLarge,
+                507 => Cause.Quota,
                 408 or 504 => Cause.Offline,
                 >= 500 => Cause.Unavailable,
                 _ => Cause.Other,
@@ -48,7 +55,9 @@ public static partial class PlainCause
         return signInProblem ? Cause.SignedOut : Cause.Other;
     }
 
-    public static string Text(Cause cause, CultureInfo? culture = null) => UiText.Get(culture, $"Cause.{cause}");
+    /// <summary>The cause in plain words; for a file that isn't uploaded (<paramref name="upload"/>), with what happens to it and what to do.</summary>
+    public static string Text(Cause cause, CultureInfo? culture = null, bool upload = false) =>
+        UiText.Get(culture, upload && cause is Cause.Unavailable or Cause.Other or Cause.Refused ? $"Cause.{cause}.Upload" : $"Cause.{cause}");
 
     /// <summary>No network or Microsoft 365 unreachable: connection failures and timeouts.</summary>
     public static bool IsNetwork(Exception e) =>
@@ -185,9 +194,9 @@ public sealed class NoticeBatcher(bool notifyUploads = true)
             var items = batch.DistinctBy(n => NameOf(n.Notice), StringComparer.OrdinalIgnoreCase).ToList();
             var first = items[0].Notice;
             var common = items.GroupBy(n => n.Cause).OrderByDescending(g => g.Count()).First().Key;
-            var cause = PlainCause.Text(common, culture);
-            // Refused for lack of access: not retried by itself (new files), so "keeps trying" would be wrong
-            var waiting = common == Cause.NoAccess ? "Waiting.Kept" : "Waiting";
+            var cause = PlainCause.Text(common, culture, upload: kind == NoticeKind.UploadWaiting);
+            // Refused for lack of access (new files) or for its name: not retried by itself, so "keeps trying" would be wrong
+            var waiting = common is Cause.NoAccess or Cause.Refused ? "Waiting.Kept" : "Waiting";
             toasts.Add(kind switch
             {
                 NoticeKind.ConflictCopy => (UiText.Get(culture, "Copy.Title"),

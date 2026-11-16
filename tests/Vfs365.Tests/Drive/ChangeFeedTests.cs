@@ -388,6 +388,7 @@ public sealed class ChangeFeedTests : IDisposable
         {
             await Names(engine, $"\\f{i}");
         }
+        await Eventually(() => api.ListCalls >= 11); // the top too: listed in the background from the 5th lookup in it
 
         now += TimeSpan.FromMinutes(3);
         await Names(engine, "\\f9"); // in use: stays

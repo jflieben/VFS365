@@ -54,6 +54,30 @@ public sealed class KnownFolderTests : IDisposable
     }
 
     [Fact]
+    public async Task Listings_from_before_the_feed_s_baseline_are_read_once_more_and_then_stay_current()
+    {
+        var api = Tree();
+        var engine = ReadPathTesting.Create(directory, api, () => now);
+        api.DeltaUnavailable = true; // the folders are opened while the baseline is still on its way
+        foreach (var path in new[] { @"\A", @"\A\B", @"\A\B\C" })
+        {
+            await engine.ListAsync((await engine.GetEntryAsync(path, default))!, default);
+        }
+        var c = (await engine.GetEntryAsync(@"\A\B\C", default))!;
+        await engine.PollAsync("b!me"); // the read their use started has failed by now
+        await Task.Delay(200); // background listings of the lookups are done
+        api.DeltaUnavailable = false;
+        now += TimeSpan.FromMinutes(5); // past the back-off
+        var before = api.ListCalls;
+        await engine.PollAsync("b!me"); // the baseline
+        await ReadPathTesting.Eventually(() => api.ListCalls - before >= 3);
+        await Task.Delay(200);
+        Assert.Equal(3, api.ListCalls - before); // each read again once
+
+        Assert.Equal(0, await ListsOverTime(engine, api, c));
+    }
+
+    [Fact]
     public async Task A_listing_below_folders_looked_up_after_the_baseline_stays_current()
     {
         var (engine, api, c) = await OpenC(earlyLookup: false);
@@ -89,10 +113,14 @@ public sealed class KnownFolderTests : IDisposable
         await ReadPathTesting.Eventually(() => fake.LookedUp.Contains("A"));
         await Task.Delay(200);
         now += TimeSpan.FromMinutes(2); // past the back-off
+        var before = fake.ListCalls;
         await engine.PollAsync("b!me"); // the baseline works now; A and A/B were looked up before it
 
-        // C was listed before the baseline too: read once more, then kept current by the feed
-        Assert.Equal(1, await ListsOverTime(engine, fake, c));
+        // C was listed before the baseline too: read once more (at the baseline), then kept current by the feed
+        await ReadPathTesting.Eventually(() => fake.ListCalls > before);
+        await Task.Delay(200);
+        await ListsOverTime(engine, fake, c);
+        Assert.Equal(1, fake.ListCalls - before);
         Assert.Contains("A/B/C", engine.ExportSnapshots(100).Single().Folders.Select(f => f.Path));
     }
 

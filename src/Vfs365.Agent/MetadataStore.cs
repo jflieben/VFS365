@@ -4,8 +4,9 @@ using Vfs365.Core.Drive;
 namespace Vfs365.Agent;
 
 /// <summary>
-/// Folder listings the change feeds kept current, with the delta links to continue from (%LOCALAPPDATA%\VFS365\metadata.bin,
-/// sealed with the cache key). The next start shows these folders before asking Graph; the first read of each feed brings them up to date.
+/// Folder listings the change feeds kept current, with the delta links to continue from (%LOCALAPPDATA%\VFS365\metadata.bin: JSON
+/// in a <see cref="SealedStream"/>, under a key derived from the cache key). The next start shows these folders before asking Graph;
+/// the first read of each feed brings them up to date. Written and read as a stream: a large snapshot is never in memory as a whole.
 /// </summary>
 static class MetadataStore
 {
@@ -14,26 +15,59 @@ static class MetadataStore
 
     public static string FilePath { get; } = Path.Combine(DiscoveryStore.DataDirectory, "metadata.bin");
 
-    public static IReadOnlyList<DriveSnapshot> Load(byte[] key)
+    /// <summary>
+    /// Empty when the file is missing, damaged, incomplete or another key's: the folders are then listed again when opened.
+    /// <paramref name="path"/>: a file elsewhere (tests).
+    /// </summary>
+    public static IReadOnlyList<DriveSnapshot> Load(byte[] key, string? path = null)
     {
+        path ??= FilePath;
         try
         {
-            return File.Exists(FilePath) && CacheKey.Unseal(key, File.ReadAllBytes(FilePath)) is { } json
-                ? JsonSerializer.Deserialize<List<DriveSnapshot>>(json) ?? []
-                : [];
+            if (!File.Exists(path))
+            {
+                return [];
+            }
+            using var file = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read | FileShare.Delete, 1, FileOptions.SequentialScan);
+            Span<byte> start = stackalloc byte[8];
+            var marked = file.ReadAtLeast(start, start.Length, throwOnEndOfStream: false) == start.Length && SealedStream.HasMarker(start);
+            file.Position = 0;
+            if (!marked)
+            {
+                return LoadOld(file, key);
+            }
+            using var content = SealedStream.Open(file, key);
+            var snapshots = JsonSerializer.Deserialize<List<DriveSnapshot>>(content);
+            // Only a file read to its checked end is whole
+            return snapshots is not null && content.ReadByte() < 0 ? snapshots : [];
         }
-        catch (Exception e) when (e is JsonException or IOException or NotSupportedException)
+        catch (Exception e) when (e is JsonException or IOException or InvalidDataException or UnauthorizedAccessException or NotSupportedException)
         {
             return [];
         }
     }
 
-    public static void Save(IReadOnlyList<DriveSnapshot> snapshots, byte[] key)
+    /// <summary>A file written before 0.9.0: sealed in one piece with the cache key itself. The next save replaces it.</summary>
+    static IReadOnlyList<DriveSnapshot> LoadOld(FileStream file, byte[] key)
     {
-        Directory.CreateDirectory(DiscoveryStore.DataDirectory);
-        var temp = FilePath + ".tmp";
-        File.WriteAllBytes(temp, CacheKey.Seal(key, JsonSerializer.SerializeToUtf8Bytes(snapshots)));
-        File.Move(temp, FilePath, overwrite: true);
+        var sealedData = new byte[file.Length];
+        file.ReadExactly(sealedData);
+        return CacheKey.Unseal(key, sealedData) is { } json ? JsonSerializer.Deserialize<List<DriveSnapshot>>(json) ?? [] : [];
+    }
+
+    /// <summary>Written to a temporary file chunk by chunk, then renamed into place. <paramref name="path"/>: a file elsewhere (tests).</summary>
+    public static void Save(IReadOnlyList<DriveSnapshot> snapshots, byte[] key, string? path = null)
+    {
+        path ??= FilePath;
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        var temp = path + ".tmp";
+        using (var file = new FileStream(temp, FileMode.Create, FileAccess.Write, FileShare.None, 1))
+        using (var content = SealedStream.Create(file, key))
+        {
+            JsonSerializer.Serialize(content, snapshots);
+            content.Complete();
+        }
+        File.Move(temp, path, overwrite: true);
     }
 
     public static void Delete()

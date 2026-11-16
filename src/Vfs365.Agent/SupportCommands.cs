@@ -74,15 +74,21 @@ static class SupportCommands
         }
     }
 
+    /// <summary>The explanation `vfs365 why` prints (without --check), from this profile's discovery state and the policy in <paramref name="settings"/>.</summary>
+    internal static WhyAnswer Explain(string query, AgentSettings settings)
+    {
+        var effective = settings.Effective();
+        var context = new WhyContext(AgentCommands.DiscoveryOptionsOf(settings), settings.PinnedLocations, UserPins.Load(), settings.Scope, DiscoveryStore.Load(),
+            DiscoveryReport.Load(), StatusFile.Read(StatusFile.DefaultPath)?.DriveLetter ?? $@"\{AgentCommands.UncPrefix(Environment.UserName)}",
+            name => effective.FirstOrDefault(s => s.Name == name).Source ?? AgentSettings.Default, settings.SharedWithMe, settings.DefaultLibrarySites);
+        return LocationExplainer.Explain(query, context);
+    }
+
     static async Task<int> WhyAsync(string query, string? configPath, bool check, Action<string> say)
     {
         var settings = AgentSettings.Load(configPath);
         var state = DiscoveryStore.Load();
-        var effective = settings.Effective();
-        var context = new WhyContext(AgentCommands.DiscoveryOptionsOf(settings), settings.PinnedLocations, UserPins.Load(), settings.Scope, state,
-            DiscoveryReport.Load(), StatusFile.Read(StatusFile.DefaultPath)?.DriveLetter ?? $@"\{AgentCommands.UncPrefix(Environment.UserName)}",
-            name => effective.FirstOrDefault(s => s.Name == name).Source ?? AgentSettings.Default, settings.SharedWithMe, settings.DefaultLibrarySites);
-        var answer = LocationExplainer.Explain(query, context);
+        var answer = Explain(query, settings);
         foreach (var line in answer.Lines)
         {
             say(line);

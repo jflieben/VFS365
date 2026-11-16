@@ -19,6 +19,13 @@ public sealed partial class DriveApi
         return doc is null ? null : ParseLinks(doc.RootElement);
     }
 
+    /// <summary>One GET for the web address of a drive's root (the library's top); null when it doesn't exist.</summary>
+    public async Task<string?> GetRootUrlAsync(string driveId, CancellationToken ct)
+    {
+        using var doc = await client.GetJsonAsync(new Uri($"{DriveUrl(driveId)}/root?$select=id,webUrl"), ct, notFoundAsNull: true);
+        return doc is null ? null : Str(doc.RootElement, "webUrl");
+    }
+
     public static ItemLinks ParseLinks(JsonElement item)
     {
         var ids = item.TryGetProperty("sharepointIds", out var found) ? found : default;

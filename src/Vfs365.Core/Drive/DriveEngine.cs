@@ -96,8 +96,9 @@ public sealed record DriveEngineOptions
     public TimeSpan MaintainedListingMaxAge { get; init; } = TimeSpan.FromHours(24);
 
     /// <summary>
-    /// Folder listings kept in memory, counted as their items plus one per listing. Beyond it the least recently used go (never
-    /// one that is loading or was used in the last minutes); they are read again when opened.
+    /// Folder listings kept in memory, counted as their items plus three per listing (about 0.7 KB per item). Beyond it the least
+    /// recently used go (never one that is loading or was used in the last 2 minutes, down to 20 s the further beyond); they are read
+    /// again when opened.
     /// </summary>
     public int MaxCachedItems { get; init; } = 250_000;
 
@@ -791,13 +792,34 @@ public sealed partial class DriveEngine(DriveNamespace ns, IDriveApi api, Conten
     /// <summary>After a read failed on the network, lookups answer from what is cached at once for this long, then one tries again.</summary>
     static readonly TimeSpan UnreachableFor = TimeSpan.FromSeconds(30);
 
-    void Unreachable(string driveId) => unreachable.GetOrAdd(driveId, _ => new Reach()).Until = Now + UnreachableFor;
+    void Unreachable(string driveId)
+    {
+        unreachable.GetOrAdd(driveId, _ => new Reach()).Until = Now + UnreachableFor;
+        if (!HotPollingPaused)
+        {
+            Volatile.Write(ref unansweredAt, Now.UtcTicks); // a call the client holds after throttling times out too: not this
+        }
+    }
+
+    /// <summary>When a call last got no answer, in UTC ticks; 0 once one was answered since.</summary>
+    long unansweredAt;
+
+    /// <summary>How long after a call without an answer <see cref="CannotReach"/> stays true with no change feed failing.</summary>
+    public static readonly TimeSpan NoAnswerShown = TimeSpan.FromMinutes(2);
+
+    /// <summary>
+    /// Microsoft 365 doesn't answer (no route, a timeout, no token) and nothing was answered since, so the drive shows what was last
+    /// known: a call failed that way in the last <see cref="NoAnswerShown"/>, or a change feed that failed that way hasn't recovered.
+    /// </summary>
+    public bool CannotReach =>
+        Volatile.Read(ref unansweredAt) is not 0 and var at && (Now.UtcTicks - at < NoAnswerShown.Ticks || feeds.Values.Any(f => f.Broken && f.NoAnswer));
 
     /// <summary>A failure without an answer from Microsoft 365 (no network, a timeout, no token): not a 404, a 403 or a 503.</summary>
     static bool Unanswered(Exception e) => e is not (RemoteException or FsException);
 
     void Reachable(string driveId)
     {
+        Volatile.Write(ref unansweredAt, 0);
         if (!unreachable.IsEmpty)
         {
             unreachable.TryRemove(driveId, out _);
@@ -933,6 +955,10 @@ public sealed partial class DriveEngine(DriveNamespace ns, IDriveApi api, Conten
             unlisted.TryRemove(key, out _);
             PrefetchChildren(driveId, folderPath, listing);
             TrackAncestors(driveId, folderPath);
+            if (feed.DeltaLink is not null && listing.RequestedAt < feed.BaselineAt && listing.TryStartRefresh())
+            {
+                _ = RefreshAsync(driveId, folderPath, key, listing); // asked for before the feed's baseline: see RefreshFromBeforeBaseline
+            }
         }
         catch (Exception e)
         {

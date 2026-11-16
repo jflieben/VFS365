@@ -32,6 +32,10 @@ public sealed record AgentStatus
     public bool Throttled { get; init; }
     public int WaitingUploads { get; init; }
     public int HeldChanges { get; init; }
+
+    /// <summary>Of HeldChanges, the files Microsoft 365 refused: they stay in WaitingFiles.</summary>
+    [JsonIgnore]
+    public int RefusedUploads { get; init; }
     public string? LastError { get; init; }
     public DateTimeOffset? LastErrorAt { get; init; }
     public IReadOnlyList<WaitingFile> WaitingFiles { get; init; } = [];
@@ -156,7 +160,7 @@ public sealed class StatusFile : IDisposable
                 lock (gate)
                 {
                     current = live(current);
-                    if (current.WaitingUploads == 0 && waiting.Count > 0)
+                    if (current.WaitingUploads == 0 && current.RefusedUploads == 0 && waiting.Count > 0)
                     {
                         waiting.Clear(); // renamed or deleted meanwhile: no notice says they are done
                         current = current with { WaitingFiles = [] };

@@ -93,6 +93,7 @@ public sealed class DriveEngineTests : IDisposable
     public async Task Listed_folder_answers_lookups_including_not_found()
     {
         var (engine, api, _) = Create();
+        api.DeltaUnavailable = true; // no change feed, whose baseline reads the folder once more
         api.Add("a", folder: true);
         api.Add("a/one.txt");
 
@@ -114,6 +115,7 @@ public sealed class DriveEngineTests : IDisposable
     public async Task Many_files_opened_by_path_in_an_unlisted_folder_get_the_folder_listed()
     {
         var (engine, api, _) = Create();
+        api.DeltaUnavailable = true; // no change feed, whose baseline reads the folder once more
         api.Add("scans", folder: true);
         for (var i = 0; i < 10; i++)
         {
@@ -257,6 +259,7 @@ public sealed class DriveEngineTests : IDisposable
     public async Task Listings_come_sorted_and_scans_of_a_big_folder_reuse_their_entries()
     {
         var (engine, api, _) = Create();
+        api.DeltaUnavailable = true; // no change feed, whose baseline reads the folder once more
         api.Add("big", folder: true);
         foreach (var i in Enumerable.Range(0, 600).Reverse())
         {

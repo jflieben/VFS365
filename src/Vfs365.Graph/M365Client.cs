@@ -87,6 +87,15 @@ public sealed class M365Client(HttpClient http, ITokenSource tokens, RequestBudg
     readonly Lock pauseLock = new();
     TimeSpan pausedUntil = TimeSpan.MinValue;
     TimeSpan backgroundUntil = TimeSpan.MinValue;
+
+    /// <summary>
+    /// Throttled again within this long after a background hold ran out: the next hold is twice as long, up to
+    /// <see cref="MaxThrottleDoublings"/> times (15 minutes become 2 hours). Thousands of agents that each try again after the same
+    /// short hold can keep a tenant throttled by themselves.
+    /// </summary>
+    public static readonly TimeSpan ThrottleForget = TimeSpan.FromMinutes(30);
+    public const int MaxThrottleDoublings = 3;
+    int throttleDoublings;
     TimeSpan foregroundNext = TimeSpan.MinValue;
     TimeSpan backgroundNext = TimeSpan.MinValue;
     long graphRequests;
@@ -127,6 +136,39 @@ public sealed class M365Client(HttpClient http, ITokenSource tokens, RequestBudg
     /// included). <see cref="SharePointDiscoveryApi.GetMyDriveAsync"/> sets it when it is still empty.
     /// </summary>
     public string? TenantRootHost { get; set; }
+
+    /// <summary>A resource's token is renewed at most this often (<see cref="RenewTokenAsync"/>).</summary>
+    public static readonly TimeSpan RenewEvery = TimeSpan.FromMinutes(15);
+
+    readonly System.Collections.Concurrent.ConcurrentDictionary<string, DateTimeOffset> renewed = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// A token issued now, through a claims challenge as Entra sends when it revokes one (nbf: now). After an admin consents to new
+    /// permissions, Windows keeps handing out the token it has for up to a day (CAE tokens live that long), without them. The token
+    /// source keeps the new one for later requests. At most once per resource per <see cref="RenewEvery"/>: false when it was renewed
+    /// recently, so a 403 that has another cause doesn't renew again and again; false too when no new token came (the one in hand
+    /// stays in use).
+    /// </summary>
+    public async Task<bool> RenewTokenAsync(string resource, CancellationToken ct)
+    {
+        var now = Clock();
+        if (renewed.TryGetValue(resource, out var at) && now - at < RenewEvery)
+        {
+            return false;
+        }
+        renewed[resource] = now;
+        var claims = JsonSerializer.Serialize(new { access_token = new { nbf = new { essential = true, value = now.ToUnixTimeSeconds().ToString(System.Globalization.CultureInfo.InvariantCulture) } } });
+        try
+        {
+            await tokens.RenewAsync(resource, claims, ct);
+            return true;
+        }
+        catch (Exception e) when (e is not OutOfMemoryException && !ct.IsCancellationRequested)
+        {
+            Log?.Invoke($"No new token for {resource}: {e.Message}");
+            return false;
+        }
+    }
 
     /// <summary>After a 429 or 503, background requests (<see cref="RequestPriority"/>) wait this long; foreground ones only for Retry-After.</summary>
     public TimeSpan ThrottlePause { get; set; } = TimeSpan.FromMinutes(15);
@@ -400,7 +442,8 @@ public sealed class M365Client(HttpClient http, ITokenSource tokens, RequestBudg
                 {
                     // Every request waits for the pause; background work longer (only UnwellPause after a 503 without Retry-After)
                     var pause = Jitter(retryAfter ?? Backoff(attempt));
-                    var hold = status == 503 && retryAfter is null && UnwellPause < ThrottlePause ? UnwellPause : ThrottlePause;
+                    // An unwell service isn't throttling: its short hold neither doubles nor counts towards the doubling
+                    var hold = status == 503 && retryAfter is null && UnwellPause < ThrottlePause ? UnwellPause : ThrottlePause * HoldFactor();
                     var backgroundPause = hold > pause ? Jitter(hold) : pause;
                     LastThrottled = Clock();
                     Interlocked.Exchange(ref lastThrottledTicks, Monotonic().Ticks);
@@ -450,6 +493,23 @@ public sealed class M365Client(HttpClient http, ITokenSource tokens, RequestBudg
             }
         }
         return text;
+    }
+
+    /// <summary>
+    /// How many times the background hold counts now. A throttled response during a hold changes nothing (foreground requests go on
+    /// meanwhile); one after a hold ran out doubles it when that was less than <see cref="ThrottleForget"/> ago, else starts over.
+    /// </summary>
+    int HoldFactor()
+    {
+        lock (pauseLock)
+        {
+            var now = Monotonic();
+            if (now >= backgroundUntil)
+            {
+                throttleDoublings = backgroundUntil != TimeSpan.MinValue && now - backgroundUntil < ThrottleForget ? Math.Min(throttleDoublings + 1, MaxThrottleDoublings) : 0;
+            }
+            return 1 << throttleDoublings;
+        }
     }
 
     /// <returns>How much longer every request is held now: the throttled time, so pauses that overlap count once.</returns>

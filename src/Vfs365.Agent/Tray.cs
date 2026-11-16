@@ -20,6 +20,18 @@ public sealed record TrayActions(string HelpUrl)
     public Action? SessionEnded { get; init; }
     public Action? CollectDiagnostics { get; init; }
     public Action? Search { get; init; }
+
+    /// <summary>Files waiting for required details (PendingDetails); the item shows while there are some, and opens the oldest.</summary>
+    public Func<int>? DetailsNeeded { get; init; }
+    public Action? ShowDetails { get; init; }
+
+    /// <summary>Files waiting to upload; the item shows while there are some and opens the list.</summary>
+    public Func<int>? WaitingFiles { get; init; }
+    public Action? ShowWaiting { get; init; }
+
+    /// <summary>"Add a library by link" and "Why is a site missing?", once mounted.</summary>
+    public Action? AddLibrary { get; init; }
+    public Action? WhyMissing { get; init; }
 }
 
 /// <summary>
@@ -35,7 +47,7 @@ sealed class Tray : IDisposable
     const uint NinSelect = 0x0400, NinKeySelect = 0x0401, NinBalloonUserClick = 0x0405, WmLButtonDblClk = 0x0203;
     const uint NimAdd = 0, NimModify = 1, NimDelete = 2, NimSetVersion = 4, NifMessage = 1, NifIcon = 2, NifTip = 4, NifInfo = 0x10, NifShowTip = 0x80;
     const uint NiifUser = 4, NiifLargeIcon = 0x20, MfString = 0, MfGrayed = 1, MfSeparator = 0x800, TpmReturnCmd = 0x100, TpmRightButton = 2;
-    const int ShowFiles = 1, ShowLog = 2, Restart = 3, Help = 4, Website = 5, SignIn = 7, Retry = 8, Diagnostics = 9, Search = 10;
+    const int ShowFiles = 1, ShowLog = 2, Restart = 3, Help = 4, Website = 5, SignIn = 7, Retry = 8, Diagnostics = 9, Search = 10, Details = 11, Waiting = 12, AddLibrary = 13, WhyMissing = 14;
     public const string JSolveUrl = "https://jsolve.nl";
 
     readonly string label;
@@ -346,6 +358,22 @@ sealed class Tray : IDisposable
         {
             Item(MfString, Search, UiText.Get("Menu.Search"));
         }
+        if (current.DetailsNeeded?.Invoke() is > 0 and var waiting && current.ShowDetails is not null)
+        {
+            Item(MfString, Details, UiText.Get("Menu.Details", waiting));
+        }
+        if (current.WaitingFiles?.Invoke() is > 0 and var waitingFiles && current.ShowWaiting is not null)
+        {
+            Item(MfString, Waiting, UiText.Get("Menu.Waiting", waitingFiles));
+        }
+        if (current.AddLibrary is not null)
+        {
+            Item(MfString, AddLibrary, UiText.Get("Menu.AddLibrary"));
+        }
+        if (current.WhyMissing is not null)
+        {
+            Item(MfString, WhyMissing, UiText.Get("Menu.Why"));
+        }
         Item(MfString, ShowLog, UiText.Get("Menu.ShowLog"));
         if (current.CollectDiagnostics is not null)
         {
@@ -380,6 +408,18 @@ sealed class Tray : IDisposable
                 break;
             case Search:
                 current.Search?.Invoke();
+                break;
+            case Details:
+                current.ShowDetails?.Invoke();
+                break;
+            case Waiting:
+                current.ShowWaiting?.Invoke();
+                break;
+            case AddLibrary:
+                current.AddLibrary?.Invoke();
+                break;
+            case WhyMissing:
+                current.WhyMissing?.Invoke();
                 break;
             case Restart:
                 current.Restart?.Invoke();

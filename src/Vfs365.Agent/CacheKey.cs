@@ -31,17 +31,11 @@ static class CacheKey
         return key;
     }
 
-    /// <summary>AES-GCM: nonce (12) | tag (16) | ciphertext.</summary>
-    public static byte[] Seal(byte[] key, byte[] plain)
-    {
-        var sealedData = new byte[28 + plain.Length];
-        RandomNumberGenerator.Fill(sealedData.AsSpan(0, 12));
-        using var gcm = new AesGcm(key, 16);
-        gcm.Encrypt(sealedData.AsSpan(0, 12), plain, sealedData.AsSpan(28), sealedData.AsSpan(12, 16));
-        return sealedData;
-    }
-
-    /// <summary>Null when the data was sealed with another key or changed.</summary>
+    /// <summary>
+    /// Opens data sealed in one piece with the key itself, as metadata.bin was before 0.9.0 (AES-GCM: nonce (12) | tag (16) |
+    /// ciphertext); nothing is written this way any more (<see cref="SealedStream"/>). Null when the data was sealed with another key
+    /// or changed.
+    /// </summary>
     public static byte[]? Unseal(byte[] key, byte[] sealedData)
     {
         if (sealedData.Length < 28)

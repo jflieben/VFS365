@@ -484,10 +484,18 @@ public sealed partial class DriveEngine
             return null;
         }
         pending.Writing.EnterReadLock();
-        if (pending.IsLive)
+        try
         {
-            Unflush(pending);
-            return new WriteLease(pending);
+            if (pending.IsLive)
+            {
+                Unflush(pending); // writes the journal, which can fail (disk full): the write then fails, without the lock
+                return new WriteLease(pending);
+            }
+        }
+        catch
+        {
+            pending.Writing.ExitReadLock();
+            throw;
         }
         pending.Writing.ExitReadLock();
         return null;
@@ -1516,6 +1524,9 @@ public sealed partial class DriveEngine
     public int WaitingToUpload() =>
         overlay.Values.OfType<PendingFile>().Count(p => p.Dirty && p.Queued && !p.Rejected && !StaysLocal(p));
 
+    /// <summary>Changed files Microsoft 365 refused (a name it doesn't accept, no access): not tried again until saved, renamed or moved.</summary>
+    public int RefusedUploads() => overlay.Values.OfType<PendingFile>().Count(p => p.Dirty && p.Rejected && !StaysLocal(p));
+
     /// <summary>A new file under a name Office's temp and lock files (or Explorer's folder files) use: never uploaded.</summary>
     static bool StaysLocal(PendingFile pending) => pending.Base is null && LocalOnlyNames.IsLocalOnly(pending.Name);
 
@@ -1606,6 +1617,9 @@ public sealed partial class DriveEngine
         DriveItemInfo? uploaded = null;
         RemoteException? refused = null;
         DriveItemInfo item;
+        var answered = false;
+        try
+        {
         try
         {
             item = await TransferAsync(async () =>
@@ -1663,6 +1677,17 @@ public sealed partial class DriveEngine
             // No answer: it may have gone through, which the next attempt looks up before it sends the file again
             pending.Unconfirmed = new UnconfirmedUpload(sent, writes);
             throw;
+        }
+        answered = true;
+        }
+        finally
+        {
+            if (!answered && toLocal is GoneItem { DeleteOnExpiry: true } deleted)
+            {
+                // A save that deletes the original first (Excel) and then fails (offline, a timeout): the delete must not go out
+                // later, or the library would have neither version. The original shows again; a new save deletes it anew
+                deleted.DeleteOnExpiry = false;
+            }
         }
         if (refused is not null)
         {

@@ -6,8 +6,9 @@ using System.Xml.Linq;
 namespace Vfs365.Agent;
 
 /// <summary>
-/// vfs365-agent.exe as started at sign-in: runs the agent as a child process (--child) and starts it again when it crashes, so a fault
-/// in the agent or in a component it loads doesn't leave the user without the drive until the next sign-in. A normal stop (unmount,
+/// vfs365-agent.exe as started at sign-in: runs the agent as a child process (--child) and starts it again when it crashes or hangs
+/// (<see cref="HangWatch"/>: it is ended first), so a fault in the agent or in a component it loads doesn't leave the user without
+/// the drive until the next sign-in. A normal stop (unmount,
 /// sign-out, uninstall, a restart from the tray) or a problem the agent reported itself ends the supervisor too. At most MaxRestarts
 /// within RestartWindow; crash details from the Windows event log go to agent.log, and giving up goes to monitoring as a crash row and
 /// to the tray (unless policy hides it), whose Retry starts the agent again.
@@ -15,6 +16,9 @@ namespace Vfs365.Agent;
 public static class AgentSupervisor
 {
     public const string ChildFlag = "--child", RestartedFlag = "--restarted";
+
+    /// <summary>What <see cref="RestartedFlag"/> carries instead of an exit code after a hang.</summary>
+    public const string Hung = "hung";
     const int MaxRestarts = 3;
     static readonly TimeSpan RestartWindow = TimeSpan.FromMinutes(15), RestartDelay = TimeSpan.FromSeconds(3);
 
@@ -43,13 +47,31 @@ public static class AgentSupervisor
             }
             int code;
             int childId;
+            var hung = false;
             using (var child = Process.Start(start)!)
             {
                 childId = child.Id;
-                child.WaitForExit();
+                using var alive = AliveSignal.TryCreate(childId);
+                var watch = new HangWatch();
+                while (!child.WaitForExit(HangWatch.Poll))
+                {
+                    if (alive is not null && watch.Hung(DateTimeOffset.UtcNow, alive.TakeBeat(), alive.IsStopping) && !sessionEnding())
+                    {
+                        try
+                        {
+                            child.Kill();
+                        }
+                        catch (Exception e) when (e is InvalidOperationException or System.ComponentModel.Win32Exception)
+                        {
+                        }
+                        child.WaitForExit();
+                        hung = child.ExitCode == -1; // else it ended by itself meanwhile
+                        break;
+                    }
+                }
                 code = child.ExitCode;
             }
-            if (!Crashed(code) || sessionEnding())
+            if (!(hung || Crashed(code)) || sessionEnding())
             {
                 return code;
             }
@@ -60,12 +82,13 @@ public static class AgentSupervisor
                 restarts.Dequeue();
             }
             // Windows records the crash only once the process is gone: the details follow in the log while the agent starts again
-            var details = Task.Run(() => WriteCrashDetails(childId));
+            var details = hung ? Task.CompletedTask : Task.Run(() => WriteCrashDetails(childId));
+            var what = hung ? $"gave no sign of life for {HangWatch.HungAfter.TotalMinutes:0} minutes and was ended" : $"stopped unexpectedly (exit code 0x{code:X8})";
             // The first start's --after (a restart from the tray) is done
             childArgs = WithoutOption(WithoutOption(args.ToList(), "--after"), RestartedFlag);
             if (restarts.Count >= MaxRestarts)
             {
-                var gaveUp = $"The agent stopped unexpectedly (exit code 0x{code:X8}) {MaxRestarts + 1} times within {RestartWindow.TotalMinutes:0} minutes " +
+                var gaveUp = $"The agent {what}, the {MaxRestarts + 1}th unexpected stop within {RestartWindow.TotalMinutes:0} minutes, " +
                     "and was not started again; it starts at the next sign-in, or at Retry in the tray";
                 Write([$"Agent:      {gaveUp}."]);
                 AgentEvents.Write(AgentEvent.NotRestarted, gaveUp);
@@ -81,14 +104,14 @@ public static class AgentSupervisor
                 continue;
             }
             restarts.Enqueue(now);
-            Write([$"Agent:      stopped unexpectedly (exit code 0x{code:X8}); starting again"]);
-            AgentEvents.Write(AgentEvent.Crashed, $"The agent stopped unexpectedly (exit code 0x{code:X8}) and is started again; agent.log has what Windows recorded");
+            Write([$"Agent:      {what}; starting again"]);
+            AgentEvents.Write(AgentEvent.Crashed, $"The agent {what} and is started again{(hung ? "" : "; agent.log has what Windows recorded")}");
             Thread.Sleep(RestartDelay);
             if (sessionEnding())
             {
                 return code;
             }
-            childArgs.AddRange([RestartedFlag, $"0x{code:X8}"]); // the new child reports the crash
+            childArgs.AddRange([RestartedFlag, hung ? Hung : $"0x{code:X8}"]); // the new child reports the crash
         }
     }
 

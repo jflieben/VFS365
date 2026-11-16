@@ -21,6 +21,59 @@ public sealed class StabilityTests
     [InlineData(3, true)]                           // nothing the agent returns itself
     public void Only_crashes_restart_the_agent(int exitCode, bool restart) => Assert.Equal(restart, AgentSupervisor.Crashed(exitCode));
 
+    [Fact]
+    public void An_agent_that_stops_ticking_while_mounted_counts_as_hung_after_ten_minutes_awake()
+    {
+        var now = new DateTimeOffset(2026, 11, 15, 9, 0, 0, TimeSpan.Zero);
+        var watch = new HangWatch();
+        bool Poll(bool beat, bool stopping = false, TimeSpan? after = null) => watch.Hung(now += after ?? HangWatch.Poll, beat, stopping);
+        bool QuietFor(TimeSpan time)
+        {
+            var hung = false;
+            for (var at = TimeSpan.Zero; at < time; at += HangWatch.Poll)
+            {
+                hung = Poll(false);
+            }
+            return hung;
+        }
+
+        Assert.False(QuietFor(TimeSpan.FromHours(1))); // starting, waiting for a sign-in: nothing ticks yet
+        Assert.False(Poll(true));
+        Assert.False(QuietFor(HangWatch.HungAfter - HangWatch.Poll));
+        Assert.False(Poll(true)); // a sign of life: counted anew
+        Assert.False(QuietFor(HangWatch.HungAfter - HangWatch.Poll));
+        Assert.True(Poll(false));
+
+        // Sleep is no hang: the time this PC didn't run doesn't count, and what was counted before starts over
+        Assert.False(Poll(true));
+        Assert.False(QuietFor(TimeSpan.FromMinutes(8)));
+        Assert.False(Poll(false, after: TimeSpan.FromHours(9)));
+        Assert.False(QuietFor(TimeSpan.FromMinutes(8)));
+        Assert.True(QuietFor(TimeSpan.FromMinutes(2)));
+
+        // Stopping (the last uploads) is no hang either
+        Assert.False(Poll(true));
+        Assert.False(Poll(false, stopping: true));
+        Assert.False(QuietFor(TimeSpan.FromHours(1)));
+    }
+
+    [Fact]
+    public void The_agent_s_signs_of_life_reach_the_supervisor()
+    {
+        using var agent = AliveSignal.TryCreate(-365)!; // no process has this ID
+        using var supervisor = AliveSignal.TryCreate(-365)!;
+
+        Assert.False(supervisor.TakeBeat());
+        agent.Beat();
+        agent.Beat();
+        Assert.True(supervisor.TakeBeat());
+        Assert.False(supervisor.TakeBeat()); // taken: the next one needs a new tick
+        Assert.False(supervisor.IsStopping);
+        agent.Stopping();
+        Assert.True(supervisor.IsStopping);
+        Assert.True(supervisor.IsStopping);
+    }
+
     const string Unc = @"\\VFS365\JaneDoe";
 
     static DriveLetterReport Healthy => new("T:", @"\Device\Volume{x}", 0, Unc, null, true);

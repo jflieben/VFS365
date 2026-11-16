@@ -113,11 +113,15 @@ public static class AgentEvents
 {
     static readonly Lazy<EventReporter> Reporter = new(() => new EventReporter(WindowsEventSink.Registered() ? new WindowsEventSink() : null));
 
-    public static void Write(AgentEvent kind, string message)
+    /// <param name="paths">
+    /// File and folder paths and names in the message: they go in as "[path 1a2b3c4d]" (<see cref="Monitoring.Scrub"/>), always. The
+    /// Application log is readable by other users of a multi-session host and collected by SIEMs; agent.log has the names.
+    /// </param>
+    public static void Write(AgentEvent kind, string message, params string?[] paths)
     {
         try
         {
-            Reporter.Value.Write(kind, message);
+            Reporter.Value.Write(kind, paths.Length == 0 ? message : Monitoring.Scrub(message, paths));
         }
         catch (Exception e) when (e is not OutOfMemoryException)
         {

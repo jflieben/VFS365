@@ -137,4 +137,24 @@ public sealed class AgentEventsTests
 
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     static extern int FormatMessageW(uint flags, IntPtr source, uint id, uint language, StringBuilder buffer, int size, IntPtr arguments);
+
+    [Fact]
+    public void Paths_and_names_go_into_events_as_hashes()
+    {
+        const string path = @"\Sites\HR\Dismissals\Jan Jansen.docx", name = "Jan Jansen.docx", copy = "Jan Jansen (conflict 2026-11-15 101500).docx";
+
+        var conflict = Monitoring.Scrub($"{path} was changed or locked in Microsoft 365; the user's version is saved as {copy}", [path, name, copy]);
+        var waiting = Monitoring.Scrub($"{path} is waiting to upload, kept on this PC: 503 ServiceUnavailable from https://graph.microsoft.com/v1.0/drives/b!x/root:/Dismissals/Jan%20Jansen.docx:/content",
+            [path, name]);
+        var notSaved = Monitoring.Scrub($@"2 changed file(s) are not saved to Microsoft 365 yet and stay on this PC: {path}; \OneDrive\Notes.txt", [path, @"\OneDrive\Notes.txt"]);
+
+        foreach (var text in new[] { conflict, waiting, notSaved })
+        {
+            Assert.DoesNotContain("Jansen", text);
+            Assert.DoesNotContain("Dismissals", text);
+            Assert.DoesNotContain("Notes", text);
+            Assert.Contains("[path ", text);
+        }
+        Assert.Contains("503", waiting); // the cause stays
+    }
 }

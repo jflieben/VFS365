@@ -22,7 +22,8 @@ public static class ExplorerVerbs
     /// <summary>The verbs in menu order, and whether files and folders get them.</summary>
     public static readonly (string Name, bool Files, bool Folders)[] Verbs =
     [
-        ("browser", true, true), ("desktop", true, false), ("link", true, true), ("versions", true, false), ("share", true, true), ("keep", true, false),
+        ("browser", true, true), ("desktop", true, false), ("link", true, true), ("versions", true, false), ("share", true, true), ("details", true, true), ("library", true, true),
+        ("deleted", true, true), ("keep", true, false),
         ("compare", true, false), ("search", false, true),
     ];
 
@@ -172,6 +173,13 @@ public static class ItemUrls
     /// <summary>SharePoint's version history page of a list item.</summary>
     public static string VersionHistory(string siteUrl, string listId, string listItemId) =>
         $"{siteUrl.TrimEnd('/')}/_layouts/15/Versions.aspx?list={Uri.EscapeDataString("{" + listId.Trim('{', '}') + "}")}&ID={Uri.EscapeDataString(listItemId)}";
+
+    /// <summary>The site's recycle bin page.</summary>
+    public static string RecycleBin(string siteUrl) => $"{siteUrl.TrimEnd('/')}/_layouts/15/RecycleBin.aspx";
+
+    /// <summary>SharePoint's form to edit a list item's columns (it redirects to the library's own form).</summary>
+    public static string EditForm(string siteUrl, string listId, string listItemId) =>
+        $"{siteUrl.TrimEnd('/')}/_layouts/15/listform.aspx?PageType=6&ListId={Uri.EscapeDataString("{" + listId.Trim('{', '}') + "}")}&ID={Uri.EscapeDataString(listItemId)}";
 
     /// <summary>
     /// A file URL in plain ASCII for the Office URI schemes: spaces, %, #, characters URIs don't allow and non-ASCII characters

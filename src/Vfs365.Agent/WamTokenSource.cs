@@ -102,6 +102,16 @@ sealed class WamTokenSource : ITokenSource
 
     public ValueTask<string> GetAccessTokenAsync(string resource, string claims, CancellationToken ct) => GetAsync(resource, claims, ct);
 
+    /// <summary>One silent request with the claims; the cached token, the failures and the problems stay as they are unless a token comes.</summary>
+    public async ValueTask<string> RenewAsync(string resource, string claims, CancellationToken ct)
+    {
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        timeout.CancelAfter(RequestTimeout);
+        var answer = await RequestAsync(resource, claims, IntPtr.Zero, timeout.Token);
+        return Accept(resource, answer.Result, answer.Generation, interactive: false)
+            ?? throw new HttpRequestException("Sign-in: the signed-in account changed during the request");
+    }
+
     async ValueTask<string> GetAsync(string resource, string? claims, CancellationToken ct)
     {
         if (claims is not null)
@@ -132,7 +142,8 @@ sealed class WamTokenSource : ITokenSource
     {
         var key = claims is null ? resource : $"{resource}\n{claims}";
         Lazy<Task<string>>? mine = null;
-        mine = new(() => SilentAsync(resource, claims, key, mine!));
+        // On the pool, never on a caller's own thread (a window's): the request must finish and leave inflight whoever asked first
+        mine = new(() => Task.Run(() => SilentAsync(resource, claims, key, mine!)));
         return inflight.GetOrAdd(key, mine).Value;
     }
 

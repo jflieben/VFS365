@@ -19,6 +19,22 @@ static class UserPins
         }
     }
 
+    /// <summary>The list changed after <paramref name="time"/> (a discovery run's): that run doesn't know it yet.</summary>
+    public static bool ChangedSince(DateTimeOffset time)
+    {
+        try
+        {
+            return File.Exists(FilePath) && File.GetLastWriteTimeUtc(FilePath) > time.UtcDateTime;
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+        {
+            return false;
+        }
+    }
+
+    /// <summary>The address `pin` accepts (an absolute https URL), or null.</summary>
+    public static Uri? Parse(string? text) => Uri.TryCreate(text?.Trim(), UriKind.Absolute, out var uri) && uri.Scheme == "https" ? uri : null;
+
     /// <summary>True when the list changed.</summary>
     public static bool Add(string url) => Update(pins => pins.Contains(url, StringComparer.OrdinalIgnoreCase) ? null : [.. pins, url]);
 
