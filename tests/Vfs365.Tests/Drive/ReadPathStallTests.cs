@@ -249,10 +249,12 @@ public sealed class ReadPathStallTests : IDisposable
 
         // Before: each of the 20 waited for its own failure (4 s here, 40 to 200 s on a black-holed network). Now the first does,
         // and the background refresh of the folder looks its ID up once
-        Assert.InRange(api.ItemCalls - calls, 1, 2);
+        Assert.InRange(api.ItemCalls - calls, 0, 2); // 0 when the folder's refresh failed first, which marks the drive the same way
         Assert.True(watch.Elapsed < TimeSpan.FromSeconds(2), $"{watch.ElapsedMilliseconds} ms");
 
-        // 30 s later a lookup still answers at once, and one asks again in the background
+        // 30 s later a lookup still answers at once, and one asks again in the background (the background refresh of the folder,
+        // offline, has failed by then: a failure arriving later would mark the drive unreachable again)
+        await Eventually(() => api.Failing == 0);
         now += TimeSpan.FromSeconds(31);
         api.Offline = false;
         calls = api.ItemCalls;
@@ -262,7 +264,7 @@ public sealed class ReadPathStallTests : IDisposable
         await Eventually(() => api.ItemCalls > calls);
 
         // That worked, so the next lookup asks Microsoft 365 again (and waits for its failure, offline again)
-        await Task.Delay(100);
+        await Eventually(() => !engine.CannotReach);
         now += TimeSpan.FromSeconds(61);
         api.Offline = true;
         watch.Restart();
@@ -478,15 +480,28 @@ sealed class StallingDriveApi(FakeDriveApi inner) : IDriveApi
 
     internal Task Hang(CancellationToken ct) => IgnoreTokens ? new TaskCompletionSource().Task : Task.Delay(Timeout.Infinite, ct);
 
+    /// <summary>Calls that started offline and haven't failed yet (with FailAfter): they fail even when the network is back meanwhile.</summary>
+    public int Failing => Volatile.Read(ref failing);
+
+    int failing;
+
     async Task OnlineAsync(CancellationToken ct)
     {
         if (Offline)
         {
-            if (FailAfter is { } wait)
+            Interlocked.Increment(ref failing);
+            try
             {
-                await Task.Delay(wait, ct);
+                if (FailAfter is { } wait)
+                {
+                    await Task.Delay(wait, ct);
+                }
+                throw new HttpRequestException("No such host is known. (graph.microsoft.com:443)");
             }
-            throw new HttpRequestException("No such host is known. (graph.microsoft.com:443)");
+            finally
+            {
+                Interlocked.Decrement(ref failing);
+            }
         }
     }
 
