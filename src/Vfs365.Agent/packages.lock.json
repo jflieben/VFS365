@@ -13,14 +13,14 @@
       "vfs365.drive.winfsp": {
         "type": "Project",
         "dependencies": {
-          "Vfs365.Core": "[0.8.3, )",
+          "Vfs365.Core": "[0.9.0, )",
           "winfsp.net": "[2.1.25156, )"
         }
       },
       "vfs365.graph": {
         "type": "Project",
         "dependencies": {
-          "Vfs365.Core": "[0.8.3, )"
+          "Vfs365.Core": "[0.9.0, )"
         }
       },
       "winfsp.net": {
