@@ -10,12 +10,12 @@
       },
       "Microsoft.NET.Test.Sdk": {
         "type": "Direct",
-        "requested": "[18.11.0, )",
-        "resolved": "18.11.0",
-        "contentHash": "xf/bR0LNkhK0SnadDRlZIQmC4sac5Wk0e1WAdiQjRN3MSo6gQ9M2c4c1XRNnVGjfOvckh704W5CJ19AL0/Xsdg==",
+        "requested": "[18.12.0, )",
+        "resolved": "18.12.0",
+        "contentHash": "MdVkskM2ZCKSlNts5DIbz9MZidX7SwcXKBoBqY4XT91b30hAwC8PkjWbdGKRak6BKAD1BQqaZnh/SD0AJGoDCQ==",
         "dependencies": {
-          "Microsoft.CodeCoverage": "18.11.0",
-          "Microsoft.TestPlatform.TestHost": "18.11.0"
+          "Microsoft.CodeCoverage": "18.12.0",
+          "Microsoft.TestPlatform.TestHost": "18.12.0"
         }
       },
       "xunit": {
@@ -37,20 +37,20 @@
       },
       "Microsoft.CodeCoverage": {
         "type": "Transitive",
-        "resolved": "18.11.0",
-        "contentHash": "MhN9wpvL1Es4hfIYslrsVgIsUdDFxuOBTbAl9mGIMvFo8PP5CLf4DrGdNrfwWSyn0lqi6sssm+I/qkkLL3MU+g=="
+        "resolved": "18.12.0",
+        "contentHash": "OhOPSaCAQhBJgXF1OrX0uK3eTkwZ1XnM44iGLZplYgKrmgKzQUdv9xtGGaE568RuQ738TlrTJ3pm9aWL5FH7iw=="
       },
       "Microsoft.TestPlatform.ObjectModel": {
         "type": "Transitive",
-        "resolved": "18.11.0",
-        "contentHash": "BXBHYnwSOljKute8UYCMXOLAdB7awxEMppPSpqOF1ZxLD/W/OH+vTBgFaXA7q0aditJTVXSMVenel+wOkEIyNg=="
+        "resolved": "18.12.0",
+        "contentHash": "ilT2o4v/c1joLgsfzS4dYQ71bWAy/RsA6fBY7f5OEUpUsUhwIzoliGeXdS3yctWuy4NZyuSVlO7dPX4ed7R06A=="
       },
       "Microsoft.TestPlatform.TestHost": {
         "type": "Transitive",
-        "resolved": "18.11.0",
-        "contentHash": "AKjwKpyRBwoQFQmpcchtoYlfJEBlaY/40uxBRi+qXP4NR7xT8t+XTJtOyEyumfvfJcH5pASs75LwNdXYRr4XNA==",
+        "resolved": "18.12.0",
+        "contentHash": "WTT912JUqmFa2BkCeXPkMCUpbYOqsbeRfRJdhaIQROx49iokgnGPAlKvXmHWKC9nJwWrHwSQfR+k+Qn7NCxfzw==",
         "dependencies": {
-          "Microsoft.TestPlatform.ObjectModel": "18.11.0"
+          "Microsoft.TestPlatform.ObjectModel": "18.12.0"
         }
       },
       "System.IO.FileSystem.AccessControl": {
@@ -101,10 +101,9 @@
       "vfs365.agent": {
         "type": "Project",
         "dependencies": {
-          "System.Security.Cryptography.ProtectedData": "[10.0.13, )",
-          "Vfs365.Core": "[0.5.0, )",
-          "Vfs365.Drive.WinFsp": "[0.5.0, )",
-          "Vfs365.Graph": "[0.5.0, )"
+          "Vfs365.Core": "[0.9.0, )",
+          "Vfs365.Drive.WinFsp": "[0.9.0, )",
+          "Vfs365.Graph": "[0.9.0, )"
         }
       },
       "vfs365.core": {
@@ -113,21 +112,15 @@
       "vfs365.drive.winfsp": {
         "type": "Project",
         "dependencies": {
-          "Vfs365.Core": "[0.5.0, )",
+          "Vfs365.Core": "[0.9.0, )",
           "winfsp.net": "[2.1.25156, )"
         }
       },
       "vfs365.graph": {
         "type": "Project",
         "dependencies": {
-          "Vfs365.Core": "[0.5.0, )"
+          "Vfs365.Core": "[0.9.0, )"
         }
-      },
-      "System.Security.Cryptography.ProtectedData": {
-        "type": "CentralTransitive",
-        "requested": "[10.0.13, )",
-        "resolved": "10.0.13",
-        "contentHash": "aUSmC6cPjFLSE0rDTsmkR3wvUOnscqewebOaaELEToh12sNmoltZqT3f0C81mJ1zhxKjWco25soHTvYwsXCsUw=="
       },
       "winfsp.net": {
         "type": "CentralTransitive",
