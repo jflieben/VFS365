@@ -10,10 +10,9 @@
       "vfs365.agent": {
         "type": "Project",
         "dependencies": {
-          "System.Security.Cryptography.ProtectedData": "[10.0.13, )",
-          "Vfs365.Core": "[0.5.0, )",
-          "Vfs365.Drive.WinFsp": "[0.5.0, )",
-          "Vfs365.Graph": "[0.5.0, )"
+          "Vfs365.Core": "[0.9.0, )",
+          "Vfs365.Drive.WinFsp": "[0.9.0, )",
+          "Vfs365.Graph": "[0.9.0, )"
         }
       },
       "vfs365.core": {
@@ -22,21 +21,15 @@
       "vfs365.drive.winfsp": {
         "type": "Project",
         "dependencies": {
-          "Vfs365.Core": "[0.5.0, )",
+          "Vfs365.Core": "[0.9.0, )",
           "winfsp.net": "[2.1.25156, )"
         }
       },
       "vfs365.graph": {
         "type": "Project",
         "dependencies": {
-          "Vfs365.Core": "[0.5.0, )"
+          "Vfs365.Core": "[0.9.0, )"
         }
-      },
-      "System.Security.Cryptography.ProtectedData": {
-        "type": "CentralTransitive",
-        "requested": "[10.0.13, )",
-        "resolved": "10.0.13",
-        "contentHash": "aUSmC6cPjFLSE0rDTsmkR3wvUOnscqewebOaaELEToh12sNmoltZqT3f0C81mJ1zhxKjWco25soHTvYwsXCsUw=="
       },
       "winfsp.net": {
         "type": "CentralTransitive",
