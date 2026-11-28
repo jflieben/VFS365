@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+## 0.9.1
+
+- `ExplorerSearch` `Allow`: a search in Explorer may use half of `ApiBudgetPerMinute` (300 resource units, about 150 folders, by default) for folder listings; a deeper one is stopped as with `Stop`, with a notification. Shallow searches work as before.
+
 ## 0.9.0
 
 - Details and columns: right-click a file or folder on the drive, VFS365, Details and columns. A window shows who made and last changed it, its size, versions, check-out and labels, and its SharePoint columns, which you can change there: text, numbers, dates, yes/no, choices, people and managed metadata, and the content type. Other columns (lookups, links, rich text) show their value and change in the browser. A notification about required columns opens this window too, and VFS365 keeps after it: closing the window with a required column empty asks first, the tray menu shows Details needed while files wait, and reminders come after 1, 3, 7 and 15 hours, until the details are filled in (here or in the browser).

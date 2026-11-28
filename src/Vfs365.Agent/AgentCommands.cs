@@ -1771,14 +1771,15 @@ public static class AgentCommands
                 using var explorerMenu = ExplorerMenu.Start(engine, driveApi, unc, drive.DriveLetter, driveLetters, settings.OverlayIcons, OfficeSettings.From(settings), search.AskAndSearchAsync,
                     (title, text, problem) => VerbPipe.Tell(tray, title, text, problem), say, log, detailsWindows.Show);
                 _ = shellPackage.ContinueWith(_ => explorerMenu?.Update(), TaskScheduler.Default); // legacy verbs go once the package is there
-                using var searchWatcher = ExplorerSearchWatcher.Start(engine, settings.ExplorerSearch,
+                var searchBudget = ExplorerSearchWatcher.SearchBudget(settings.ApiBudgetPerMinute);
+                using var searchWatcher = ExplorerSearchWatcher.Start(engine, settings.ExplorerSearch, searchBudget,
                     () => ExplorerMenu.Roots(unc, drive.DriveLetter, driveLetters?.Folders().Keys ?? []), DriveVolumePath, search.HandOffAsync,
                     (title, text) => VerbPipe.Tell(tray, title, text, false), log);
                 say(settings.ExplorerSearch switch
                 {
                     ExplorerSearchMode.Browser => "Search:     Explorer searches on the drive open in Microsoft 365",
                     ExplorerSearchMode.Stop => "Search:     Explorer searches on the drive are stopped (policy ExplorerSearch)",
-                    _ => "Search:     Explorer searches the drive itself (policy ExplorerSearch)",
+                    _ => $"Search:     Explorer searches the drive itself (policy ExplorerSearch){(searchBudget > 0 ? $"; a search may use {searchBudget} resource units of folder listings" : "")}",
                 });
                 if (tray is not null)
                 {

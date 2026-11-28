@@ -225,6 +225,8 @@ public static class UiText
         ["Search.HandedOff.Title"] = ("Search results in your browser", "Zoekresultaten in uw browser"),
         ["Search.HandedOff"] = ("VFS365 searched Microsoft 365 for \"{0}\": the results are in your browser.",
             "VFS365 heeft in Microsoft 365 gezocht naar \"{0}\": de resultaten staan in uw browser."),
+        ["Search.TooDeep"] = ("This search read too many folders from Microsoft 365, so VFS365 stopped it. Search a folder further down, or right-click a folder and choose VFS365 > Search in Microsoft 365.",
+            "Deze zoekopdracht las te veel mappen uit Microsoft 365, daarom heeft VFS365 hem gestopt. Zoek in een dieper gelegen map, of klik met de rechtermuisknop op een map en kies VFS365 > Zoeken in Microsoft 365."),
         ["Search.Stopped"] = ("Searching the drive in Explorer reads every folder from Microsoft 365, so VFS365 stopped it. Right-click a folder and choose VFS365 > Search in Microsoft 365.",
             "Zoeken op het station in Verkenner leest elke map uit Microsoft 365, daarom heeft VFS365 het gestopt. Klik met de rechtermuisknop op een map en kies VFS365 > Zoeken in Microsoft 365."),
         ["Search.NoPage"] = ("{0} can't be searched in Microsoft 365.", "{0} kan niet worden doorzocht in Microsoft 365."),

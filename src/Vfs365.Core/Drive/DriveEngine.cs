@@ -1087,6 +1087,7 @@ public sealed partial class DriveEngine(DriveNamespace ns, IDriveApi api, Conten
                     yield break;
                 }
                 deadline.CancelAfter(Timeout.InfiniteTimeSpan);
+                Charge(driveId, folderPath);
                 yield return pages.Current;
             }
         }

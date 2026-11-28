@@ -178,6 +178,32 @@ public sealed class ExplorerWatcherTests
     }
 
     [Fact]
+    public void The_search_a_tab_shows_is_known_from_its_first_words_until_it_leaves_it()
+    {
+        var tracker = Tracker();
+        long now = 20_000;
+        tracker.Look(1, Folder(@"M:\Sites\X", "X"), Roots, now, false);
+        Assert.Null(tracker.Showing(1));
+
+        tracker.Look(1, Search(@"M:\Sites\X", "i"), Roots, now += 300, false); // still settling: Explorer crawls already
+        Assert.Equal((@"\Sites\X", @"M:\Sites\X"), tracker.Showing(1));
+        Assert.Null(tracker.Showing(2));
+
+        tracker.Look(1, Folder(@"M:\Sites\X", "X"), Roots, now += 300, false);
+        Assert.Null(tracker.Showing(1));
+        tracker.Look(1, Search(@"M:\Sites\X", "inv"), Roots, now += 300, false);
+        tracker.Gone(1, now += 300);
+        Assert.Null(tracker.Showing(1));
+    }
+
+    [Fact]
+    public void A_search_in_mode_allow_may_use_half_of_the_per_minute_budget()
+    {
+        Assert.Equal(300, ExplorerSearchWatcher.SearchBudget(600));
+        Assert.Equal(0, ExplorerSearchWatcher.SearchBudget(0)); // no budget set: no limit either
+    }
+
+    [Fact]
     public void A_cleared_search_box_ends_the_wait()
     {
         var tracker = Tracker();

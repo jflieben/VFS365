@@ -6,40 +6,35 @@ VFS365 shows Microsoft 365 files (OneDrive, Teams and SharePoint libraries) as a
 
 | File | Use |
 |---|---|
-| `VFS365-<version>-x64-setup.exe`, `VFS365-<version>-arm64-setup.exe` | Setup: installs WinFsp (when missing or older) and VFS365. The simplest way to deploy |
-| `VFS365-<version>-x64.msi`, `VFS365-<version>-arm64.msi` | VFS365 alone, for when WinFsp is deployed separately |
-| `winfsp-<version>.msi` | The unmodified WinFsp installer the setup contains |
+| `VFS365-<version>-x64-setup.exe`, `VFS365-<version>-arm64-setup.exe` | Setup: installs WinFsp (when missing or older) and VFS365 |
 | `VFS365-<version>-policy.zip` (`VFS365.admx`, `en-US\VFS365.adml`, laid out as in `PolicyDefinitions`) | Policy templates for Intune (ADMX import) or Group Policy |
 | `vfs365-monitoring.html` | Dashboard for the monitoring tables, see [Monitoring](#monitoring) |
 | `SHA256SUMS.txt` | SHA-256 checksums of the files above |
 
-Releases are on the repository's GitHub Releases page; the guides, `LICENSE` and `THIRD-PARTY-NOTICES.md` are in the repository (a local `./build.ps1 release` also copies them next to the installers).
+Releases are on the repository's GitHub Releases page; a new one is a pre-release until it is marked as the latest. The MSIs (VFS365's and the unmodified WinFsp installer) are inside the setups, not separate downloads; the guides, `LICENSE` and `THIRD-PARTY-NOTICES.md` are in the repository (a local `./build.ps1 release` also copies them next to the installers).
 
 All programs are self-contained: no .NET is needed on the devices.
 
-Releases from 0.4.2 on are Authenticode signed with JSolve B.V.'s certificate through Azure Artifact Signing: the setups, the MSIs, and VFS365's programs, DLLs and `vfs365np.dll` inside them. Check a file with `Get-AuthenticodeSignature <file>` (status `Valid`, signer JSolve B.V.). One file inside is unsigned: `winfsp-msil.dll`, WinFsp's .NET layer as its NuGet package ships it (WinFsp's files ship unmodified); with WDAC or App Control, allow it by hash. The WinFsp MSI carries its author's own signature.
+Releases from 0.4.2 on are Authenticode signed with JSolve B.V.'s certificate through Azure Artifact Signing: the setups, the MSIs in them, and VFS365's programs, DLLs and `vfs365np.dll` inside them. Check a file with `Get-AuthenticodeSignature <file>` (status `Valid`, signer JSolve B.V.). One file inside is unsigned: `winfsp-msil.dll`, WinFsp's .NET layer as its NuGet package ships it (WinFsp's files ship unmodified); with WDAC or App Control, allow it by hash. The WinFsp MSI carries its author's own signature.
 
-Every VFS365 release file also has a build provenance attestation, which shows it was built by this repository's release workflow from `main`:
+Every release file also has a build provenance attestation, which shows it was built by this repository's release workflow from `main`:
 
 ```
 gh attestation verify <file> --repo jflieben/VFS365 --signer-workflow jflieben/VFS365/.github/workflows/release.yml --source-ref refs/heads/main
 ```
 
-The WinFsp MSI is upstream's, so it has no attestation from VFS365; `SHA256SUMS.txt` lists it, and `build.ps1` pins its SHA-256.
+The WinFsp MSI inside the setup is upstream's, unmodified; `build.ps1` pins its SHA-256.
 
 ## Prerequisites
 
 1. **Admin consent** for JSolve's VFS365 app, once per tenant: one link, see [APP-REGISTRATION.md](APP-REGISTRATION.md) (delegated permissions only). Or your own app registration, through the `ClientId` policy.
 2. Windows 11, x64 or ARM64. Entra joined or registered devices sign in silently; others prompt once.
 
-## Install (.exe)
+## Install
 
-- **Setup (recommended):** Intune Win32 app or any deployment tool, device context. Install `VFS365-<version>-<arch>-setup.exe /quiet /norestart`, uninstall `VFS365-<version>-<arch>-setup.exe /uninstall /quiet /norestart`. Detection: the VFS365 product in Apps (or the file `C:\Program Files\VFS365\vfs365-agent.exe`).
-
-## Install (2x msi)
-
-- **MSI:** deploy `winfsp-<version>.msi` first (in Intune as a dependency)
-- then `msiexec /i VFS365-<version>-<arch>.msi /qn /norestart`; uninstall with `msiexec /x VFS365-<version>-<arch>.msi /qn /norestart`. The MSI refuses to install without WinFsp, and the x64 package and setup refuse ARM64 devices (use the arm64 ones there).
+- **Setup:** Intune Win32 app or any deployment tool, device context. Install `VFS365-<version>-<arch>-setup.exe /quiet /norestart`, uninstall `VFS365-<version>-<arch>-setup.exe /uninstall /quiet /norestart`. Detection: the VFS365 product in Apps (or the file `C:\Program Files\VFS365\vfs365-agent.exe`).
+- The x64 setup refuses ARM64 devices: use the arm64 one there.
+- **MSI** (Group Policy software installation, or WinFsp deployed separately): `./build.ps1 release` builds `VFS365-<version>-<arch>.msi`, unsigned (see the README). Deploy WinFsp first; then `msiexec /i VFS365-<version>-<arch>.msi /qn /norestart`, uninstall with `msiexec /x ... /qn /norestart`. The MSI refuses to install without WinFsp.
 
 Keep `/norestart` in quiet commands: without it the setup or msiexec restarts the device by itself when a file it replaces is in use (`vfs365np.dll`, which Explorer loads). With it, exit code 3010 means done, with a restart pending (Intune: soft reboot).
 
@@ -95,7 +90,7 @@ Values: on/off settings also take REG_SZ (`1`/`0`, `true`/`false`, `yes`/`no`, `
 | `DriveMappings` | REG_MULTI_SZ | none | Drive letters of their own for folders in VFS365: `Z:=Sites\Finance\Documents`, `\|Finance` for the name in Explorer. See [Folder redirection and drive letters](#folder-redirection-and-drive-letters) |
 | `ChangeCheckSeconds` | REG_DWORD | `20` | How often a library in use (last 2 minutes) checks for changes made elsewhere, 5 to 300 s (1 to 4 count as 5); `0` relies on SharePoint's push (often 20 to 30 s). With push working, each check doubles the wait up to 8 times this (160 s) until this PC changes something there; without push, each check that finds nothing doubles it up to 4 times this (80 s). Pauses when the tenant is throttled |
 | `DatabaseFiles` | REG_SZ | `Allow` | Multi-user database files (Access, QuickBooks, SQLite): `Allow`, `ReadOnly` (open but never saved) or `Block` (can't be opened). Their locks don't reach other PCs, so two users can both write |
-| `ExplorerSearch` | REG_SZ | `Browser` | A search in Explorer's search box on the drive: `Browser` (stopped and opened in SharePoint search in the browser, see [What users get](#what-users-get)), `Stop` (only stopped, with a hint to use the VFS365 menu's "Search in Microsoft 365") or `Allow` (Explorer reads every folder below the one searched, which can get the tenant throttled) |
+| `ExplorerSearch` | REG_SZ | `Browser` | A search in Explorer's search box on the drive: `Browser` (stopped and opened in SharePoint search in the browser, see [What users get](#what-users-get)), `Stop` (only stopped, with a hint to use the VFS365 menu's "Search in Microsoft 365") or `Allow` (Explorer searches the drive itself, reading the folders below the one searched; a search whose folder listings cost more than half of `ApiBudgetPerMinute`, 300 resource units or about 150 folders by default, is stopped as with `Stop`, so a shallow search works and a deep one doesn't crawl on. Searches of the same folder within 10 minutes share that budget. With `ApiBudgetPerMinute` 0 there is no limit) |
 | `OfficeFiles` | REG_SZ | `DesktopApp` | A double-click or Enter in Explorer on an Office file in the drive (types in `OfficeFileTypes`): `DesktopApp` (its Office app opens it from Microsoft 365: co-authoring, AutoSave), `Browser` (Office for the web) or `Local` (the copy on the drive). The copy on the drive opens anyway when it has changes not uploaded yet, is new or empty, or Microsoft 365 doesn't answer within 4 s. Office's File > Open and Recent, the command line, other programs and Open in the right-click menu keep opening the copy on the drive. See [What users get](#what-users-get) |
 | `OfficeFileTypes` | REG_MULTI_SZ | `.docx`, `.xlsx`, `.pptx` | Types `OfficeFiles` applies to, with or without the dot. Also possible: `.docm` `.xlsm` `.xlsb` `.pptm` `.ppsx` `.doc` `.xls` `.ppt`, `.one` (OneNote) and `.vsdx` `.vsdm` (Visio). Templates, database files and other types are ignored, with a warning |
 | `OfficeMissing` | REG_SZ | `Browser` | A type in `OfficeFileTypes` that no app on the PC opens: `Browser` (Office for the web), `Ask` (open in the browser or choose an app; asked once per type until VFS365 restarts) or `Local` (Windows asks which app). A type with another default app (LibreOffice) always opens in that app |

@@ -15,7 +15,7 @@ Fixes go into the latest release. Update to it before reporting, if you can.
 
 ## Verifying a release
 
-Releases from 0.4.2 on are Authenticode signed with JSolve B.V.'s certificate through Azure Artifact Signing: the setups, the MSIs, and VFS365's programs, DLLs and `vfs365np.dll` inside them. Check a file with `Get-AuthenticodeSignature <file>`: the status must be `Valid` and the signer JSolve B.V. The only unsigned file inside is `winfsp-msil.dll`, which WinFsp's NuGet package ships unsigned and VFS365 ships unmodified.
+Releases from 0.4.2 on are Authenticode signed with JSolve B.V.'s certificate through Azure Artifact Signing: the setups, the MSIs in them, and VFS365's programs, DLLs and `vfs365np.dll` inside them. Check a file with `Get-AuthenticodeSignature <file>`: the status must be `Valid` and the signer JSolve B.V. The only unsigned file inside is `winfsp-msil.dll`, which WinFsp's NuGet package ships unsigned and VFS365 ships unmodified.
 
 VFS365's release files also carry a build provenance attestation and are listed in `SHA256SUMS.txt`. Check that a file was built by the release workflow from `main`:
 
@@ -23,7 +23,7 @@ VFS365's release files also carry a build provenance attestation and are listed 
 gh attestation verify <file> --repo jflieben/VFS365 --signer-workflow jflieben/VFS365/.github/workflows/release.yml --source-ref refs/heads/main
 ```
 
-The bundled WinFsp MSI is upstream's: it carries its author's signature and its SHA-256 is pinned in `build.ps1`.
+The WinFsp MSI in the setups is upstream's: it carries its author's signature and its SHA-256 is pinned in `build.ps1`.
 
 ## Known limits
 

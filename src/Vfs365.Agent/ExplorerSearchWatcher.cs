@@ -14,7 +14,9 @@ public enum ExplorerSearchMode { Browser, Stop, Allow }
 /// as you type), sends the tab back to the folder, which ends the crawl, and opens SharePoint search with the same words. Mode Stop only
 /// stops it and says how to search instead. Woken by the tabs' navigation events (which tab navigated tells it what to read), the
 /// opening and closing of tabs and the drive's folder listings, idle otherwise; all COM calls on its own thread, every wrapper released
-/// after use. Never throws: problems are logged once.
+/// after use. Never throws: problems are logged once. Mode Allow lets Explorer search, but stops a search whose folder listings from
+/// Microsoft 365 cost more than its budget (<see cref="DriveEngine.MeasureListings"/>); searches of the same folder within
+/// <see cref="RestFor"/> share it, so searching again doesn't go deeper each time.
 /// </summary>
 internal sealed partial class ExplorerSearchWatcher : IDisposable
 {
@@ -28,6 +30,11 @@ internal sealed partial class ExplorerSearchWatcher : IDisposable
     readonly Action<string, string> notify;
     readonly Action<string> log;
     readonly SearchTracker tracker;
+    readonly int budget;
+    /// <summary>Mode Allow: the search each tab shows on the drive, its meter and whether it was stopped (the watcher thread only).</summary>
+    readonly Dictionary<long, (string Volume, DriveEngine.ListingMeter Meter, bool Stopped)> crawls = [];
+    /// <summary>Mode Allow: the meters of folders searched, by volume path, and when a search last used each.</summary>
+    readonly Dictionary<string, (DriveEngine.ListingMeter Meter, long Used)> spent = new(StringComparer.OrdinalIgnoreCase);
     readonly AutoResetEvent wake = new(false);
     readonly CancellationTokenSource stop = new();
     readonly Thread thread;
@@ -40,15 +47,16 @@ internal sealed partial class ExplorerSearchWatcher : IDisposable
     readonly Dictionary<long, Tab> tabs = [];
     object? shell;
     IDisposable? shellEvents;
-    long lastActivity, lastListing = -AwakeFor, lastHint = -HintGap;
+    const int TooDeepGap = 30 * 1000;
+    long lastActivity, lastListing = -AwakeFor, lastHint = -HintGap, lastTooDeep = -TooDeepGap;
     int refreshSignalled;
     uint watcherThread;
     Timer? watchdog;
 
-    ExplorerSearchWatcher(DriveEngine engine, ExplorerSearchMode mode, Func<IReadOnlyList<string>> roots, Func<string, string?> volumePath,
+    ExplorerSearchWatcher(DriveEngine engine, ExplorerSearchMode mode, int budget, Func<IReadOnlyList<string>> roots, Func<string, string?> volumePath,
         Func<string, string, Func<string, bool>?, CancellationToken, Task<string?>> handOff, Action<string, string> notify, Action<string> log)
     {
-        (this.engine, this.mode, this.roots, this.handOff, this.notify, this.log) = (engine, mode, roots, handOff, notify, log);
+        (this.engine, this.mode, this.budget, this.roots, this.handOff, this.notify, this.log) = (engine, mode, budget, roots, handOff, notify, log);
         tracker = new SearchTracker(volumePath);
         engine.FolderListed += Woken;
         thread = new Thread(Run) { IsBackground = true, Name = "VFS365 Explorer search" };
@@ -57,10 +65,16 @@ internal sealed partial class ExplorerSearchWatcher : IDisposable
         WokenByExplorer(0); // a first look now, so searches typed later are told apart from restored ones
     }
 
-    /// <summary>Starts watching; null for mode Allow.</summary>
-    public static ExplorerSearchWatcher? Start(DriveEngine engine, ExplorerSearchMode mode, Func<IReadOnlyList<string>> roots, Func<string, string?> volumePath,
+    /// <summary>
+    /// Starts watching. <paramref name="budget"/>: mode Allow's resource units per search (<see cref="SearchBudget"/>); null for mode
+    /// Allow without one.
+    /// </summary>
+    public static ExplorerSearchWatcher? Start(DriveEngine engine, ExplorerSearchMode mode, int budget, Func<IReadOnlyList<string>> roots, Func<string, string?> volumePath,
         Func<string, string, Func<string, bool>?, CancellationToken, Task<string?>> handOff, Action<string, string> notify, Action<string> log) =>
-        mode == ExplorerSearchMode.Allow ? null : new ExplorerSearchWatcher(engine, mode, roots, volumePath, handOff, notify, log);
+        mode == ExplorerSearchMode.Allow && budget <= 0 ? null : new ExplorerSearchWatcher(engine, mode, budget, roots, volumePath, handOff, notify, log);
+
+    /// <summary>Mode Allow's budget of one search: half of what one user may use per minute (ApiBudgetPerMinute; 0, no limit, gives none).</summary>
+    public static int SearchBudget(int apiBudgetPerMinute) => apiBudgetPerMinute / 2;
 
     /// <summary>A folder listing on the drive: looks at every tab, at most once per <see cref="ListingPollGap"/> ms (a copy lists many).</summary>
     void Woken()
@@ -324,6 +338,7 @@ internal sealed partial class ExplorerSearchWatcher : IDisposable
     void Drop(Tab tab, long now)
     {
         tabs.Remove(tab.Identity);
+        crawls.Remove(tab.Identity);
         tracker.Gone(tab.Identity, now);
         tab.Dispose();
     }
@@ -345,7 +360,13 @@ internal sealed partial class ExplorerSearchWatcher : IDisposable
             Volatile.Write(ref refreshSignalled, 1); // it probably closed
             return;
         }
-        if (tracker.Look(tab.Identity, view, places, now, initial) is not { } hit)
+        var hit = tracker.Look(tab.Identity, view, places, now, initial);
+        if (mode == ExplorerSearchMode.Allow)
+        {
+            Measure(tab, now);
+            return;
+        }
+        if (hit is null)
         {
             return;
         }
@@ -377,6 +398,47 @@ internal sealed partial class ExplorerSearchWatcher : IDisposable
                 StopTab(tab.Browser, hit.Location, first: false);
                 log($"Explorer search: the search in {volume} still showed, stopped it again");
                 break;
+        }
+    }
+
+    /// <summary>Mode Allow: the tab's search counts what its listings cost; past the budget it is stopped, as in mode Stop.</summary>
+    void Measure(Tab tab, long now)
+    {
+        var showing = tracker.Showing(tab.Identity);
+        if (crawls.TryGetValue(tab.Identity, out var crawl) && !string.Equals(crawl.Volume, showing?.Volume, StringComparison.OrdinalIgnoreCase))
+        {
+            crawls.Remove(tab.Identity); // the search ended or moved: its meter stays in spent
+            crawl = default;
+        }
+        foreach (var old in spent.Where(s => now - s.Value.Used >= RestFor && !crawls.Values.Any(c => ReferenceEquals(c.Meter, s.Value.Meter))).ToList())
+        {
+            old.Value.Meter.Dispose();
+            spent.Remove(old.Key);
+        }
+        if (showing is not { } search)
+        {
+            return;
+        }
+        if (crawl.Meter is null)
+        {
+            var meter = spent.TryGetValue(search.Volume, out var earlier) ? earlier.Meter : engine.MeasureListings(search.Volume);
+            crawls[tab.Identity] = crawl = (search.Volume, meter, false);
+        }
+        spent[search.Volume] = (crawl.Meter, now);
+        if (crawl.Meter.Units <= budget)
+        {
+            return;
+        }
+        StopTab(tab.Browser, search.Location, first: true);
+        if (!crawl.Stopped)
+        {
+            crawls[tab.Identity] = crawl with { Stopped = true };
+            log($"Explorer search: stopped a search in {search.Volume}: its folder listings cost {crawl.Meter.Units} resource units, more than the {budget} a search may use");
+            if (now - lastTooDeep >= TooDeepGap)
+            {
+                lastTooDeep = now;
+                notify(UiText.Get("Search.Title"), UiText.Get("Search.TooDeep"));
+            }
         }
     }
 
@@ -466,6 +528,10 @@ internal sealed partial class ExplorerSearchWatcher : IDisposable
         stop.Cancel();
         wake.Set();
         thread.Join(TimeSpan.FromSeconds(2)); // a hung Explorer call keeps the background thread, not the stop
+        foreach (var meter in spent.Values.Select(s => s.Meter).Concat(crawls.Values.Select(c => c.Meter)).ToList())
+        {
+            meter.Dispose();
+        }
     }
 
     [LibraryImport("ole32.dll")]
@@ -539,10 +605,15 @@ internal sealed class SearchTracker(Func<string, string?> volumePath)
     readonly SearchSettle settle = new();
     /// <summary>The last folder each tab showed (not a search): its parsing name and display name.</summary>
     readonly Dictionary<long, (string? Parsing, string? Name)> shown = [];
+    /// <summary>The search on the drive each tab showed at its last look: the folder searched, as a volume path and as Explorer's location.</summary>
+    readonly Dictionary<long, (string Volume, string Location)> searching = [];
     /// <summary>Searches already showing at the first look (windows Explorer restored at sign-in): stopped, never opened.</summary>
     readonly HashSet<(long Tab, string Key)> restored = [];
 
     public bool Pending => settle.Pending;
+
+    /// <summary>The search on the drive the tab showed at its last look; null for anything else.</summary>
+    public (string Volume, string Location)? Showing(long tab) => searching.TryGetValue(tab, out var search) ? search : null;
 
     /// <summary>The tabs with a search settling.</summary>
     public IReadOnlyList<long> PendingTabs => [.. settle.PendingTabs];
@@ -565,8 +636,10 @@ internal sealed class SearchTracker(Func<string, string?> volumePath)
             }
             settle.See(tab, null, now); // no search, elsewhere, or the box was cleared
             restored.RemoveWhere(r => r.Tab == tab);
+            searching.Remove(tab);
             return null;
         }
+        searching[tab] = (volume, location);
         var key = $"{volume}|{search.Terms}";
         if (initial)
         {
@@ -582,6 +655,7 @@ internal sealed class SearchTracker(Func<string, string?> volumePath)
     public void Gone(long tab, long now)
     {
         shown.Remove(tab);
+        searching.Remove(tab);
         settle.See(tab, null, now);
         restored.RemoveWhere(r => r.Tab == tab);
     }

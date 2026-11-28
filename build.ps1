@@ -7,7 +7,7 @@
     self-contained x64 and ARM64 builds, wraps each in an MSI and in a setup program that installs WinFsp first, and puts these, the
     unmodified WinFsp MSI, the policy templates (also zipped), the monitoring dashboard, licence, notices, guides and checksums in release\<version>\. The
     version's CHANGELOG entry goes to artifacts\release-notes.md. SHA256SUMS.txt lists the files a GitHub release publishes (the
-    installers, the policy zip and the dashboard). GitHub Actions runs this when VERSION changes on main.
+    setups, the policy zip and the dashboard; the MSIs are inside the setups). GitHub Actions runs this when VERSION changes on main.
 
     release runs in two stages, or one of them with -BuildOnly or -PackageOnly. Build compiles the network provider and publishes the
     programs into artifacts\, unsigned. Package signs them, builds the MSIs and setups and fills release\<version>\. GitHub Actions runs
@@ -428,8 +428,8 @@ if($Task -eq 'release'){
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'monitoring\vfs365-monitoring.html') -Destination $output
     foreach($doc in 'DEPLOYMENT.md', 'APP-REGISTRATION.md'){ Copy-Item -LiteralPath (Join-Path $PSScriptRoot "docs\$doc") -Destination $output }
     if($signing){ Assert-Signed $output }
-    #Exactly the files a GitHub release publishes (release.yml uploads what this lists)
-    Get-ChildItem -LiteralPath $output -File | Where-Object Extension -in '.exe', '.msi', '.zip', '.html' | Sort-Object Name | ForEach-Object {
+    #Exactly the files a GitHub release publishes (release.yml uploads what this lists): not the MSIs, which the setups contain
+    Get-ChildItem -LiteralPath $output -File | Where-Object Extension -in '.exe', '.zip', '.html' | Sort-Object Name | ForEach-Object {
         "{0}  {1}" -f (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLower(), $_.Name
     } | Set-Content -LiteralPath (Join-Path $output 'SHA256SUMS.txt') -Encoding ascii
     Write-Host "Release $version in $output"

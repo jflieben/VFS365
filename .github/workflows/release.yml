@@ -1,10 +1,11 @@
 # Publishes a GitHub release when VERSION on main names a version that has no release yet. Release notes come from that version's
-# CHANGELOG.md entry; the first job fails without one. Builds, signing and publishing run for main only.
+# CHANGELOG.md entry; the first job fails without one. Builds, signing and publishing run for main only. The release is published as
+# a pre-release, to test the downloads and installers first; a maintainer then makes it the latest release on GitHub (Edit release).
 #
 # Each job has only the rights it needs: tests and the builds read the repository; only publish creates the release and the build
 # provenance attestation. Verify a file with:
 #   gh attestation verify <file> --repo <owner>/<repo> --signer-workflow <owner>/<repo>/.github/workflows/release.yml --source-ref refs/heads/main
-# The WinFsp MSI is upstream's (pinned by hash in build.ps1), so it gets no attestation from here. Actions are pinned by commit
+# The MSIs are built and checked, but only the setups (which contain them) are published. Actions are pinned by commit
 # (Dependabot keeps them current); NuGet restores in locked mode against the packages.lock.json files (CI=true). Tests and build use
 # the NuGet cache (keyed by those files), build also the Zig cache; package, which signs, uses neither.
 #
@@ -223,11 +224,12 @@ jobs:
         with:
           name: release
 
-      # VFS365's own files and the checksums; not the WinFsp MSI, which is upstream's
+      # The published files (SHA256SUMS.txt lists them) and the checksums
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: |
-            release/${{ needs.version.outputs.version }}/VFS365-*
+            release/${{ needs.version.outputs.version }}/VFS365-*-setup.exe
+            release/${{ needs.version.outputs.version }}/VFS365-*-policy.zip
             release/${{ needs.version.outputs.version }}/vfs365-monitoring.html
             release/${{ needs.version.outputs.version }}/SHA256SUMS.txt
 
@@ -240,4 +242,4 @@ jobs:
         run: |
           $folder = "release/$env:VERSION"
           $assets = @(Get-Content "$folder/SHA256SUMS.txt" | ForEach-Object { Join-Path $folder ($_ -split '  ', 2)[1] }) + (Join-Path $folder 'SHA256SUMS.txt')
-          gh release create "v$env:VERSION" --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA --title "VFS365 $env:VERSION" --notes-file artifacts/release-notes.md @assets
+          gh release create "v$env:VERSION" --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA --title "VFS365 $env:VERSION" --notes-file artifacts/release-notes.md --prerelease @assets
